@@ -1,0 +1,13 @@
+[package]
+name = "systemcall-circuit"
+description = "SystemCall transfer-circuit API with the current Halo2 backend"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+circuit.workspace = true
+
+[lints]
+workspace = true

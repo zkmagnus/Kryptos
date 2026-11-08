@@ -1,0 +1,46 @@
+[package]
+name = "runtime"
+description = "The node daemon: event loop, miner, local RPC and command line"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rhombus"
+path = "src/main.rs"
+
+[[bin]]
+name = "wallet"
+path = "src/bin/wallet_rpc.rs"
+
+[[bin]]
+name = "rhomscan"
+path = "src/bin/rhomscan.rs"
+
+[dependencies]
+crypto.workspace = true
+systemcall-proof.workspace = true
+systemcall.workspace = true
+protocol.workspace = true
+storage.workspace = true
+chain.workspace = true
+p2p.workspace = true
+wallet.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+rand.workspace = true
+rand_core.workspace = true
+subtle.workspace = true
+zeroize.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
+socket2.workspace = true
+
+[dev-dependencies]
+rand_chacha.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

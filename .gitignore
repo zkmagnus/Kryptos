@@ -1,0 +1,7 @@
+/target/
+/dist/
+**/*.rs.bk
+*.params
+*.pk
+*.vk
+Cargo.lock.bak

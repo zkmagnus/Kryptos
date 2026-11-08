@@ -1,0 +1,28 @@
+[package]
+name = "chain"
+description = "Proof of work, difficulty adjustment, block validation and chain state"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+crypto.workspace = true
+systemcall-proof.workspace = true
+protocol.workspace = true
+systemcall.workspace = true
+storage.workspace = true
+blake2b_simd.workspace = true
+thiserror.workspace = true
+rand_core = { workspace = true, features = ["getrandom"] }
+uint.workspace = true
+randomx-bindings.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,14 @@
+[package]
+name = "systemcall-proof"
+description = "SystemCall proof API backed by the current Halo2 implementation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+circuit.workspace = true
+systemcall-circuit.workspace = true
+
+[lints]
+workspace = true
