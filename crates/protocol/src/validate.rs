@@ -10,10 +10,7 @@ use crypto::signature::{BatchVerifier, BindingVerificationKey};
 use rand_core::{CryptoRng, RngCore};
 use systemcall_proof::{ProofBatch, VerifyingKey};
 
-use crate::consensus::{
-    is_action_class, proof_len, BranchId, TRANSFER_ENTRYPOINT, TRANSFER_PROGRAM_ID,
-    TRANSFER_PROGRAM_VERSION, TX_VERSION,
-};
+use crate::consensus::{is_action_class, proof_len, BranchId, TX_VERSION};
 use crate::transaction::Transaction;
 use crate::{Error, Result};
 
@@ -23,7 +20,7 @@ use crate::{Error, Result};
 /// # Errors
 /// Returns [`Error::InvalidTransaction`] naming the first violated rule.
 pub fn check_structure(tx: &Transaction) -> Result<()> {
-    check_shape_and_program(tx)?;
+    check_shape_and_program(tx, crate::consensus::TRANSFER_ENTRYPOINT)?;
     Ok(())
 }
 
@@ -32,21 +29,20 @@ pub fn check_structure(tx: &Transaction) -> Result<()> {
 /// This must only be called after the chain kernel has classified the
 /// transaction as a coinbase and computed its public balance.
 pub fn check_coinbase_structure(tx: &Transaction) -> Result<()> {
-    check_shape_and_program(tx)
+    check_shape_and_program(tx, crate::consensus::COINBASE_ENTRYPOINT)
 }
 
-fn check_shape_and_program(tx: &Transaction) -> Result<()> {
+fn check_shape_and_program(tx: &Transaction, entrypoint: u16) -> Result<()> {
     if tx.version() != TX_VERSION {
         return Err(Error::InvalidTransaction("unknown version"));
     }
-    if tx.program_id() != &TRANSFER_PROGRAM_ID || tx.entrypoint() != TRANSFER_ENTRYPOINT {
+    if tx.entrypoint() != entrypoint {
         return Err(Error::InvalidTransaction("unknown SystemCall target"));
     }
-    if tx.program_version() != TRANSFER_PROGRAM_VERSION {
-        return Err(Error::InvalidTransaction("unknown SystemCall target"));
-    }
-    if tx.private_proof_v1().is_none() {
-        return Err(Error::InvalidTransaction("V1 proof envelope is missing"));
+    program_vm::decode(tx.opcode(), &[])
+        .map_err(|_| Error::InvalidTransaction("unknown SystemCall opcode"))?;
+    if tx.private_proof_v2().is_none() {
+        return Err(Error::InvalidTransaction("V2 proof envelope is missing"));
     }
     if !is_action_class(tx.actions().len()) {
         return Err(Error::InvalidTransaction(
@@ -77,7 +73,7 @@ pub fn coinbase_balance(credit: crate::coin::Rhombus) -> Result<i64> {
         .ok_or(Error::AmountOutOfRange)
 }
 
-/// Queues every V1 signature of `tx` into `batch` for later verification.
+/// Queues every transaction signature into `batch` for later verification.
 /// `balance` is the public value balance the binding signature must prove;
 /// `branch` is the consensus branch in force where the transaction is being
 /// validated, which the signatures must have been made for.
@@ -91,15 +87,23 @@ pub fn queue_signatures(
     batch: &mut BatchVerifier,
 ) -> Result<()> {
     let sighash = tx.sighash(branch);
-    for action in tx.actions() {
-        batch.queue_spend_auth(action.body().rk(), action.spend_auth_sig(), &sighash);
-    }
+    queue_spend_auth_signatures(tx, branch, batch);
     let bvk = BindingVerificationKey::from_commitments(tx.value_commitments(), balance)?;
     batch.queue_binding(&bvk, tx.binding_signature(), &sighash);
     Ok(())
 }
 
-/// Queues signatures for an ordinary transfer using its explicit public fee.
+/// Queues only the per-action spend authorization signatures. This is used
+/// for block validation, where value conservation is proven once by the
+/// block-wide binding signature rather than by public per-transaction fees.
+pub fn queue_spend_auth_signatures(tx: &Transaction, branch: BranchId, batch: &mut BatchVerifier) {
+    let sighash = tx.sighash(branch);
+    for action in tx.actions() {
+        batch.queue_spend_auth(action.body().rk(), action.spend_auth_sig(), &sighash);
+    }
+}
+
+/// Queues signatures for an ordinary transfer using its attached relay fee.
 pub fn queue_transfer_signatures(
     tx: &Transaction,
     branch: BranchId,
@@ -113,19 +117,19 @@ pub fn queue_transfer_signatures(
 /// # Errors
 /// Fails if an action carries a non-canonical point.
 pub fn queue_proof(tx: &Transaction, batch: &mut ProofBatch) -> Result<()> {
-    if tx.private_proof_v1().is_none() {
-        return Err(Error::InvalidTransaction("V1 proof envelope is missing"));
+    if tx.private_proof_v2().is_none() {
+        return Err(Error::InvalidTransaction("V2 proof envelope is missing"));
     }
     Ok(batch.add(tx.proof(), &tx.public_inputs()?)?)
 }
 
-/// Verifies the V1 proof of one transaction on its own.
+/// Verifies the V2 proof of one transaction on its own.
 ///
 /// # Errors
 /// Returns [`systemcall_proof::Error::InvalidProof`] if the proof is wrong.
 pub fn verify_proof(tx: &Transaction, vk: &VerifyingKey) -> Result<()> {
-    tx.private_proof_v1()
-        .ok_or(Error::InvalidTransaction("V1 proof envelope is missing"))?
+    tx.private_proof_v2()
+        .ok_or(Error::InvalidTransaction("V2 proof envelope is missing"))?
         .verify(vk, &tx.public_inputs()?)?;
     Ok(())
 }
@@ -176,7 +180,7 @@ mod tests {
     use crypto::signature::BindingSignature;
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
-    use systemcall_proof::PrivateTransactionProofV1;
+    use systemcall_proof::PrivateTransactionProofV2;
 
     use super::*;
     use crate::action::tests::sample_action;
@@ -193,12 +197,12 @@ mod tests {
         } else {
             dummy_proof(count)
         };
-        let v1_proof = PrivateTransactionProofV1::new(&action_proof).unwrap();
+        let v2_proof = PrivateTransactionProofV2::new(&action_proof).unwrap();
         Transaction::new(
             sample_anchor(),
             crate::coin::Rhombus::ZERO,
             actions,
-            v1_proof,
+            v2_proof,
             BindingSignature::from_bytes([0; 64]),
         )
         .unwrap()
@@ -227,12 +231,12 @@ mod tests {
     fn structure_rejects_wrong_proof_length() {
         let mut rng = ChaCha20Rng::seed_from_u64(9);
         let actions = (0..2).map(|_| sample_action(&mut rng, b"x")).collect();
-        let v1_proof = PrivateTransactionProofV1::new(&dummy_proof(4)).unwrap();
+        let v2_proof = PrivateTransactionProofV2::new(&dummy_proof(4)).unwrap();
         let tx = Transaction::new(
             sample_anchor(),
             crate::coin::Rhombus::ZERO,
             actions,
-            v1_proof,
+            v2_proof,
             BindingSignature::from_bytes([0; 64]),
         )
         .unwrap();
@@ -247,19 +251,15 @@ mod tests {
     #[test]
     fn structure_rejects_unknown_version() {
         let mut bytes = unsigned_tx(3, 2).to_vec();
-        bytes[0] = 2;
-        let tx = Transaction::from_slice(&bytes).unwrap();
-        assert!(matches!(
-            check_structure(&tx),
-            Err(Error::InvalidTransaction("unknown version"))
-        ));
+        bytes[0] = TX_VERSION.wrapping_add(1);
+        assert!(Transaction::from_slice(&bytes).is_err());
     }
 
     #[test]
     fn structure_rejects_duplicate_nullifiers() {
         let tx = unsigned_tx(4, 2);
         let mut bytes = tx.to_vec();
-        let first = 1 + 32 + 2 + 2 + 32 + 1 + 8;
+        let first = 1 + 1 + 2 + 32 + 1;
         let second = first + ACTION_BODY_LEN;
         let nf: Vec<u8> = bytes[first..first + 32].to_vec();
         bytes[second..second + 32].copy_from_slice(&nf);

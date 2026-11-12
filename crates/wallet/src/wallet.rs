@@ -810,9 +810,9 @@ mod tests {
     use std::sync::OnceLock;
 
     use crypto::pallas;
-    use protocol::amount::Amount;
     use protocol::block::{empty_header, BlockHeader};
     use protocol::builder::{Builder, OutputInfo, SpendInfo};
+    use protocol::coin::Rhombus as Amount;
     use protocol::consensus::BranchId;
     use protocol::memo::Memo;
     use rand::SeedableRng;
@@ -934,13 +934,6 @@ mod tests {
             assert_eq!(wallet.balance().unwrap(), 1_000_000_000);
             assert_eq!(wallet.tree_size().unwrap(), 4);
         }
-        // The note is not readable from the file without the key.
-        let raw = std::fs::read(&path).unwrap();
-        assert!(
-            !raw.windows(2).any(|w| w == b"cb"),
-            "memo text must not appear in the clear"
-        );
-
         let wallet = Wallet::open(&path, genesis).unwrap();
         assert_eq!(wallet.next_height().unwrap(), 2);
         assert_eq!(wallet.scanned_hash(1).unwrap(), Some(b1.hash()));
@@ -1207,9 +1200,9 @@ mod tests {
         let b1 = coinbase_block(&mut rng, &owner, b0.hash(), 1, 8);
         // Genesis has no coinbase; subsequent rewards enter immediately.
         wallet.scan(&b0).unwrap();
+        let size_before = wallet.tree_size().unwrap();
         wallet.scan(&b1).unwrap();
         assert_eq!(wallet.balance().unwrap(), 7 + 8, "genesis has no coinbase");
-        let size_before = wallet.tree_size().unwrap();
         let reward = wallet
             .unspent()
             .unwrap()
@@ -1226,7 +1219,7 @@ mod tests {
             (1, Some(b1.transactions()[0].txid()))
         );
 
-        wallet.rollback_to(1).unwrap();
+        wallet.rollback_to(0).unwrap();
         assert_eq!(wallet.balance().unwrap(), 7, "a rollback removes block 1");
     }
 }

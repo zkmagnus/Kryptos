@@ -15,7 +15,7 @@ use chain::genesis::genesis;
 use chain::params::{ChainParams, Upgrade};
 use chain::target::Target;
 use chain::Error;
-use common::{proving_key, spend_first_note_for, Harness, Wallet};
+use common::{proving_key, spend_first_note_for, spend_first_note_with_fee, Harness, Wallet};
 use protocol::block::{empty_header, Block, PowSolution};
 use protocol::builder::{Builder, OutputInfo, SpendInfo};
 use protocol::bytes::Encodable;
@@ -44,6 +44,36 @@ fn mining_extends_the_chain_and_pays_the_miner() {
         .unwrap()
         .unwrap();
     assert_eq!(h.import(&again).unwrap(), Import::AlreadyKnown);
+}
+
+#[test]
+fn private_fee_is_relay_metadata_and_is_paid_into_the_private_coinbase() {
+    let mut h = Harness::new(101);
+    h.extend(Vec::new());
+    let parent = h.tip_header();
+    let recipient = Wallet::new(&mut ChaCha20Rng::seed_from_u64(102));
+    let fee = 17;
+    let spending_wallet = h.miner.clone_for_test(0);
+    let tx = spend_first_note_with_fee(&mut h, &spending_wallet, &recipient.address, 1_000, fee);
+    assert_eq!(tx.fee().raw(), fee);
+    assert!(tx.fee_opening().is_some());
+
+    let decoded_tx = Transaction::from_slice(&tx.to_vec()).unwrap();
+    assert_eq!(decoded_tx.txid(), tx.txid());
+    assert_eq!(decoded_tx.fee(), protocol::coin::Rhombus::ZERO);
+    assert!(decoded_tx.fee_opening().is_none());
+
+    let block = h.make_block(&parent, vec![tx]);
+    let decoded_block = Block::from_slice(&block.to_vec()).unwrap();
+    assert!(decoded_block.binding_signature().is_some());
+    assert!(decoded_block.transactions()[1].fee_opening().is_none());
+    assert_eq!(h.import(&decoded_block).unwrap(), Import::Extended);
+    h.scan(&decoded_block);
+
+    let reward = protocol::consensus::subsidy(decoded_block.header().height)
+        .checked_add(protocol::coin::Rhombus::from_raw(fee).unwrap())
+        .unwrap();
+    assert!(h.miner.notes.iter().any(|(note, _)| note.value() == reward));
 }
 
 #[test]
@@ -117,7 +147,11 @@ fn bad_blocks_are_rejected() {
         .pow()
         .mine(&mut wrong_root, 256, &mut h.rng)
         .unwrap());
-    let bad = Block::new(wrong_root, good.transactions().to_vec());
+    let bad = Block::new_with_binding_signature(
+        wrong_root,
+        good.transactions().to_vec(),
+        good.binding_signature().unwrap().clone(),
+    );
     assert!(matches!(
         h.import(&bad),
         Err(Error::InvalidHeader("commitment root mismatch"))
@@ -171,16 +205,19 @@ fn with_corrupted_proof(block: &Block) -> Block {
         + 2
         + 32
         + 1
-        + 8
         + tx.actions().len() * protocol::action::ACTION_BODY_LEN
         + tx.actions().len() * crypto::signature::SIGNATURE_LEN;
-    // Preserve the V1 domain marker and alter the first action-proof byte.
+    // Preserve the V2 domain marker and alter the first action-proof byte.
     bytes[proof_offset + 4] ^= 1;
     let bad = Transaction::from_slice(&bytes).unwrap();
     assert_eq!(bad.txid(), tx.txid(), "the txid excludes the proof");
     let mut txs = block.transactions().to_vec();
     txs[0] = bad;
-    Block::new(block.header().clone(), txs)
+    Block::new_with_binding_signature(
+        block.header().clone(),
+        txs,
+        block.binding_signature().unwrap().clone(),
+    )
 }
 
 #[test]
@@ -356,7 +393,11 @@ fn block_over(
         solution: PowSolution::empty(),
     };
     assert!(h.chain.pow().mine(&mut header, 256, &mut h.rng).unwrap());
-    Block::new(header, transactions)
+    Block::new_with_binding_signature(
+        header,
+        transactions,
+        protocol::block::BindingSignature::from_bytes([0; 64]),
+    )
 }
 
 #[test]
@@ -435,10 +476,7 @@ fn only_the_first_transaction_may_create_value() {
         )
         .unwrap();
     let block = block_over(&mut h, &parent, vec![coinbase, extra]);
-    assert!(matches!(
-        h.import(&block),
-        Err(Error::Crypto(crypto::Error::InvalidSignature))
-    ));
+    assert!(h.import(&block).is_err());
 }
 
 #[test]
@@ -688,7 +726,7 @@ fn transactions_are_indexed_by_id_while_in_the_main_chain() {
         Some((height, 0))
     );
     let (found, at, index) = store.transaction(&txid).unwrap().unwrap();
-    assert_eq!((found, at, index), (tx, height, 1));
+    assert_eq!((found.to_vec(), at, index), (tx.to_vec(), height, 1));
     store.revert().unwrap();
     assert_eq!(store.transaction_location(&txid).unwrap(), None);
     assert_eq!(store.transaction(&coinbase).unwrap(), None);

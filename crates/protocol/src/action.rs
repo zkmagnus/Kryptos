@@ -86,13 +86,20 @@ impl ActionBody {
     ///
     /// # Errors
     /// Fails if `rk` is not a canonical point.
-    pub fn public_inputs(&self, anchor: &Anchor) -> Result<PublicInputs> {
+    pub fn public_inputs(
+        &self,
+        anchor: &Anchor,
+        cv_net_total: crypto::pallas::Point,
+        net_sign: crypto::pallas::Base,
+    ) -> Result<PublicInputs> {
         Ok(PublicInputs {
             anchor: *anchor.inner(),
             nf_old: self.nullifier.to_base()?,
             rk: self.rk.to_point()?,
             cmx_new: *self.cmx.inner(),
             cv_net: *self.cv_net.as_point(),
+            cv_net_total,
+            net_sign,
         })
     }
 }
@@ -158,8 +165,8 @@ pub(crate) mod tests {
     use rand_chacha::ChaCha20Rng;
 
     use super::*;
-    use crate::address::Address;
-    use crate::amount::Amount;
+    use crate::address::RhombusAddress as Address;
+    use crate::coin::Rhombus as Amount;
     use crate::memo::Memo;
     use crate::note::{Note, RandomSeed, Rho};
     use crate::note_encryption::encrypt_note;

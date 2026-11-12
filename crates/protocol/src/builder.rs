@@ -5,7 +5,7 @@
 //! pads to the next action class with dummy actions, shuffles so position
 //! reveals nothing, derives every per-action secret, signs once the
 //! sighash is known, and proves every action in one action proof wrapped
-//! with the V1 domain marker. Input selection and change computation stay
+//! with the V2 domain marker. Input selection and change computation stay
 //! in the wallet.
 
 use crypto::commitment::{ValueCommitTrapdoor, ValueCommitment};
@@ -16,13 +16,14 @@ use crypto::merkle::{MerklePath, EMPTY_LEAF, MERKLE_DEPTH};
 use crypto::signature::{BindingSigningKey, RandomizedSigningKey, SpendAuthRandomizer};
 use rand_core::{CryptoRng, RngCore};
 use systemcall_circuit::{ActionWitness, NoteWitness, SpendWitness};
-use systemcall_proof::{PrivateTransactionProofV1, ProvingKey};
+use systemcall_proof::{PrivateTransactionProofV2, ProvingKey};
 
 use crate::action::{Action, ActionBody};
 use crate::address::RhombusAddress;
 use crate::coin::{Rhombus, ValueSum};
 use crate::consensus::action_class_for;
-use crate::consensus::BranchId;
+use crate::consensus::{BranchId, COINBASE_ENTRYPOINT, TRANSFER_ENTRYPOINT};
+use crate::fee::FeeOpening;
 use crate::memo::Memo;
 use crate::note::{Note, RandomSeed, Rho};
 use crate::note_encryption::encrypt_note;
@@ -163,7 +164,7 @@ impl Builder {
     }
 
     /// Pads, shuffles, balances including the declared fee, encrypts, signs,
-    /// and proves a V1 transfer.
+    /// and proves a V2 transfer.
     ///
     /// # Errors
     /// Returns [`Error::Unbalanced`] if spends do not equal outputs, or
@@ -189,11 +190,26 @@ impl Builder {
         branch: BranchId,
         rng: &mut (impl RngCore + CryptoRng),
     ) -> Result<Transaction> {
-        let balance = fee.to_i64()?;
-        self.build_v1_with_balance(fee, pk, branch, ValueSum::ZERO.plus(fee), balance, rng)
+        self.build_with_fee_opening(fee, pk, branch, rng)
+            .map(|(transaction, _)| transaction)
     }
 
-    fn build_v1_with_balance(
+    /// Builds a transfer and returns its fee opening as out-of-band relay
+    /// metadata. The opening must not be added to the transaction or block.
+    pub fn build_with_fee_opening(
+        self,
+        fee: Rhombus,
+        pk: &ProvingKey,
+        branch: BranchId,
+        rng: &mut (impl RngCore + CryptoRng),
+    ) -> Result<(Transaction, FeeOpening)> {
+        let balance = fee.to_i64()?;
+        let (transaction, blinding) =
+            self.build_v2_with_balance(fee, pk, branch, ValueSum::ZERO.plus(fee), balance, rng)?;
+        Ok((transaction, FeeOpening::new(fee, blinding)))
+    }
+
+    fn build_v2_with_balance(
         mut self,
         fee: Rhombus,
         pk: &ProvingKey,
@@ -201,7 +217,7 @@ impl Builder {
         spent_minus_created: ValueSum,
         balance: i64,
         rng: &mut (impl RngCore + CryptoRng),
-    ) -> Result<Transaction> {
+    ) -> Result<(Transaction, ValueCommitTrapdoor)> {
         let class = self.class()?;
         self.check_balance(spent_minus_created)?;
         self.pad(class, rng)?;
@@ -216,16 +232,41 @@ impl Builder {
             .collect::<Result<Vec<_>>>()?;
 
         let bodies: Vec<&ActionBody> = prepared.iter().map(|p| &p.body).collect();
-        let sighash = sighash_of(&self.anchor, &bodies, fee, branch);
+        let entrypoint = if balance < 0 {
+            COINBASE_ENTRYPOINT
+        } else {
+            TRANSFER_ENTRYPOINT
+        };
+        let sighash = sighash_of(&self.anchor, &bodies, entrypoint, branch);
+        let fee_blinding = ValueCommitTrapdoor::sum(prepared.iter().map(|p| &p.rcv));
+        let aggregate_commitment = ValueCommitment::sum(bodies.iter().map(|body| body.cv_net()));
+        let net_sign = if balance < 0 {
+            -crypto::pallas::Base::one()
+        } else {
+            crypto::pallas::Base::one()
+        };
         let public = bodies
             .iter()
-            .map(|body| body.public_inputs(&self.anchor))
+            .map(|body| {
+                body.public_inputs(&self.anchor, *aggregate_commitment.as_point(), net_sign)
+            })
             .collect::<Result<Vec<_>>>()?;
-        let witnesses: Vec<ActionWitness> = prepared.iter().map(|p| p.witness.clone()).collect();
+        let transaction_net = balance.unsigned_abs();
+        let transaction_rcv = fee_blinding.expose();
+        let witnesses: Vec<ActionWitness> = prepared
+            .iter()
+            .map(|p| {
+                let mut witness = p.witness.clone();
+                witness.transaction_net = transaction_net;
+                witness.transaction_rcv = transaction_rcv;
+                witness.transaction_negative = balance < 0;
+                witness
+            })
+            .collect();
         if spent_minus_created.to_i64()? != balance {
             return Err(Error::Unbalanced);
         }
-        let proof = PrivateTransactionProofV1::create(pk, &witnesses, &public, &mut *rng)?;
+        let proof = PrivateTransactionProofV2::create(pk, &witnesses, &public, &mut *rng)?;
 
         let binding_key = BindingSigningKey::from_trapdoors(prepared.iter().map(|p| &p.rcv))?;
         let binding_signature = binding_key.sign(rng, &sighash);
@@ -237,11 +278,22 @@ impl Builder {
             })
             .collect();
 
-        Transaction::new(self.anchor, fee, actions, proof, binding_signature)
+        let opening = FeeOpening::new(fee, fee_blinding.clone());
+        let transaction = if balance < 0 {
+            Transaction::new_coinbase(self.anchor, actions, proof, binding_signature)?
+        } else {
+            Transaction::new(self.anchor, fee, actions, proof, binding_signature)?
+        };
+        let transaction = if balance >= 0 {
+            transaction.with_fee_opening(&opening)?
+        } else {
+            transaction
+        };
+        Ok((transaction, fee_blinding))
     }
 
-    /// Builds a v1 coinbase: no spends, outputs worth exactly `credit`, the
-    /// scheduled subsidy plus public transaction fees assigned by consensus.
+    /// Builds a V2 coinbase: no spends, outputs worth exactly `credit`, the
+    /// scheduled subsidy plus private transaction fees assigned by the block producer.
     ///
     /// # Errors
     /// Returns [`Error::InvalidTransaction`] if spends were added,
@@ -254,6 +306,19 @@ impl Builder {
         branch: BranchId,
         rng: &mut (impl RngCore + CryptoRng),
     ) -> Result<Transaction> {
+        self.build_coinbase_with_opening(pk, credit, branch, rng)
+            .map(|(transaction, _)| transaction)
+    }
+
+    /// Builds a coinbase and returns its aggregate commitment opening for
+    /// block-level value conservation.
+    pub fn build_coinbase_with_opening(
+        self,
+        pk: &ProvingKey,
+        credit: Rhombus,
+        branch: BranchId,
+        rng: &mut (impl RngCore + CryptoRng),
+    ) -> Result<(Transaction, ValueCommitTrapdoor)> {
         if !self.spends.is_empty() {
             return Err(Error::InvalidTransaction("coinbase cannot spend"));
         }
@@ -261,7 +326,7 @@ impl Builder {
             .to_i64()?
             .checked_neg()
             .ok_or(Error::AmountOutOfRange)?;
-        self.build_v1_with_balance(
+        self.build_v2_with_balance(
             Rhombus::ZERO,
             pk,
             branch,
@@ -339,6 +404,9 @@ fn prepare_action(
         },
         output: note_witness(&note)?,
         rcv: rcv.expose(),
+        transaction_net: 0,
+        transaction_rcv: crypto::pallas::Scalar::zero(),
+        transaction_negative: false,
     };
     Ok(PreparedAction {
         body: ActionBody::new(nullifier, rk, cmx, cv_net, encrypted),
@@ -374,6 +442,8 @@ fn shuffle<T>(items: &mut [T], rng: &mut (impl RngCore + CryptoRng)) {
 
 #[cfg(test)]
 mod tests {
+    use crate::address::RhombusAddress as Address;
+    use crate::coin::Rhombus as Amount;
     /// The branch every test transaction is signed for.
     const BRANCH: BranchId = BranchId::new(1);
 
@@ -578,7 +648,7 @@ mod tests {
             .unwrap();
         assert_eq!(tx.actions().len(), 2);
         let balance = validate::coinbase_balance(credit).unwrap();
-        assert!(validate::verify_with_balance(
+        assert!(validate::verify_coinbase_with_balance(
             &tx,
             balance,
             BRANCH,
@@ -589,7 +659,7 @@ mod tests {
         // Claiming a different credit, or treating it as a regular
         // transaction, fails the binding signature.
         let other = validate::coinbase_balance(amount(1)).unwrap();
-        assert!(validate::verify_with_balance(
+        assert!(validate::verify_coinbase_with_balance(
             &tx,
             other,
             BRANCH,
@@ -638,7 +708,7 @@ mod tests {
         b.add_spend(spend).unwrap();
         b.add_output(OutputInfo::new(
             alice.address,
-            amount(1_000),
+            amount(999),
             Memo::empty(),
             None,
         ))
@@ -687,8 +757,15 @@ mod tests {
         let output = OutputInfo::new(alice.address, amount(200), Memo::empty(), None);
         let prepared = prepare_action(&spend, &output, &mut rng).unwrap();
         let anchor = ledger.anchor();
-        let from_body = prepared.body.public_inputs(&anchor).unwrap();
-        let from_witness = PublicInputs::from_witness(*anchor.inner(), &prepared.witness).unwrap();
+        let aggregate = *prepared.body.cv_net().as_point();
+        let from_body = prepared
+            .body
+            .public_inputs(&anchor, aggregate, crypto::pallas::Base::one())
+            .unwrap();
+        let mut witness = prepared.witness.clone();
+        witness.transaction_net = 300;
+        witness.transaction_rcv = witness.rcv;
+        let from_witness = PublicInputs::from_witness(*anchor.inner(), &witness).unwrap();
         assert_eq!(from_body, from_witness);
     }
 
@@ -707,7 +784,7 @@ mod tests {
     fn tampering_with_a_built_transaction_breaks_verification() {
         let (mut rng, _, _, tx) = payment(10);
         let mut bytes = crate::bytes::Encodable::to_vec(&tx);
-        bytes[1] ^= 1; // anchor changes the sighash and the proof inputs
+        bytes[4] ^= 1; // anchor changes the sighash and the proof inputs
         let tampered = <Transaction as crate::bytes::Encodable>::from_slice(&bytes).unwrap();
         assert!(verify_regular(&tampered, BRANCH, test_keys::verifying_key(), &mut rng).is_err());
     }

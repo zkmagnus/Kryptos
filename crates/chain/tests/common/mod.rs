@@ -16,8 +16,10 @@ use chain::params::ChainParams;
 use chain::target::Target;
 use chain::validate::{header_lookback, recent_headers};
 use chain::Error;
+use crypto::commitment::ValueCommitTrapdoor;
 use crypto::keys::{Diversifier, FullViewingKey, SpendingKey};
 use crypto::merkle::MerkleTree;
+use crypto::signature::BindingSigningKey;
 use protocol::address::RhombusAddress;
 use protocol::block::{empty_header, Block, BlockHeader, PowSolution};
 use protocol::builder::{Builder, OutputInfo, SpendInfo};
@@ -187,9 +189,15 @@ impl Harness {
         ))
         .unwrap();
         let branch = self.chain.params().branch_at(height);
-        let coinbase = b
-            .build_coinbase(proving_key(), credit, branch, &mut self.rng)
+        let (coinbase, coinbase_blinding) = b
+            .build_coinbase_with_opening(proving_key(), credit, branch, &mut self.rng)
             .unwrap();
+        let mut block_blindings = txs
+            .iter()
+            .map(|tx| ValueCommitTrapdoor::from_scalar(tx.fee_opening().unwrap().blinding()))
+            .collect::<Vec<_>>();
+        block_blindings.push(coinbase_blinding);
+        let binding_key = BindingSigningKey::from_trapdoors(block_blindings.iter()).unwrap();
         let mut transactions = vec![coinbase];
         transactions.extend(txs);
         let params = *self.chain.params();
@@ -234,7 +242,11 @@ impl Harness {
                 .unwrap(),
             "mining failed"
         );
-        (Block::new(header, transactions), tree)
+        let binding_signature = binding_key.sign(&mut self.rng, &Block::binding_message(&header));
+        (
+            Block::new_with_binding_signature(header, transactions, binding_signature),
+            tree,
+        )
     }
 
     pub fn tip_header(&self) -> BlockHeader {
@@ -314,4 +326,46 @@ pub fn spend_first_note_for(
         .unwrap();
     }
     b.build(proving_key(), branch, &mut h.rng).unwrap()
+}
+
+/// A regular transaction with a nonzero private fee opening.
+pub fn spend_first_note_with_fee(
+    h: &mut Harness,
+    wallet: &Wallet,
+    recipient: &RhombusAddress,
+    pay: u64,
+    fee: u64,
+) -> Transaction {
+    let branch = h.chain.params().branch_at(h.tip_header().height + 1);
+    let (note, position) = wallet.notes[0].clone();
+    let path = wallet.tree.path(position).unwrap();
+    let parent = h.tip_header();
+    let change = note.value().raw() - pay - fee;
+    let mut b = Builder::new(parent.commitment_root);
+    b.add_spend(SpendInfo::new(wallet.sk.clone(), note, path))
+        .unwrap();
+    b.add_output(OutputInfo::new(
+        *recipient,
+        Rhombus::from_raw(pay).unwrap(),
+        Memo::empty(),
+        None,
+    ))
+    .unwrap();
+    if change > 0 {
+        b.add_output(OutputInfo::new(
+            wallet.address,
+            Rhombus::from_raw(change).unwrap(),
+            Memo::empty(),
+            None,
+        ))
+        .unwrap();
+    }
+    b.build_with_fee_opening(
+        Rhombus::from_raw(fee).unwrap(),
+        proving_key(),
+        branch,
+        &mut h.rng,
+    )
+    .unwrap()
+    .0
 }

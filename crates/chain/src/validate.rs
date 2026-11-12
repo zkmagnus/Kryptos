@@ -15,9 +15,8 @@
 
 use std::collections::BTreeSet;
 
-use crypto::signature::BatchVerifier;
+use crypto::signature::{BatchVerifier, BindingVerificationKey};
 use protocol::block::{Block, BlockHeader};
-use protocol::coin::Rhombus;
 use protocol::consensus::{next_height, subsidy, BranchId, BLOCK_VERSION, MAX_BLOCK_TRANSACTIONS};
 use protocol::nullifier::Nullifier;
 use protocol::transaction::Transaction;
@@ -203,6 +202,7 @@ impl Validator<'_> {
         for (tx, coinbase_balance) in balances(block)? {
             batch.queue(tx, coinbase_balance, branch)?;
         }
+        queue_block_binding(block, &mut batch.signatures)?;
         batch.verify(self.vk, rng)
     }
 
@@ -220,10 +220,11 @@ impl Validator<'_> {
             batch.queue(tx, coinbase_balance, branch)?;
             self.check_chain_state(store, tx)?;
         }
+        queue_block_binding(block, &mut batch.signatures)?;
         batch.verify(self.vk, rng)?;
         let mut tree = store.tree()?;
         for tx in tree_transactions(block)? {
-            let effects = SystemCall::Transfer(tx).effects();
+            let effects = SystemCall::dispatch(tx)?.effects();
             for commitment in &effects.commitments {
                 tree.append(commitment)?;
             }
@@ -240,7 +241,7 @@ impl Validator<'_> {
         {
             return Err(Error::InvalidBlock("unknown or stale anchor"));
         }
-        let effects = SystemCall::Transfer(tx).effects();
+        let effects = SystemCall::dispatch(tx)?.effects();
         for nf in &effects.nullifiers {
             if store.contains_nullifier(nf)? {
                 return Err(Error::InvalidBlock("nullifier already spent"));
@@ -250,11 +251,33 @@ impl Validator<'_> {
     }
 }
 
-/// Every transaction of `block` with the public balance required by consensus.
+/// Queues the block-wide Pedersen balance signature. The net value of all
+/// action commitments in a valid block is exactly negative subsidy.
+fn queue_block_binding(block: &Block, batch: &mut BatchVerifier) -> Result<()> {
+    let signature = block
+        .binding_signature()
+        .ok_or(Error::InvalidBlock("missing block value-binding signature"))?;
+    let subsidy = subsidy(block.header().height)
+        .to_i64()?
+        .checked_neg()
+        .ok_or(Error::InvalidBlock("subsidy out of range"))?;
+    let key = BindingVerificationKey::from_commitments(
+        block
+            .transactions()
+            .iter()
+            .flat_map(Transaction::value_commitments),
+        subsidy,
+    )?;
+    let message = Block::binding_message(block.header());
+    batch.queue_binding(&key, signature, &message);
+    Ok(())
+}
+
+/// Every transaction of `block`, with the first item marked as coinbase.
 ///
 /// # Errors
 /// Fails if the transaction count is out of range.
-fn balances(block: &Block) -> Result<Vec<(&Transaction, Option<i64>)>> {
+fn balances(block: &Block) -> Result<Vec<(&Transaction, bool)>> {
     let txs = block.transactions();
     if txs.is_empty() || txs.len() > MAX_BLOCK_TRANSACTIONS {
         return Err(Error::InvalidBlock("transaction count out of range"));
@@ -265,28 +288,9 @@ fn balances(block: &Block) -> Result<Vec<(&Transaction, Option<i64>)>> {
             "coinbase must create exactly two states",
         ));
     }
-    if coinbase.fee() != Rhombus::ZERO {
-        return Err(Error::InvalidBlock(
-            "coinbase cannot claim a transaction fee",
-        ));
-    }
-    let fees = txs.iter().skip(1).try_fold(Rhombus::ZERO, |sum, tx| {
-        sum.checked_add(tx.fee())
-            .map_err(|_| Error::InvalidBlock("block fee total overflow"))
-    })?;
-    let credit = subsidy(block.header().height)
-        .checked_add(fees)
-        .map_err(|_| Error::InvalidBlock("coinbase credit overflow"))?;
     txs.iter()
         .enumerate()
-        .map(|(index, tx)| {
-            let coinbase_balance = if index == 0 {
-                Some(tx_validate::coinbase_balance(credit)?)
-            } else {
-                None
-            };
-            Ok((tx, coinbase_balance))
-        })
+        .map(|(index, tx)| Ok((tx, index == 0)))
         .collect()
 }
 
@@ -303,26 +307,20 @@ struct AuthorizationBatch {
 impl AuthorizationBatch {
     /// Checks `tx`'s structure and block-wide nullifier uniqueness and
     /// queues its signatures, made for `branch`, and its proof.
-    fn queue(
-        &mut self,
-        tx: &Transaction,
-        coinbase_balance: Option<i64>,
-        branch: BranchId,
-    ) -> Result<()> {
-        let call = SystemCall::Transfer(tx);
-        if let Some(balance) = coinbase_balance {
+    fn queue(&mut self, tx: &Transaction, is_coinbase: bool, branch: BranchId) -> Result<()> {
+        let call = SystemCall::dispatch(tx)?;
+        if is_coinbase {
             call.check_coinbase_structure()?;
-            call.queue_coinbase_signatures(balance, branch, &mut self.signatures)?;
         } else {
             call.check_structure()?;
-            call.queue_signatures(branch, &mut self.signatures)?;
         }
-        for nf in SystemCall::Transfer(tx).effects().nullifiers {
+        tx_validate::queue_spend_auth_signatures(tx, branch, &mut self.signatures);
+        for nf in call.effects().nullifiers {
             if !self.seen.insert(nf) {
                 return Err(Error::InvalidBlock("nullifier already spent"));
             }
         }
-        call.queue_proof(&mut self.proofs)?;
+        tx_validate::queue_proof(tx, &mut self.proofs)?;
         Ok(())
     }
 

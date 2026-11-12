@@ -21,14 +21,14 @@ fn params() -> Params<vesta::Affine> {
     Params::new(K)
 }
 
-/// Top-level V1 transaction proof envelope containing the action proof.
+/// Top-level private-fee transaction proof envelope containing the action proof.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PrivateTransactionProofV1(Vec<u8>);
+pub struct PrivateTransactionProofV2(Vec<u8>);
 
-impl PrivateTransactionProofV1 {
-    const MAGIC: &'static [u8; 4] = b"RHV1";
+impl PrivateTransactionProofV2 {
+    const MAGIC: &'static [u8; 4] = b"RHV2";
 
-    /// Wraps a transfer proof in the V1 domain marker.
+    /// Wraps a transfer proof in the V2 domain marker.
     pub fn new(action: &Proof) -> Result<Self, Error> {
         if action.as_bytes().is_empty() {
             return Err(Error::CountMismatch);
@@ -39,7 +39,7 @@ impl PrivateTransactionProofV1 {
         Ok(Self(bytes))
     }
 
-    /// Creates the V1 transaction proof from its action witnesses.
+    /// Creates the V2 transaction proof from its action witnesses.
     pub fn create(
         action_pk: &ProvingKey,
         action_witnesses: &[ActionWitness],
@@ -54,7 +54,7 @@ impl PrivateTransactionProofV1 {
         )?)
     }
 
-    /// Parses the canonical V1 transaction proof envelope.
+    /// Parses the canonical V2 transaction proof envelope.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, Error> {
         if bytes.len() <= Self::MAGIC.len() || &bytes[..Self::MAGIC.len()] != Self::MAGIC {
             return Err(Error::InvalidProof);
@@ -62,12 +62,12 @@ impl PrivateTransactionProofV1 {
         Ok(Self(bytes))
     }
 
-    /// The canonical serialized V1 proof.
+    /// The canonical serialized V2 proof.
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 
-    /// Returns the action proof carried by the V1 envelope.
+    /// Returns the action proof carried by the V2 envelope.
     pub fn proof(&self) -> Result<Proof, Error> {
         if self.0.len() <= Self::MAGIC.len() || &self.0[..Self::MAGIC.len()] != Self::MAGIC {
             return Err(Error::InvalidProof);
@@ -75,7 +75,7 @@ impl PrivateTransactionProofV1 {
         Ok(Proof::from_bytes(self.0[Self::MAGIC.len()..].to_vec()))
     }
 
-    /// Verifies the transfer proof under the V1 transaction domain.
+    /// Verifies the transfer proof under the V2 transaction domain.
     pub fn verify(&self, vk: &VerifyingKey, action_public: &[PublicInputs]) -> Result<(), Error> {
         self.proof()?.verify(vk, action_public)
     }
@@ -297,7 +297,7 @@ mod tests {
 
     /// `BLAKE2b` of the pinned verifying key description. Any change to the
     /// circuit changes this value; update it deliberately, never casually.
-    const PINNED_VK_HASH: &str = "1695a41f021d6d96f2c6370f758ebc280b3caa9652bb60e9cb48fee4148a6f13";
+    const PINNED_VK_HASH: &str = "9b18612cef14d44f18be424aeb9529e38b647f9d80ef2d55ed76a52e63a933e4";
 
     #[test]
     fn verifying_key_is_pinned() {

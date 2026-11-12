@@ -171,6 +171,8 @@ pub enum Request {
     Hash(u32),
     /// Submit a transaction.
     Submit(Box<Transaction>),
+    /// Submit a transaction with its private fee opening relay metadata.
+    SubmitWithFee(Box<Transaction>, protocol::fee::FeeOpening),
     /// Whether a nullifier is spent.
     IsSpent(Nullifier),
     /// A metrics snapshot.
@@ -359,6 +361,7 @@ impl PeerHandle {
 struct PendingBlock {
     header: BlockHeader,
     transactions: Vec<Option<Transaction>>,
+    binding_signature: Option<protocol::block::BindingSignature>,
     received_at: u64,
 }
 
@@ -1024,8 +1027,10 @@ impl Node {
             Message::Block(block) => {
                 self.on_block(Some(id), &block)?;
             }
-            Message::Tx(tx) => self.on_tx(Some(id), *tx, false),
-            Message::StemTx(tx) => self.on_tx(Some(id), *tx, true),
+            Message::Tx(tx) => self.on_tx(Some(id), *tx, false, None),
+            Message::StemTx(tx) => self.on_tx(Some(id), *tx, true, None),
+            Message::TxWithFee(tx, opening) => self.on_tx(Some(id), *tx, false, Some(opening)),
+            Message::StemTxWithFee(tx, opening) => self.on_tx(Some(id), *tx, true, Some(opening)),
             Message::CompactBlock(compact) => self.on_compact_block(id, *compact)?,
             Message::GetBlockTxn { hash, indices } => self.on_get_block_txn(id, hash, &indices)?,
             Message::BlockTxn { hash, transactions } => {
@@ -1251,7 +1256,13 @@ impl Node {
                     None => missing.push(*item),
                 },
                 Inventory::Tx(txid) => match self.mempool.get(txid).cloned() {
-                    Some(tx) => self.send(id, Message::Tx(Box::new(tx))),
+                    Some(tx) => {
+                        let message = match self.mempool.fee_opening(txid).cloned() {
+                            Some(opening) => Message::TxWithFee(Box::new(tx), opening),
+                            None => Message::Tx(Box::new(tx)),
+                        };
+                        self.send(id, message);
+                    }
                     None => missing.push(*item),
                 },
             }
@@ -1406,6 +1417,7 @@ impl Node {
         let pending = PendingBlock {
             header: compact.header,
             transactions,
+            binding_signature: compact.binding_signature,
             received_at: now(),
         };
         if missing.is_empty() {
@@ -1615,11 +1627,21 @@ impl Node {
             &self.params,
             MAX_BLOCK_TRANSACTIONS.saturating_sub(1),
         )?;
+        let fee_openings = transactions
+            .iter()
+            .map(|tx| {
+                self.mempool
+                    .fee_opening(&tx.txid())
+                    .cloned()
+                    .ok_or_else(|| Error::Argument("pooled transaction has no fee opening".into()))
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(Template {
             parent,
             recent,
             tree,
             transactions,
+            fee_openings,
             params: self.params,
             now: now(),
         })
@@ -1627,7 +1649,17 @@ impl Node {
 
     // ---- transactions -----------------------------------------------
 
-    fn on_tx(&mut self, from: Option<PeerId>, tx: Transaction, stem: bool) {
+    fn on_tx(
+        &mut self,
+        from: Option<PeerId>,
+        tx: Transaction,
+        stem: bool,
+        fee_opening: Option<protocol::fee::FeeOpening>,
+    ) {
+        if fee_opening.is_none() {
+            logging::debug("transaction rejected: missing private fee opening");
+            return;
+        }
         let txid = tx.txid();
         if let Some(id) = from {
             if let Some(handle) = self.peers.get_mut(&id) {
@@ -1641,13 +1673,24 @@ impl Node {
             return;
         }
         let verifying = self.chain.verifying_key();
-        match self.mempool.insert(
-            tx.clone(),
-            self.chain.store(),
-            &self.params,
-            verifying,
-            &mut self.rng,
-        ) {
+        let inserted = match fee_opening.clone() {
+            Some(opening) => self.mempool.insert_with_fee_opening(
+                tx.clone(),
+                opening,
+                self.chain.store(),
+                &self.params,
+                verifying,
+                &mut self.rng,
+            ),
+            None => self.mempool.insert(
+                tx.clone(),
+                self.chain.store(),
+                &self.params,
+                verifying,
+                &mut self.rng,
+            ),
+        };
+        match inserted {
             Ok(_) => {}
             Err(chain::Error::Rejected(reason)) => {
                 logging::debug(&format!("tx {txid} rejected: {reason}"));
@@ -1666,13 +1709,24 @@ impl Node {
             (None, _) => self.dandelion.route_own(txid, now(), &mut self.rng),
             (Some(_), false) => Route::Fluff,
         };
-        self.relay(txid, tx, route, from);
+        self.relay(txid, tx, route, from, fee_opening);
     }
 
-    fn relay(&mut self, txid: TxId, tx: Transaction, route: Route<PeerId>, from: Option<PeerId>) {
+    fn relay(
+        &mut self,
+        txid: TxId,
+        tx: Transaction,
+        route: Route<PeerId>,
+        from: Option<PeerId>,
+        fee_opening: Option<protocol::fee::FeeOpening>,
+    ) {
         match route {
             Route::Stem(peer) if self.peers.get(&peer).is_some_and(|h| h.peer.is_ready()) => {
-                self.send(peer, Message::StemTx(Box::new(tx)));
+                let message = match fee_opening {
+                    Some(opening) => Message::StemTxWithFee(Box::new(tx), opening),
+                    None => Message::StemTx(Box::new(tx)),
+                };
+                self.send(peer, message);
             }
             Route::Stem(_) | Route::Fluff => {
                 self.dandelion.seen_fluffed(&txid);
@@ -1738,7 +1792,8 @@ impl Node {
             .retain(|_, p| now.saturating_sub(p.received_at) < PENDING_BLOCK_SECONDS);
         for txid in self.dandelion.expired_embargoes(now) {
             if let Some(tx) = self.mempool.get(&txid).cloned() {
-                self.relay(txid, tx, Route::Fluff, None);
+                let opening = self.mempool.fee_opening(&txid).cloned();
+                self.relay(txid, tx, Route::Fluff, None, opening);
             }
         }
         if self.dandelion.epoch_expired(now) {
@@ -2004,7 +2059,17 @@ impl Node {
             Request::Hash(height) => Ok(Response::Hash(self.chain.store().hash_at(height)?)),
             Request::Submit(tx) => {
                 let txid = tx.txid();
-                self.on_tx(None, *tx, false);
+                let opening = tx.fee_opening().cloned();
+                self.on_tx(None, *tx, false, opening);
+                if self.mempool.contains(&txid) {
+                    Ok(Response::Submitted(txid))
+                } else {
+                    Ok(Response::Failed("transaction not accepted".into()))
+                }
+            }
+            Request::SubmitWithFee(tx, opening) => {
+                let txid = tx.txid();
+                self.on_tx(None, *tx, false, Some(opening));
                 if self.mempool.contains(&txid) {
                     Ok(Response::Submitted(txid))
                 } else {
@@ -2040,7 +2105,14 @@ fn assemble(pending: &PendingBlock) -> Result<Block> {
     if transactions.len() != pending.transactions.len() {
         return Err(Error::Argument("block incomplete".into()));
     }
-    Ok(Block::new(pending.header.clone(), transactions))
+    Ok(match &pending.binding_signature {
+        Some(signature) => Block::new_with_binding_signature(
+            pending.header.clone(),
+            transactions,
+            signature.clone(),
+        ),
+        None => Block::new(pending.header.clone(), transactions),
+    })
 }
 
 /// Whether transactions verified for the branch of the block after

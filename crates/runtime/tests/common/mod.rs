@@ -6,7 +6,7 @@
     clippy::arithmetic_side_effects
 )]
 
-use node::node::{Handle, Request, Response};
+use runtime::node::{Handle, Request, Response};
 use wallet::wallet::Wallet;
 
 /// A reward mined at height 1 is in the tree after block 1 and spendable

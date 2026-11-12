@@ -6,13 +6,13 @@
 //! change and requires an explicit consensus revision and activation rule.
 
 pub use circuit::proof::{
-    proof_len, PrivateTransactionProofV1, Proof, ProofBatch, ProvingKey, VerifyingKey,
+    proof_len, PrivateTransactionProofV2, Proof, ProofBatch, ProvingKey, VerifyingKey,
 };
 pub use systemcall_circuit::Error;
 
 /// Version of the SystemCall proof adapter API, not the wire transaction
-/// version. V1 exposes a top-level transaction proof envelope.
-pub const API_VERSION: u16 = 1;
+/// version. V2 exposes a top-level private-fee transaction proof envelope.
+pub const API_VERSION: u16 = 2;
 
 /// Name of the proving backend currently used by this adapter.
 pub const BACKEND: &str = "halo2";

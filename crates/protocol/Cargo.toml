@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 crypto.workspace = true
+program-vm = { path = "../program-vm" }
 systemcall-circuit.workspace = true
 systemcall-proof.workspace = true
 thiserror.workspace = true

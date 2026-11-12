@@ -33,6 +33,7 @@ pub mod coin;
 pub mod compact;
 pub mod consensus;
 mod error;
+pub mod fee;
 pub mod memo;
 pub mod note;
 pub mod note_encryption;

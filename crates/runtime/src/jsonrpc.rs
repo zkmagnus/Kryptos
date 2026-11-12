@@ -21,7 +21,7 @@ use p2p::peer::Direction;
 use protocol::address::RhombusAddress;
 use protocol::block::{Block, BlockHash, BlockHeader, PowSolution};
 use protocol::bytes::Encodable;
-use protocol::coin::COIN;
+use protocol::coin::RAWCOIN;
 use protocol::consensus::{
     next_height, proof_len, BranchId, ACTION_CLASSES, BLOCK_EMISSION_START, EMISSION_INTERVAL,
     MAX_ACTIONS, MAX_BLOCK_TRANSACTIONS, TAIL_BLOCK_EMISSION,
@@ -184,6 +184,7 @@ struct CachedTemplate {
     payout: RhombusAddress,
     header: BlockHeader,
     transactions: Vec<Transaction>,
+    binding_signature: protocol::block::BindingSignature,
     created_at: u64,
 }
 
@@ -321,7 +322,7 @@ impl Context {
             return Err(RpcError::new(REJECTED, "tip moved; ask again"));
         }
         let pk = self.proving_key().await?;
-        let (header, transactions) = tokio::task::spawn_blocking(move || {
+        let (header, transactions, binding_signature) = tokio::task::spawn_blocking(move || {
             template.assemble(&payout, pk.as_ref(), &mut rand::rngs::OsRng)
         })
         .await
@@ -334,6 +335,7 @@ impl Context {
             payout,
             header,
             transactions,
+            binding_signature,
             created_at: ready,
         };
         let id = lock(&self.templates)?.insert(cached.clone(), ready);
@@ -675,7 +677,11 @@ async fn mining_methods(
                 header.timestamp = params.get(1, "timestamp")?;
                 header.nonce = parse_nonce(&params.get::<String>(2, "nonce")?)?;
                 header.solution = parse_solution(&params.get::<String>(3, "solution")?)?;
-                Block::new(header, cached.transactions)
+                Block::new_with_binding_signature(
+                    header,
+                    cached.transactions,
+                    cached.binding_signature,
+                )
             } else {
                 let hex: String = params.get(0, "block")?;
                 Block::from_slice(&from_hex(&hex)?)?
@@ -848,7 +854,15 @@ async fn other_methods(
         "sendrawtransaction" => {
             let hex: String = params.get(0, "hex")?;
             let tx = Transaction::from_slice(&from_hex(&hex)?)?;
-            match context.ask(Request::Submit(Box::new(tx))).await? {
+            let opening: Option<String> = params.opt(1, "fee_opening")?;
+            let request = match opening {
+                Some(opening) => Request::SubmitWithFee(
+                    Box::new(tx),
+                    protocol::fee::FeeOpening::from_slice(&from_hex(&opening)?)?,
+                ),
+                None => Request::Submit(Box::new(tx)),
+            };
+            match context.ask(request).await? {
                 Response::Submitted(txid) => Ok(json!(txid.to_string())),
                 other => Err(unexpected(&other)),
             }
@@ -945,7 +959,7 @@ async fn blockchain_info(context: &Context) -> core::result::Result<Value, RpcEr
         "max_actions": MAX_ACTIONS,
         "proof_lengths": proof_lengths,
         "max_block_transactions": MAX_BLOCK_TRANSACTIONS,
-        "coin": COIN.to_string(),
+        "coin": RAWCOIN.to_string(),
         "emission": {
             "initial": BLOCK_EMISSION_START.to_string(),
             "tail": TAIL_BLOCK_EMISSION.to_string(),
@@ -1131,7 +1145,8 @@ fn transaction_json(tx: &Transaction, location: Option<(u32, u32)>, tip: u32) ->
     object.insert("txid".into(), json!(tx.txid().to_string()));
     object.insert("version".into(), json!(tx.version()));
     object.insert("anchor".into(), json!(to_hex(&tx.anchor().to_bytes())));
-    object.insert("fee".into(), json!(tx.fee().raw().to_string()));
+    object.insert("fee".into(), Value::Null);
+    object.insert("fee_private".into(), json!(true));
     object.insert("action_count".into(), json!(tx.actions().len()));
     object.insert("actions".into(), Value::Array(actions));
     object.insert("size".into(), json!(tx.to_vec().len()));
@@ -1195,6 +1210,7 @@ pub(crate) fn memo_json(memo: &Memo) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use protocol::address::RhombusAddress as Address;
 
     #[test]
     fn memo_json_reports_empty_text_and_binary_memos() {
@@ -1274,6 +1290,7 @@ mod tests {
             payout,
             header,
             transactions: Vec::new(),
+            binding_signature: protocol::block::BindingSignature::from_bytes([0; 64]),
             created_at,
         }
     }

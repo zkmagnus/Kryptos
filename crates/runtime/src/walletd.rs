@@ -644,6 +644,7 @@ impl WalletDaemon {
         op.locked.sort_unstable();
         op.locked.dedup();
         op.record_transaction(built.transaction.to_vec());
+        op.fee_opening = Some(built.fee_opening.clone());
         if self.0.wallet.compare_and_swap_operation(&previous, &op)? {
             // The commit above must succeed before the node can see any bytes.
             // Any reply failure leaves the exact transaction and locks intact.
@@ -657,7 +658,17 @@ impl WalletDaemon {
             .transaction
             .as_ref()
             .ok_or_else(|| Error::Wallet(wallet::Error::Corrupt("pending transaction missing")))?;
-        client.call(&format!("submit {}", to_hex(bytes))).await?;
+        let opening = op
+            .fee_opening
+            .as_ref()
+            .ok_or_else(|| Error::Wallet(wallet::Error::Corrupt("pending fee opening missing")))?;
+        client
+            .call(&format!(
+                "submit {} {}",
+                to_hex(bytes),
+                to_hex(&opening.to_vec())
+            ))
+            .await?;
         Ok(())
     }
 
@@ -1086,9 +1097,11 @@ fn parse_txid(text: &str) -> core::result::Result<TxId, RpcError> {
 mod tests {
     use std::collections::VecDeque;
 
+    use crypto::commitment::ValueCommitTrapdoor;
     use crypto::keys::SpendingKey;
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
+    use wallet::keys::WalletKeys;
 
     use super::*;
 
@@ -1161,7 +1174,8 @@ mod tests {
                 Memo::empty(),
                 None,
             ))
-            .unwrap()
+            .unwrap();
+        builder
             .build_coinbase(
                 &ProvingKey::build().unwrap(),
                 Rhombus::ZERO,
@@ -1179,6 +1193,10 @@ mod tests {
             built_at: 0,
         };
         op.transaction = Some(tx.to_vec());
+        op.fee_opening = Some(protocol::fee::FeeOpening::new(
+            Rhombus::ZERO,
+            ValueCommitTrapdoor::zero(),
+        ));
         op.locked = vec![0];
         op.attempts = 1;
         wallet.put_operation(&op).unwrap();
@@ -1219,7 +1237,11 @@ mod tests {
             assert_eq!(saved.locked, vec![0]);
             assert_eq!(
                 line,
-                format!("submit {}", to_hex(saved.transaction.as_ref().unwrap()))
+                format!(
+                    "submit {} {}",
+                    to_hex(saved.transaction.as_ref().unwrap()),
+                    to_hex(&saved.fee_opening.as_ref().unwrap().to_vec())
+                )
             );
             // None simulates termination while waiting for a network response.
             match self.reply.take() {
@@ -1261,6 +1283,10 @@ mod tests {
                     Built {
                         transaction: tx.clone(),
                         spent: vec![0],
+                        fee_opening: protocol::fee::FeeOpening::new(
+                            Rhombus::ZERO,
+                            ValueCommitTrapdoor::zero(),
+                        ),
                     },
                     0,
                 ),
@@ -1342,7 +1368,11 @@ mod tests {
         daemon.follow(&mut client, pending, 10, 0).await.unwrap();
         assert_eq!(
             client.calls[1],
-            format!("submit {}", to_hex(op.transaction.as_ref().unwrap()))
+            format!(
+                "submit {} {}",
+                to_hex(op.transaction.as_ref().unwrap()),
+                to_hex(&op.fee_opening.as_ref().unwrap().to_vec())
+            )
         );
         daemon.reconcile_operations(&mut client, 3).await.unwrap();
         let confirmed = daemon.wallet().operation(op.id).unwrap();
@@ -1428,9 +1458,7 @@ mod tests {
     #[tokio::test]
     async fn failed_replacements_keep_pending_transactions_and_retry_limits_keep_locks() {
         let (_dir, wallet) = wallet_file();
-        wallet
-            .scan(&genesis(&Network::Test.params()), 1, None)
-            .unwrap();
+        wallet.scan(&genesis(&Network::Test.params())).unwrap();
         let mut op = recorded_payment(&wallet);
         op.status = OperationStatus::Queued;
         op.attempts = MAX_ATTEMPTS;
@@ -1510,9 +1538,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_restarted_prover_and_a_lost_acceptance_reply_preserve_one_real_payment() {
         let (dir, wallet) = wallet_file();
-        wallet
-            .scan(&genesis(&Network::Test.params()), 1, None)
-            .unwrap();
+        wallet.scan(&genesis(&Network::Test.params())).unwrap();
         assert!(wallet.balance().unwrap() > 0);
         let mut op = payment(&wallet);
         op.status = OperationStatus::Building;

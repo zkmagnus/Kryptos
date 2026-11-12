@@ -139,7 +139,7 @@ mod tests {
         let proxy: SocketAddr = "127.0.0.1:9050".parse().unwrap();
         let mut config = Config::test();
         assert_eq!(path(&config), Some(config.datadir.join(PEERS_FILE)));
-        config.datadir = Some(PathBuf::from("/data"));
+        config.datadir = PathBuf::from("/data");
         assert_eq!(path(&config), Some(PathBuf::from("/data/peers.dat")));
         config.proxy = Some(proxy);
         assert_eq!(path(&config), None, "proxy");

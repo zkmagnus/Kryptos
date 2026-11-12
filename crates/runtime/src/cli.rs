@@ -17,7 +17,7 @@ use protocol::memo::Memo;
 use systemcall_proof::ProvingKey;
 use wallet::keys::WalletKeys;
 use wallet::seed::SeedPhrase;
-use wallet::spend::{build_payment_with_fee, build_payments_with_fee, Payment, MAX_RECIPIENTS};
+use wallet::spend::{build_payments, build_payments_with_fee, Payment, MAX_RECIPIENTS};
 use wallet::wallet::Wallet;
 
 use crate::config::{Config, Network};
@@ -243,9 +243,9 @@ pub enum Command {
         /// Rhombus in smallest units.
         #[arg(long)]
         amount: u64,
-        /// Public fee offer in smallest units.
-        #[arg(long, default_value_t = 0)]
-        fee: u64,
+        /// Private fee amount in raw units (default: 1 raw unit per encoded byte).
+        #[arg(long)]
+        fee: Option<u64>,
         /// The node.
         #[command(flatten)]
         rpc: RpcArgs,
@@ -262,9 +262,9 @@ pub enum Command {
         /// Recipient in ADDRESS=RAW_AMOUNT form; repeat for each recipient.
         #[arg(long = "payment", required = true, value_name = "ADDRESS=RAW_AMOUNT")]
         payments: Vec<String>,
-        /// Public fee offer in smallest units.
-        #[arg(long, default_value_t = 0)]
-        fee: u64,
+        /// Private fee amount in raw units (default: 1 raw unit per encoded byte).
+        #[arg(long)]
+        fee: Option<u64>,
         /// The node.
         #[command(flatten)]
         rpc: RpcArgs,
@@ -359,7 +359,7 @@ pub async fn run(cli: Cli) -> Result<()> {
 async fn batch_transfer(
     wallet_args: &WalletArgs,
     payment_args: &[String],
-    fee: u64,
+    fee: Option<u64>,
     rpc: &RpcArgs,
     light: bool,
 ) -> Result<()> {
@@ -398,21 +398,37 @@ async fn batch_transfer(
     let pk = tokio::task::spawn_blocking(ProvingKey::build)
         .await
         .map_err(|_| Error::Stopped)??;
-    let built = build_payments_with_fee(
-        &wallet,
-        &payments,
-        Rhombus::from_raw(fee)?,
-        &pk,
-        branch,
-        &[],
-        u32::MAX,
-        &mut rand::rngs::OsRng,
-    )?;
+    let built = match fee {
+        Some(raw) => build_payments_with_fee(
+            &wallet,
+            &payments,
+            Rhombus::from_raw(raw)?,
+            &pk,
+            branch,
+            &[],
+            u32::MAX,
+            &mut rand::rngs::OsRng,
+        )?,
+        None => build_payments(
+            &wallet,
+            &payments,
+            &pk,
+            branch,
+            &[],
+            u32::MAX,
+            &mut rand::rngs::OsRng,
+        )?,
+    };
+    let actual_fee = built.transaction.fee().raw();
     let txid = client
-        .call(&format!("submit {}", to_hex(&built.transaction.to_vec())))
+        .call(&format!(
+            "submit {} {}",
+            to_hex(&built.transaction.to_vec()),
+            to_hex(&built.fee_opening.to_vec())
+        ))
         .await?;
     println!(
-        "submitted {txid} ({} recipients, fee {fee} raw units)",
+        "submitted {txid} ({} recipients, fee {actual_fee} raw units)",
         payments.len()
     );
     Ok(())
@@ -441,7 +457,7 @@ async fn send(
     wallet: &WalletArgs,
     to: &str,
     amount: u64,
-    fee: u64,
+    fee: Option<u64>,
     rpc: &RpcArgs,
     light: bool,
 ) -> Result<()> {
@@ -457,8 +473,41 @@ async fn send(
     let pk = tokio::task::spawn_blocking(ProvingKey::build)
         .await
         .map_err(|_| Error::Stopped)??;
-    let txid = pay(&mut client, &wallet, &pk, recipient, amount, fee, branch).await?;
-    println!("submitted {txid} (fee {fee} raw units)");
+    let payment = Payment {
+        recipient,
+        amount,
+        memo: Memo::empty(),
+    };
+    let built = match fee {
+        Some(raw) => build_payments_with_fee(
+            &wallet,
+            &[payment],
+            Rhombus::from_raw(raw)?,
+            &pk,
+            branch,
+            &[],
+            u32::MAX,
+            &mut rand::rngs::OsRng,
+        )?,
+        None => build_payments(
+            &wallet,
+            &[payment],
+            &pk,
+            branch,
+            &[],
+            u32::MAX,
+            &mut rand::rngs::OsRng,
+        )?,
+    };
+    let actual_fee = built.fee_opening.fee().raw();
+    let txid = client
+        .call(&format!(
+            "submit {} {}",
+            to_hex(&built.transaction.to_vec()),
+            to_hex(&built.fee_opening.to_vec())
+        ))
+        .await?;
+    println!("submitted {txid} (fee {actual_fee} raw units)");
     Ok(())
 }
 
@@ -584,16 +633,22 @@ pub async fn pay(
         amount,
         memo: Memo::empty(),
     };
-    let tx = build_payment_with_fee(
+    let built = build_payments_with_fee(
         wallet,
-        payment,
+        &[payment],
         Rhombus::from_raw(fee)?,
         pk,
         branch,
+        &[],
+        u32::MAX,
         &mut rand::rngs::OsRng,
     )?;
     client
-        .call(&format!("submit {}", to_hex(&tx.to_vec())))
+        .call(&format!(
+            "submit {} {}",
+            to_hex(&built.transaction.to_vec()),
+            to_hex(&built.fee_opening.to_vec())
+        ))
         .await
 }
 

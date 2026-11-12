@@ -12,12 +12,12 @@ mod common;
 use std::time::{Duration, Instant};
 
 use crypto::keys::SpendingKey;
-use node::config::{Config, Network};
-use node::node::{spawn, Handle, Request, Response};
-use protocol::amount::Amount;
+use protocol::coin::Rhombus as Amount;
 use protocol::memo::Memo;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
+use runtime::config::{Config, Network};
+use runtime::node::{spawn, Handle, Request, Response};
 use systemcall_proof::ProvingKey;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wallet::keys::WalletKeys;

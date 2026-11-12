@@ -1,0 +1,12 @@
+[package]
+name = "program-vm"
+description = "Deterministic XPVM scalar bytecode validation and execution"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

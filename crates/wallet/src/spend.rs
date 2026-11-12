@@ -5,6 +5,7 @@ use protocol::builder::{Builder, OutputInfo, SpendInfo};
 use protocol::coin::Rhombus;
 use protocol::consensus::action_class_for;
 use protocol::consensus::{BranchId, MAX_ACTIONS};
+use protocol::fee::FeeOpening;
 use protocol::memo::Memo;
 use protocol::transaction::Transaction;
 use rand_core::{CryptoRng, RngCore};
@@ -115,16 +116,44 @@ pub fn quote_payments(
     max_note_height: u32,
 ) -> Result<Quote> {
     let unspent = wallet.unspent()?;
-    quote_from(&unspent, payments, excluded, max_note_height)
+    let (chosen, _) = plan_with_default_fee(&unspent, payments, excluded, max_note_height)?;
+    Ok(Quote {
+        spends: chosen.len(),
+        actions: action_class(chosen.len(), payments.len().saturating_add(1))?,
+    })
 }
 
+/// Finds a stable note selection and fee, accounting for fee bytes possibly
+/// requiring one more input and therefore a larger action class.
+fn plan_with_default_fee<'a>(
+    unspent: &'a [OwnedNote],
+    payments: &[Payment],
+    excluded: &[u64],
+    max_note_height: u32,
+) -> Result<(Vec<&'a OwnedNote>, Rhombus)> {
+    let mut fee = Rhombus::ZERO;
+    for _ in 0..=protocol::consensus::ACTION_CLASSES.len() {
+        let chosen = plan(unspent, payments, fee, excluded, max_note_height)?;
+        let actions = action_class(chosen.len(), payments.len().saturating_add(1))?;
+        let required = Transaction::default_fee_for_actions(actions)?;
+        if required == fee {
+            return Ok((chosen, fee));
+        }
+        fee = required;
+    }
+    Err(Error::Protocol(protocol::Error::InvalidTransaction(
+        "default fee selection did not converge",
+    )))
+}
+
+#[cfg(test)]
 fn quote_from(
     unspent: &[OwnedNote],
     payments: &[Payment],
     excluded: &[u64],
     max_note_height: u32,
 ) -> Result<Quote> {
-    let chosen = plan(unspent, payments, Rhombus::ZERO, excluded, max_note_height)?;
+    let (chosen, _) = plan_with_default_fee(unspent, payments, excluded, max_note_height)?;
     Ok(Quote {
         spends: chosen.len(),
         actions: action_class(chosen.len(), payments.len().saturating_add(1))?,
@@ -147,6 +176,8 @@ pub struct Payment {
 pub struct Built {
     /// The transaction, proved and signed.
     pub transaction: Transaction,
+    /// Fee opening to send as node-only relay metadata.
+    pub fee_opening: FeeOpening,
     /// Positions of the notes it spends, to set aside until it is mined.
     pub spent: Vec<u64>,
 }
@@ -164,10 +195,10 @@ pub fn build_payment(
     branch: BranchId,
     rng: &mut (impl RngCore + CryptoRng),
 ) -> Result<Transaction> {
-    build_payment_with_fee(wallet, payment, Rhombus::ZERO, pk, branch, rng)
+    Ok(build_payments(wallet, &[payment], pk, branch, &[], u32::MAX, rng)?.transaction)
 }
 
-/// Builds a payment with a public fee offer.
+/// Builds a payment with an explicit private fee amount.
 pub fn build_payment_with_fee(
     wallet: &Wallet,
     payment: Payment,
@@ -186,7 +217,8 @@ pub fn build_payment_with_fee(
 /// [`MAX_RECIPIENTS`], from the wallet's unspent notes other than those
 /// at `excluded` positions (notes set aside for pending operations) and
 /// those received above `max_note_height` (too few confirmations).
-/// Change goes to the wallet's default address.
+/// Change goes to the wallet's default address. The default fee is one raw
+/// unit per encoded transaction byte.
 ///
 /// # Errors
 /// Returns [`Error::TooManyRecipients`] past the limit and
@@ -200,20 +232,13 @@ pub fn build_payments(
     max_note_height: u32,
     rng: &mut (impl RngCore + CryptoRng),
 ) -> Result<Built> {
-    build_payments_with_fee(
-        wallet,
-        payments,
-        Rhombus::ZERO,
-        pk,
-        branch,
-        excluded,
-        max_note_height,
-        rng,
-    )
+    let unspent = spendable_notes(wallet)?;
+    let (chosen, fee) = plan_with_default_fee(&unspent, payments, excluded, max_note_height)?;
+    build_selected(wallet, payments, fee, &chosen, pk, branch, rng)
 }
 
-/// Builds a batched payment and returns change after subtracting the public
-/// fee offer. The fee is included in the transaction's signed body.
+/// Builds a batched payment and returns change after subtracting the private
+/// fee amount. The fee opening is returned in relay metadata.
 pub fn build_payments_with_fee(
     wallet: &Wallet,
     payments: &[Payment],
@@ -274,8 +299,10 @@ fn build_selected(
             ovk,
         ))?;
     }
+    let (transaction, fee_opening) = builder.build_with_fee_opening(fee, pk, branch, rng)?;
     Ok(Built {
-        transaction: builder.build_with_fee(fee, pk, branch, rng)?,
+        transaction,
+        fee_opening,
         spent: positions,
     })
 }
@@ -284,6 +311,7 @@ fn build_selected(
 mod tests {
     use crypto::keys::SpendingKey;
     use crypto::pallas;
+    use protocol::coin::Rhombus as Amount;
     use protocol::note::{Note, RandomSeed, Rho};
     use protocol::nullifier::Nullifier;
     use rand::SeedableRng;

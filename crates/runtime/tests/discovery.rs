@@ -4,13 +4,13 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use node::config::{Config, OUTBOUND_TARGET};
-use node::node::{spawn, Event, Handle, PeerSummary, Request, Response};
 use p2p::addrbook::Snapshot;
 use p2p::message::{Message, PeerAddr};
 use p2p::noise::Role;
 use p2p::peer::{version_info, Direction};
 use p2p::transport::{establish, ConnectionReader, ConnectionWriter};
+use runtime::config::{Config, OUTBOUND_TARGET};
+use runtime::node::{spawn, Event, Handle, PeerSummary, Request, Response};
 use tokio::net::{TcpListener, TcpStream};
 
 const DEADLINE: Duration = Duration::from_secs(30);
@@ -60,7 +60,7 @@ fn address(addr: SocketAddr) -> PeerAddr {
     PeerAddr {
         ip,
         port: addr.port(),
-        last_seen: node::now(),
+        last_seen: runtime::now(),
     }
 }
 
@@ -84,7 +84,7 @@ impl Client {
                 123,
                 0,
                 genesis,
-                node::now(),
+                runtime::now(),
             )))
             .await
             .unwrap();
@@ -320,7 +320,7 @@ async fn an_unfinished_version_handshake_cannot_start_chain_sync() {
             123,
             1,
             ours.genesis,
-            node::now(),
+            runtime::now(),
         )))
         .await
         .unwrap();

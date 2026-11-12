@@ -5,8 +5,8 @@ use core::ops::{Add, Sub};
 
 use crate::{Error, Result};
 
-/// Smallest unit. Provisional: 6 decimal places.
-pub const COIN: u64 = 1_000_000;
+/// Smallest unit. Provisional: 8 decimal places.
+pub const RAWCOIN: u64 = 100_000_000;
 
 /// A non-negative amount represented as a `u64`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]

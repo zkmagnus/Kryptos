@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use protocol::block::Block;
 use protocol::consensus::{next_height, BranchId};
+use protocol::fee::FeeOpening;
 use protocol::nullifier::Nullifier;
 use protocol::transaction::{Transaction, TxId};
 use rand_core::{CryptoRng, RngCore};
@@ -55,6 +56,9 @@ pub struct Mempool {
     by_id: HashMap<TxId, u64>,
     /// Nullifier to the transaction that would spend it.
     nullifiers: HashMap<Nullifier, TxId>,
+    /// Fee openings received out of band from peers. These are not stored in
+    /// blocks or transaction encodings.
+    fee_openings: HashMap<TxId, FeeOpening>,
     next_seq: u64,
     capacity: usize,
     /// The consensus branch every pooled signature was verified for. The
@@ -70,6 +74,7 @@ impl Mempool {
             queue: BTreeMap::new(),
             by_id: HashMap::new(),
             nullifiers: HashMap::new(),
+            fee_openings: HashMap::new(),
             next_seq: 0,
             capacity,
             verified_for: None,
@@ -112,6 +117,30 @@ impl Mempool {
         self.by_id.get(txid).and_then(|seq| self.queue.get(seq))
     }
 
+    /// The relay opening associated with a pooled transaction, if supplied.
+    pub fn fee_opening(&self, txid: &TxId) -> Option<&FeeOpening> {
+        self.fee_openings.get(txid)
+    }
+
+    /// Admits a transaction with its off-chain fee opening.
+    ///
+    /// The opening is verified against the transaction's aggregate value
+    /// commitment before admission.
+    pub fn insert_with_fee_opening(
+        &mut self,
+        tx: Transaction,
+        opening: FeeOpening,
+        store: &Store,
+        params: &ChainParams,
+        vk: &VerifyingKey,
+        rng: &mut (impl RngCore + CryptoRng),
+    ) -> Result<TxId> {
+        let tx = tx.with_fee_opening(&opening)?;
+        let txid = self.insert(tx, store, params, vk, rng)?;
+        self.fee_openings.insert(txid, opening);
+        Ok(txid)
+    }
+
     /// Admits `tx` after full stateless verification and the stateful
     /// checks against `store`.
     ///
@@ -134,7 +163,7 @@ impl Mempool {
         if self.len() >= self.capacity {
             return Err(Error::Rejected(Rejection::Full));
         }
-        let call = SystemCall::Transfer(&tx);
+        let call = SystemCall::dispatch(&tx)?;
         call.check_structure()?;
         self.check_state(&tx, store, params)?;
         call.verify(branch, vk, rng)?;
@@ -166,8 +195,15 @@ impl Mempool {
             if self.contains(&txid) || self.len() >= self.capacity {
                 continue;
             }
+            let Some(opening) = self.fee_openings.get(&txid).cloned() else {
+                // Block encodings intentionally omit fee openings. A wallet
+                // can resubmit after a reorg with its persisted relay opening.
+                continue;
+            };
             if self.check_state(tx, store, params).is_ok() {
-                self.admit(txid, tx.clone());
+                if let Ok(tx) = tx.clone().with_fee_opening(&opening) {
+                    self.admit(txid, tx);
+                }
             }
         }
         Ok(())
@@ -207,11 +243,13 @@ impl Mempool {
         self.queue.clear();
         self.by_id.clear();
         self.nullifiers.clear();
+        self.fee_openings.clear();
     }
 
     fn remove(&mut self, txid: &TxId) -> Option<Transaction> {
         let seq = self.by_id.remove(txid)?;
         let tx = self.queue.remove(&seq)?;
+        self.fee_openings.remove(txid);
         for nf in tx.nullifiers() {
             self.nullifiers.remove(nf);
         }

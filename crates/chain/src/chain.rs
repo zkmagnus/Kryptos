@@ -233,7 +233,7 @@ impl Chain {
 /// Revision of the validation logic. Bump it in the same commit as any
 /// change to how blocks are validated or applied that the parameters do not
 /// capture, so stores built by earlier binaries are refused instead of served.
-pub const CONSENSUS_REVISION: u32 = 1;
+pub const CONSENSUS_REVISION: u32 = 3;
 
 /// Digest of everything that decides whether an applied block was valid:
 /// [`CONSENSUS_REVISION`], every consensus parameter, the genesis branch,
@@ -241,11 +241,12 @@ pub const CONSENSUS_REVISION: u32 = 1;
 pub fn rules_digest(params: &ChainParams, vk: &VerifyingKey) -> [u8; 32] {
     let mut w = Writer::default();
     w.put(&CONSENSUS_REVISION.to_le_bytes());
-    w.put(b"rhombus-randomx-v1-systemcall-v1-public-fee-no-tax-no-reserve-no-burn-no-coinbase-maturity");
+    w.put(b"rhombus-randomx-v1-systemcall-v3-transfer-opcode-private-fee-block-binding");
     w.put(&protocol::consensus::TX_VERSION.to_le_bytes());
-    w.put(&protocol::consensus::TRANSFER_PROGRAM_ID);
-    w.put(&protocol::consensus::TRANSFER_PROGRAM_VERSION.to_le_bytes());
+    w.put(&[protocol::consensus::TRANSFER_OPCODE]);
     w.put(&protocol::consensus::TRANSFER_ENTRYPOINT.to_le_bytes());
+    w.put(&protocol::consensus::COINBASE_ENTRYPOINT.to_le_bytes());
+    w.put(&[protocol::consensus::BLOCK_VERSION]);
     w.put(&protocol::consensus::BLOCK_EMISSION_START.to_le_bytes());
     w.put(&protocol::consensus::TAIL_BLOCK_EMISSION.to_le_bytes());
     w.put(&protocol::consensus::EMISSION_INTERVAL.to_le_bytes());

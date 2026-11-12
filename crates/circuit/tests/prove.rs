@@ -56,10 +56,15 @@ fn action(rng: &mut ChaCha20Rng, value: u64) -> (ActionWitness, PublicInputs) {
         rcm: Fp::random(&mut *rng),
     };
     output.rho = spend.nullifier();
+    let rcv = pallas::Scalar::random(&mut *rng);
+    let transaction_net = value - output.value;
     let witness = ActionWitness {
         spend,
         output,
-        rcv: pallas::Scalar::random(&mut *rng),
+        rcv,
+        transaction_net,
+        transaction_rcv: rcv,
+        transaction_negative: false,
     };
     let public = PublicInputs::from_witness(tree.root(), &witness).unwrap();
     (witness, public)
@@ -73,8 +78,17 @@ fn two_action_proof_roundtrips_and_rejects_wrong_inputs() {
     let vk = pk.verifying_key();
     eprintln!("keygen: {:?}", started.elapsed());
 
-    let (w1, p1) = action(&mut rng, 1_000);
-    let (w2, p2) = action(&mut rng, 0);
+    let (mut w1, p1) = action(&mut rng, 1_000);
+    let (mut w2, p2) = action(&mut rng, 0);
+    let total_net = w1.transaction_net + w2.transaction_net;
+    let total_rcv = w1.rcv + w2.rcv;
+    for witness in [&mut w1, &mut w2] {
+        witness.transaction_net = total_net;
+        witness.transaction_rcv = total_rcv;
+        witness.transaction_negative = false;
+    }
+    let p1 = PublicInputs::from_witness(p1.anchor, &w1).unwrap();
+    let p2 = PublicInputs::from_witness(p2.anchor, &w2).unwrap();
 
     let started = Instant::now();
     let proof = Proof::create(&pk, &[w1, w2], &[p1, p2], &mut rng).unwrap();

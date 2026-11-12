@@ -15,15 +15,15 @@ use std::time::Duration;
 use chain::pow::RandomXPow;
 use crypto::encoding::{from_hex, to_hex};
 use crypto::keys::SpendingKey;
-use node::config::{Config, Network};
-use node::jsonrpc::REJECTED;
-use node::node::spawn;
-use node::rpc::Token;
 use protocol::block::{Block, BlockHash, BlockHeader, PowSolution};
 use protocol::bytes::Encodable;
 use protocol::transaction::Anchor;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
+use runtime::config::{Config, Network};
+use runtime::jsonrpc::REJECTED;
+use runtime::node::spawn;
+use runtime::rpc::Token;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -114,7 +114,7 @@ async fn a_pool_mines_through_templates_and_submissions() {
     assert_eq!(info["height"], 0);
     assert_eq!(info["syncing"], false);
     assert_eq!(info["next_height"], 1);
-    assert_eq!(info["subsidy"], "5000000000", "50 DTC initial emission");
+    assert_eq!(info["subsidy"], "12500000", "12.5 Rhombus tail emission");
     assert_eq!(info["pow"]["algorithm"], "RandomX");
     assert_eq!(info["next_target"].as_str().unwrap().len(), 8);
 
@@ -134,7 +134,7 @@ async fn a_pool_mines_through_templates_and_submissions() {
     assert_eq!(again["template_id"], template["template_id"]);
     assert_eq!(
         call_err(addr, t, "getblocktemplate", json!(["tnull1nonsense"])).await,
-        node::jsonrpc::INVALID_PARAMS
+        runtime::jsonrpc::INVALID_PARAMS
     );
 
     // The pool rebuilds the header, checks it hashes the bytes the node

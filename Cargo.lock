@@ -1305,6 +1305,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "program-vm"
+version = "0.1.0"
+
+[[package]]
 name = "proptest"
 version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1331,6 +1335,7 @@ dependencies = [
  "base64",
  "crypto",
  "ff",
+ "program-vm",
  "rand 0.8.8",
  "rand_chacha",
  "rand_core 0.6.4",
@@ -1831,6 +1836,7 @@ name = "systemcall"
 version = "0.1.0"
 dependencies = [
  "crypto",
+ "program-vm",
  "protocol",
  "rand 0.8.8",
  "rand_chacha",

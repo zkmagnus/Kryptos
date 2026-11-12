@@ -9,9 +9,13 @@ transfer private notes and are authorized with zero-knowledge proofs built on
 Halo2.
 There are no transparent addresses.
 
-The current SystemCall migration selects ABI v1 with a new genesis for each
-network. This is a consensus-breaking development change: old chain databases
-and legacy wire histories are incompatible. See [SYSTEM-CALL-SPEC.md](SYSTEM-CALL-SPEC.md)
+The current transaction migration selects wire version 3 with one explicit
+Transfer opcode, private fees, and a block-wide value binding signature, with
+a new genesis for each network. The shielded action proof remains envelope
+V2. Fee openings travel as relay metadata; transaction and block encodings do not
+publish fee or reward amounts. This is a consensus-breaking development
+change: old chain databases and legacy wire histories are incompatible. See
+[SYSTEM-CALL-SPEC.md](SYSTEM-CALL-SPEC.md) and [PRIVATE-FEES-DESIGN.md](PRIVATE-FEES-DESIGN.md)
 for the ABI and migration status.
 
 Blocks use RandomX proof of work. Nodes run RandomX in light mode and need
@@ -26,8 +30,9 @@ a mainnet payment.
 The `rhombus` command runs a node, mines blocks, syncs the chain and relays
 transactions over encrypted peer connections using Dandelion++. The wallet
 can scan balances and send payments. A separate test network is available for
-development. The block subsidy follows the schedule in [EMISSION-DESIGN.md](EMISSION-DESIGN.md),
-including a permanent tail. Rhombus is experimental
+development. Blocks pay 12.5 Rhombus per block initially, then transition to
+the 0.125 Rhombus tail after the first million-block emission interval.
+Rhombus is experimental
 and has not had an independent security audit; see [SECURITY.md](SECURITY.md)
 for the review scope and vulnerability reporting guidance.
 
@@ -109,7 +114,12 @@ a reorganization.
 ### Batch transfers
 
 `batchtransfer` sends several recipients in one transaction and one proof.
-Amounts are in raw units, and each `--payment` is `ADDRESS=RAW_AMOUNT`:
+Amounts are in raw units, and each `--payment` is `ADDRESS=RAW_AMOUNT`.
+Wallet send commands default to a fee of one raw unit per encoded
+transaction byte; pass `--fee` to set an explicit fee in raw units. Fee
+amounts travel with encrypted node-to-node relay metadata and are omitted from
+transaction and block encodings. A block-wide binding signature proves that
+the coinbase value is limited to the subsidy plus the aggregate fees:
 
 ```sh
 cargo run --release -p runtime -- batchtransfer --network test \
@@ -118,5 +128,6 @@ cargo run --release -p runtime -- batchtransfer --network test \
   --payment '<ADDRESS_2>=400000'
 ```
 
-The protocol uses the existing Transfer SystemCall; no separate consensus
-entrypoint is needed. Wallet RPC clients can also use `sendmany`.
+Transactions carry the Transfer opcode and dispatch into the existing shielded
+action proof and balance checks. The opcode has no public payload, so the
+recipient and amount remain private. Wallet RPC clients can also use `sendmany`.

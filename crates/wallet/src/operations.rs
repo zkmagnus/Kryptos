@@ -5,6 +5,7 @@
 use protocol::address::RhombusAddress;
 use protocol::bytes::{Encodable, Reader, Writer};
 use protocol::coin::Rhombus;
+use protocol::fee::FeeOpening;
 use protocol::memo::Memo;
 use protocol::transaction::TxId;
 
@@ -91,6 +92,8 @@ pub struct Operation {
     pub locked: Vec<u64>,
     /// The built transaction, kept for resubmission.
     pub transaction: Option<Vec<u8>>,
+    /// Off-chain opening for the active transaction's fee commitment.
+    pub fee_opening: Option<FeeOpening>,
     /// How many times it was built.
     pub attempts: u32,
     /// Earlier versions of this payment. Kept so a reorganization that mines
@@ -109,6 +112,7 @@ impl Operation {
             status: OperationStatus::Queued,
             locked: Vec::new(),
             transaction: None,
+            fee_opening: None,
             attempts: 0,
             previous_transactions: Vec::new(),
         }
@@ -252,10 +256,19 @@ impl Encodable for Operation {
         w.put(&self.attempts.to_le_bytes());
         // Empty history retains the original disk layout. A nonempty extension
         // is readable by new wallets and refused by old ones, never ignored.
-        if !self.previous_transactions.is_empty() {
+        if !self.previous_transactions.is_empty() || self.fee_opening.is_some() {
             w.put_u64_le(self.previous_transactions.len() as u64);
             for bytes in &self.previous_transactions {
                 w.put_u64_le(bytes.len() as u64).put(bytes);
+            }
+            match &self.fee_opening {
+                Some(opening) => {
+                    w.put_u8(1);
+                    opening.write(w);
+                }
+                None => {
+                    w.put_u8(0);
+                }
             }
         }
     }
@@ -284,17 +297,20 @@ impl Encodable for Operation {
         };
         let attempts = u32::from_le_bytes(r.take_array()?);
         let mut previous_transactions = Vec::new();
+        let mut fee_opening = None;
         if r.remaining() > 0 {
             let count = r.take_u64_le()?;
-            if count == 0 {
-                return Err(protocol::Error::Malformed(
-                    "empty transaction history extension",
-                ));
-            }
             for _ in 0..count {
                 let len = usize::try_from(r.take_u64_le()?)
                     .map_err(|_| protocol::Error::Malformed("transaction length"))?;
                 previous_transactions.push(r.take(len)?.to_vec());
+            }
+            if r.remaining() > 0 {
+                fee_opening = match r.take_u8()? {
+                    0 => None,
+                    1 => Some(FeeOpening::read(r)?),
+                    _ => return Err(protocol::Error::Malformed("fee opening flag")),
+                };
             }
         }
         Ok(Self {
@@ -305,6 +321,7 @@ impl Encodable for Operation {
             status,
             locked,
             transaction,
+            fee_opening,
             attempts,
             previous_transactions,
         })
@@ -314,6 +331,7 @@ impl Encodable for Operation {
 #[cfg(test)]
 mod tests {
     use crypto::keys::SpendingKey;
+    use protocol::coin::Rhombus as Amount;
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
 
@@ -405,9 +423,10 @@ mod tests {
         assert_eq!(Operation::from_slice(&op.to_vec()).unwrap(), op);
         let mut malformed = sample(OperationStatus::Queued).to_vec();
         malformed.extend_from_slice(&0u64.to_le_bytes());
+        malformed.push(2); // invalid fee-opening flag after the extension count
         assert!(Operation::from_slice(&malformed).is_err());
         let mut truncated = op.to_vec();
-        truncated.pop();
+        truncated.truncate(truncated.len() - 2);
         assert!(Operation::from_slice(&truncated).is_err());
     }
 }

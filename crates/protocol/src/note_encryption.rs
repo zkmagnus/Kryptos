@@ -362,6 +362,8 @@ fn parse_out_plaintext(bytes: &[u8]) -> Result<(DiversifiedTransmissionKey, Ephe
 
 #[cfg(test)]
 mod tests {
+    use crate::address::RhombusAddress as Address;
+    use crate::coin::Rhombus as Amount;
     use crypto::commitment::ValueCommitTrapdoor;
     use crypto::keys::{FullViewingKey, SpendingKey};
     use crypto::pallas;
@@ -529,7 +531,7 @@ mod tests {
         assert_eq!(decoded.memo, s.memo);
 
         let mut bad_version = encoded.clone();
-        bad_version[0] = 0x01;
+        bad_version[0] = 0x02;
         assert_eq!(
             NotePlaintext::decode(&bad_version).unwrap_err(),
             Error::NoteDecryption("unknown plaintext version")
@@ -541,13 +543,13 @@ mod tests {
     }
 
     #[test]
-    fn plaintext_value_above_cap_is_rejected() {
+    fn plaintext_accepts_the_full_raw_amount_range() {
         let s = scenario(9, true);
         let mut encoded = NotePlaintext::from_note(&s.note, &s.memo).encode();
         encoded[12..20].copy_from_slice(&u64::MAX.to_le_bytes());
         assert_eq!(
-            NotePlaintext::decode(&encoded).unwrap_err(),
-            Error::AmountOutOfRange
+            NotePlaintext::decode(&encoded).unwrap().value.raw(),
+            u64::MAX
         );
     }
 

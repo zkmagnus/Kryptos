@@ -16,13 +16,13 @@ use std::time::{Duration, Instant};
 
 use chain::genesis::genesis;
 use crypto::keys::SpendingKey;
-use node::config::{Config, Network};
-use node::jsonrpc::{NOT_FOUND, REJECTED};
-use node::node::spawn;
-use node::rpc::{Endpoint, Token};
-use node::walletd;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
+use runtime::config::{Config, Network};
+use runtime::jsonrpc::{NOT_FOUND, REJECTED};
+use runtime::node::spawn;
+use runtime::rpc::{Endpoint, Token};
+use runtime::walletd;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -109,7 +109,7 @@ async fn the_wallet_daemon_serves_an_exchange() {
     let prefix = Network::Test.address_prefix();
 
     // It syncs and sees the coinbase notes from blocks 1 to 3.
-    let three_rewards = u64::from(3);
+    let three_rewards = 3u64;
     wait_for(Duration::from_secs(240), async || {
         let info = call(addr, t, "getwalletinfo", json!([])).await;
         info["scanned_height"]
@@ -258,7 +258,7 @@ async fn the_wallet_daemon_serves_an_exchange() {
             json!([[{"address": "tnull1junk", "amount": "1"}]])
         )
         .await,
-        node::jsonrpc::INVALID_PARAMS
+        runtime::jsonrpc::INVALID_PARAMS
     );
 
     // Rescan from genesis finds the same notes again.

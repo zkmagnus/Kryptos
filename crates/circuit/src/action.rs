@@ -1,7 +1,8 @@
 //! The action circuit: all three layers of `docs/circuit.md`.
 //!
 //! Public inputs, one instance column, rows in this order:
-//! `anchor, nf_old, rk.x, rk.y, cmx_new, cv_net.x, cv_net.y`.
+//! `anchor, nf_old, rk.x, rk.y, cmx_new, cv_net.x, cv_net.y,
+//!  cv_net_total.x, cv_net_total.y, net_sign`.
 
 use crypto::commitment::{ValueCommitTrapdoor, ValueCommitment};
 use crypto::curve::Generator;
@@ -40,8 +41,14 @@ pub mod rows {
     pub const CV_X: usize = 5;
     /// `cv_net.y`.
     pub const CV_Y: usize = 6;
+    /// Aggregate `cv_net.x`.
+    pub const NET_TOTAL_X: usize = 7;
+    /// Aggregate `cv_net.y`.
+    pub const NET_TOTAL_Y: usize = 8;
+    /// Aggregate net sign, +1 for transfer and -1 for coinbase.
+    pub const NET_SIGN: usize = 9;
     /// Number of rows.
-    pub const COUNT: usize = 7;
+    pub const COUNT: usize = 10;
 }
 
 /// `log2` of the number of rows the circuit needs.
@@ -125,6 +132,13 @@ pub struct ActionWitness {
     pub output: NoteWitness,
     /// The value commitment trapdoor.
     pub rcv: pallas::Scalar,
+    /// Absolute net value of the whole transaction, shared by each action
+    /// witness in its proof bundle.
+    pub transaction_net: u64,
+    /// Sum of all per-action value commitment blindings in the transaction.
+    pub transaction_rcv: pallas::Scalar,
+    /// Whether the aggregate transaction net is negative (coinbase).
+    pub transaction_negative: bool,
 }
 
 impl ActionWitness {
@@ -139,6 +153,24 @@ impl ActionWitness {
             .and_then(|net| i64::try_from(net).ok())
             .ok_or(crypto::Error::Internal("net value overflow"))?;
         let cv = ValueCommitment::commit(net, &ValueCommitTrapdoor::from_scalar(self.rcv));
+        Ok(*cv.as_point())
+    }
+
+    /// The transaction-wide net commitment repeated by each action proof.
+    pub fn transaction_cv_net(&self, negative: bool) -> Result<pallas::Point, crypto::Error> {
+        let magnitude = i64::try_from(self.transaction_net)
+            .map_err(|_| crypto::Error::Internal("transaction net exceeds i64"))?;
+        let value = if negative {
+            magnitude
+                .checked_neg()
+                .ok_or(crypto::Error::Internal("transaction net overflow"))?
+        } else {
+            magnitude
+        };
+        let cv = ValueCommitment::commit(
+            value,
+            &ValueCommitTrapdoor::from_scalar(self.transaction_rcv),
+        );
         Ok(*cv.as_point())
     }
 }
@@ -156,6 +188,10 @@ pub struct PublicInputs {
     pub cmx_new: Fp,
     /// The net value commitment.
     pub cv_net: pallas::Point,
+    /// The sum of all action net value commitments.
+    pub cv_net_total: pallas::Point,
+    /// The sign of the aggregate net value: +1 for transfers, -1 for coinbase.
+    pub net_sign: Fp,
 }
 
 impl PublicInputs {
@@ -170,6 +206,12 @@ impl PublicInputs {
             rk: witness.spend.rk(),
             cmx_new: witness.output.commitment(),
             cv_net: witness.cv_net()?,
+            cv_net_total: witness.transaction_cv_net(witness.transaction_negative)?,
+            net_sign: if witness.transaction_negative {
+                -Fp::one()
+            } else {
+                Fp::one()
+            },
         })
     }
 
@@ -177,6 +219,7 @@ impl PublicInputs {
     pub fn to_instance(&self) -> Vec<Vec<Fp>> {
         let (rk_x, rk_y) = affine_coords(&self.rk);
         let (cv_x, cv_y) = affine_coords(&self.cv_net);
+        let (net_total_x, net_total_y) = affine_coords(&self.cv_net_total);
         vec![vec![
             self.anchor,
             self.nf_old,
@@ -185,6 +228,9 @@ impl PublicInputs {
             self.cmx_new,
             cv_x,
             cv_y,
+            net_total_x,
+            net_total_y,
+            self.net_sign,
         ]]
     }
 }
@@ -460,7 +506,53 @@ impl ActionCircuit {
                 .map(|w| w.cv_net().unwrap_or(pallas::Point::identity())),
         )?;
         cv_net.constrain_equal(layouter.namespace(|| "value balance"), &expected)?;
-        constrain_point(config, layouter, &cv_net, rows::CV_X, rows::CV_Y)
+        constrain_point(config, layouter, &cv_net, rows::CV_X, rows::CV_Y)?;
+
+        // The transaction aggregate is range checked once per action proof
+        // instance. All instances receive the same signed value and blinding;
+        // the public aggregate point is derived from the action commitments.
+        let transaction_net = config.note.load(
+            layouter.namespace(|| "transaction net magnitude"),
+            "transaction net magnitude",
+            self.witness.as_ref().map(|w| Fp::from(w.transaction_net)),
+        )?;
+        let transaction_sign = config.note.load_instance(
+            layouter.namespace(|| "transaction net sign"),
+            config.instance,
+            rows::NET_SIGN,
+        )?;
+        let transaction_value = config.ecc.mul_value(
+            layouter.namespace(|| "[transaction net] V"),
+            &transaction_net,
+            &transaction_sign,
+        )?;
+        let transaction_randomness = config.ecc.mul_fixed(
+            layouter.namespace(|| "[transaction rcv] R"),
+            FullBase::ValueCommitRandom,
+            self.witness.as_ref().map(|w| w.transaction_rcv),
+        )?;
+        let transaction_expected = transaction_value.add(
+            layouter.namespace(|| "aggregate net commitment"),
+            &transaction_randomness,
+        )?;
+        let transaction_commitment = config.ecc.witness_point(
+            layouter.namespace(|| "transaction cv_net total"),
+            self.witness.as_ref().map(|w| {
+                w.transaction_cv_net(w.transaction_negative)
+                    .unwrap_or(pallas::Point::identity())
+            }),
+        )?;
+        transaction_commitment.constrain_equal(
+            layouter.namespace(|| "aggregate transaction balance"),
+            &transaction_expected,
+        )?;
+        constrain_point(
+            config,
+            layouter,
+            &transaction_commitment,
+            rows::NET_TOTAL_X,
+            rows::NET_TOTAL_Y,
+        )
     }
 }
 
@@ -537,12 +629,17 @@ mod tests {
             rivk: fvk.rivk().expose(),
             alpha: pallas::Scalar::random(&mut rng),
         };
-        let mut output = random_note(&mut rng, 5);
+        let mut output = random_note(&mut rng, value.min(5));
         output.rho = spend.nullifier();
+        let rcv = pallas::Scalar::random(&mut rng);
+        let transaction_net = value - output.value;
         let witness = ActionWitness {
             spend,
             output,
-            rcv: pallas::Scalar::random(&mut rng),
+            rcv,
+            transaction_net,
+            transaction_rcv: rcv,
+            transaction_negative: false,
         };
         let public = PublicInputs::from_witness(tree.root(), &witness).unwrap();
         Fixture { witness, public }
@@ -745,6 +842,9 @@ mod tests {
         for (seed, old, new) in [(18u64, 1_000u64, 5u64), (19, 1_000, 2_000), (20, 7, 7)] {
             let mut f = fixture(seed, old);
             f.witness.output.value = new;
+            f.witness.transaction_net = old.abs_diff(new);
+            f.witness.transaction_negative = new > old;
+            f.witness.transaction_rcv = f.witness.rcv;
             let public = PublicInputs::from_witness(f.public.anchor, &f.witness).unwrap();
             assert_eq!(prove(&f, &public), Ok(()), "old {old} new {new}");
         }

@@ -1,22 +1,19 @@
 //! Consensus constants for transaction shape, issuance and size limits.
-//! Explicit public transaction fees are included in coinbase accounting;
-//! per-action tax and reserve accounting are removed.
+//! Transaction fees are relay metadata and block reward conservation is
+//! checked with the block-wide value-binding signature.
 
 use crate::coin::Rhombus;
 use crate::{Error, Result};
 
-/// The only outer transaction version. Transfer SystemCall program version 1
-/// is the sole supported transaction and proof layout.
+/// The private-fee transaction format with an explicit SystemCall opcode.
 pub const TX_VERSION: u8 = 1;
 
-/// Fixed V1 identity of the public-fee Transfer SystemCall. The distinct ID
-/// prevents old layouts from being parsed as this transaction format.
-pub const TRANSFER_PROGRAM_ID: [u8; 32] = *b"RHOMBUS\0TRANSFER\0V1FEE\0\0\0\0\0\0\0\0\0\0";
-/// Current Transfer SystemCall envelope and proof version, with a public
-/// explicit transaction fee and no tax, reserve, or burn field.
-pub const TRANSFER_PROGRAM_VERSION: u16 = 1;
+/// The only supported VM operation, also encoded in each transaction.
+pub const TRANSFER_OPCODE: u8 = program_vm::TRANSFER_OPCODE;
 /// Entrypoint selector for a shielded transfer.
 pub const TRANSFER_ENTRYPOINT: u16 = 1;
+/// Entry point for a block's coinbase transfer. Its aggregate net is negative.
+pub const COINBASE_ENTRYPOINT: u16 = 2;
 
 /// The only block version.
 pub const BLOCK_VERSION: u8 = 1;
@@ -48,15 +45,15 @@ pub const POW_SOLUTION_LEN: usize = 32;
 /// Most transactions a block may carry. Provisional.
 pub const MAX_BLOCK_TRANSACTIONS: usize = 512;
 
-/// Initial block emission: 50 Rhombs.
-pub const BLOCK_EMISSION_START: u64 = 50_000_000;
-/// Permanent tail emission: 0.781250 Rhombs, reached after six halvings.
-pub const TAIL_BLOCK_EMISSION: u64 = 781_250;
-/// Number of halvings from the initial emission to the permanent tail.
-pub const EMISSION_HALVINGS_TO_TAIL: u64 = 6;
+/// Initial block emission: 12.5 Rhombs.
+pub const BLOCK_EMISSION_START: u64 = 1_250_000_000;
+/// Permanent tail emission: 0.125 Rhombs.
+pub const TAIL_BLOCK_EMISSION: u64 = 12_500_000;
+/// Number of emission intervals before subsidy reaches the permanent tail.
+pub const EMISSION_HALVINGS_TO_TAIL: u64 = 1;
 /// Length of each emission interval: approximately six months at 30 seconds
 /// per block (365 days per year).
-pub const EMISSION_INTERVAL: u64 = 100_000;
+pub const EMISSION_INTERVAL: u64 = 1_000_000;
 
 /// The block subsidy at `height`. Genesis pays nothing.
 pub fn subsidy(height: u32) -> Rhombus {
@@ -169,14 +166,13 @@ mod tests {
     }
 
     #[test]
-    fn emission_schedule_halves_from_fifty_to_a_permanent_tail() {
+    fn emission_reaches_the_permanent_tail_after_one_interval() {
         assert_eq!(subsidy(0), Rhombus::ZERO);
         assert_eq!(subsidy(1).raw(), BLOCK_EMISSION_START);
         assert_eq!(subsidy(100_000).raw(), BLOCK_EMISSION_START);
-        assert_eq!(subsidy(100_001).raw(), BLOCK_EMISSION_START / 2);
-        assert_eq!(subsidy(200_001).raw(), BLOCK_EMISSION_START / 4);
-        assert_eq!(subsidy(500_001).raw(), BLOCK_EMISSION_START / 32);
-        assert_eq!(subsidy(600_001).raw(), TAIL_BLOCK_EMISSION);
+        assert_eq!(BLOCK_EMISSION_START, 12_500_000);
+        assert_eq!(TAIL_BLOCK_EMISSION, 125_000);
+        assert_eq!(subsidy(1_000_001).raw(), TAIL_BLOCK_EMISSION);
         assert_eq!(subsidy(u32::MAX).raw(), TAIL_BLOCK_EMISSION);
     }
 }

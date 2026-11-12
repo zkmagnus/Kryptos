@@ -5,11 +5,11 @@
 use std::time::Duration;
 
 use crypto::keys::SpendingKey;
-use node::config::{Config, Network};
-use node::miner;
-use node::node::{spawn, Handle, Request, Response};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
+use runtime::config::{Config, Network};
+use runtime::miner;
+use runtime::node::{spawn, Handle, Request, Response};
 use wallet::keys::WalletKeys;
 
 /// Blocks this node mined, and how many are in its main chain.

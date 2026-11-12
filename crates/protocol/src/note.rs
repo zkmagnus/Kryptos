@@ -271,6 +271,8 @@ impl Encodable for Note {
 
 #[cfg(test)]
 mod tests {
+    use crate::address::RhombusAddress as Address;
+    use crate::coin::Rhombus as Amount;
     use crypto::keys::{Diversifier, FullViewingKey, SpendingKey};
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;

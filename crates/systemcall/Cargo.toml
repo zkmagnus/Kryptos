@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 crypto.workspace = true
 protocol.workspace = true
+program-vm = { path = "../program-vm" }
 systemcall-proof.workspace = true
 rand_core.workspace = true
 

@@ -4,11 +4,14 @@ use chain::difficulty::{next_target, Sample};
 use chain::params::ChainParams;
 use chain::pow::RandomXPow;
 use chain::target::Target;
+use crypto::commitment::ValueCommitTrapdoor;
+use crypto::signature::BindingSigningKey;
 use protocol::address::RhombusAddress;
 use protocol::block::{empty_header, tx_root, Block, BlockHash, BlockHeader, PowSolution};
 use protocol::builder::{Builder, OutputInfo};
 use protocol::coin::Rhombus;
 use protocol::consensus::{next_height, subsidy, BLOCK_VERSION};
+use protocol::fee::FeeOpening;
 use protocol::memo::Memo;
 use protocol::transaction::Transaction;
 use protocol::tree_order::tree_transactions;
@@ -41,6 +44,8 @@ pub struct Template {
     pub tree: CommitmentTree,
     /// Transactions to include after the coinbase.
     pub transactions: Vec<Transaction>,
+    /// Relay openings corresponding to `transactions`, in the same order.
+    pub fee_openings: Vec<FeeOpening>,
     /// Network parameters.
     pub params: ChainParams,
     /// Wall-clock time.
@@ -59,12 +64,30 @@ impl Template {
         miner: &RhombusAddress,
         pk: &ProvingKey,
         rng: &mut (impl RngCore + CryptoRng),
-    ) -> Result<(BlockHeader, Vec<Transaction>)> {
+    ) -> Result<(
+        BlockHeader,
+        Vec<Transaction>,
+        crypto::signature::BindingSignature,
+    )> {
         let height = next_height(self.parent.height)?;
         let credit = self.credit()?;
         let mut coinbase = Builder::new(self.parent.commitment_root);
         coinbase.add_output(OutputInfo::new(*miner, credit, Memo::empty(), None))?;
-        let coinbase = coinbase.build_coinbase(pk, credit, self.params.branch_at(height), rng)?;
+        let (coinbase, coinbase_blinding) =
+            coinbase.build_coinbase_with_opening(pk, credit, self.params.branch_at(height), rng)?;
+
+        if self.fee_openings.len() != self.transactions.len() {
+            return Err(Error::Argument(
+                "template fee openings do not match transactions".into(),
+            ));
+        }
+        let mut block_blindings: Vec<ValueCommitTrapdoor> = self
+            .fee_openings
+            .iter()
+            .map(|opening| ValueCommitTrapdoor::from_scalar(opening.blinding()))
+            .collect();
+        block_blindings.push(coinbase_blinding);
+        let binding_key = BindingSigningKey::from_trapdoors(block_blindings.iter())?;
 
         let mut transactions = vec![coinbase];
         transactions.extend(self.transactions.iter().cloned());
@@ -92,10 +115,12 @@ impl Template {
             nonce: [0; 32],
             solution: PowSolution::empty(),
         };
-        Ok((header, transactions))
+        let message = Block::binding_message(&header);
+        let signature = binding_key.sign(rng, &message);
+        Ok((header, transactions, signature))
     }
 
-    /// The scheduled subsidy plus public fee offers in the selected transfers.
+    /// The scheduled subsidy plus fee amounts from selected relay openings.
     ///
     pub fn credit(&self) -> Result<Rhombus> {
         let height = next_height(self.parent.height)?;
@@ -145,9 +170,13 @@ impl Template {
         if !keep_going() {
             return Ok(None);
         }
-        let (mut header, transactions) = self.assemble(miner, pk, rng)?;
+        let (mut header, transactions, binding_signature) = self.assemble(miner, pk, rng)?;
         if pow.mine_while(&mut header, NONCES_PER_TEMPLATE, rng, keep_going)? {
-            Ok(Some(Block::new(header, transactions)))
+            Ok(Some(Block::new_with_binding_signature(
+                header,
+                transactions,
+                binding_signature,
+            )))
         } else {
             Ok(None)
         }
