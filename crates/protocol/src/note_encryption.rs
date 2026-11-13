@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! note plaintext  = version(1) || d(11) || value(8 LE) || rseed(32) || memo(512)
-//! out plaintext   = pk_d(32) || esk(32)
+//! out plaintext   = pk_d(32) || ek(1184) || KEM shared secret(32)
 //! ```
 //!
 //! The receiver decrypts with `ivk`. The sender, or a holder of its `ovk`,
@@ -13,11 +13,11 @@
 
 use crypto::commitment::ValueCommitment;
 use crypto::encoding::ENCODED_LEN;
-use crypto::encryption::{EphemeralPublicKey, EphemeralSecretKey, SymmetricKey, TAG_LEN};
-use crypto::keys::{
-    DiversifiedTransmissionKey, Diversifier, IncomingViewingKey, OutgoingViewingKey,
-    DIVERSIFIER_LEN,
+use crypto::encryption::{
+    KemCiphertext, KemSharedSecret, ReceiverKey, SymmetricKey, TransmissionKey,
+    KEM_CIPHERTEXT_LEN, KEM_ENCAPSULATION_KEY_LEN, KEM_SHARED_SECRET_LEN, TAG_LEN,
 };
+use crypto::keys::{DiversifiedTransmissionKey, Diversifier, IncomingViewingKey, OutgoingViewingKey, DIVERSIFIER_LEN};
 use rand_core::{CryptoRng, RngCore};
 
 use crate::address::RhombusAddress;
@@ -35,11 +35,11 @@ pub const NOTE_PLAINTEXT_LEN: usize = 1 + DIVERSIFIER_LEN + 8 + RANDOM_SEED_LEN 
 /// Byte length of a note ciphertext.
 pub const NOTE_CIPHERTEXT_LEN: usize = NOTE_PLAINTEXT_LEN + TAG_LEN;
 /// Byte length of an outgoing plaintext.
-pub const OUT_PLAINTEXT_LEN: usize = ENCODED_LEN + ENCODED_LEN;
+pub const OUT_PLAINTEXT_LEN: usize = ENCODED_LEN + KEM_ENCAPSULATION_KEY_LEN + KEM_SHARED_SECRET_LEN;
 /// Byte length of an outgoing ciphertext.
 pub const OUT_CIPHERTEXT_LEN: usize = OUT_PLAINTEXT_LEN + TAG_LEN;
 /// Byte length of an encoded [`EncryptedNote`].
-pub const ENCRYPTED_NOTE_LEN: usize = ENCODED_LEN + NOTE_CIPHERTEXT_LEN + OUT_CIPHERTEXT_LEN;
+pub const ENCRYPTED_NOTE_LEN: usize = 1 + KEM_CIPHERTEXT_LEN + NOTE_CIPHERTEXT_LEN + OUT_CIPHERTEXT_LEN;
 /// Bytes of the note ciphertext a light client needs to detect and
 /// rebuild a note: version, diversifier, value and seed, but not the memo.
 pub const COMPACT_NOTE_LEAD: usize = 1 + DIVERSIFIER_LEN + 8 + RANDOM_SEED_LEN;
@@ -47,15 +47,15 @@ pub const COMPACT_NOTE_LEAD: usize = 1 + DIVERSIFIER_LEN + 8 + RANDOM_SEED_LEN;
 /// The encrypted form of a note as it appears in an action.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EncryptedNote {
-    epk: EphemeralPublicKey,
+    kem_ciphertext: KemCiphertext,
     enc_ciphertext: [u8; NOTE_CIPHERTEXT_LEN],
     out_ciphertext: [u8; OUT_CIPHERTEXT_LEN],
 }
 
 impl EncryptedNote {
-    /// The ephemeral public key.
-    pub fn epk(&self) -> &EphemeralPublicKey {
-        &self.epk
+    /// The ML-KEM encapsulation sent to the receiver.
+    pub fn kem_ciphertext(&self) -> &KemCiphertext {
+        &self.kem_ciphertext
     }
 
     /// The note ciphertext.
@@ -70,12 +70,12 @@ impl EncryptedNote {
 
     /// Builds from parts already validated elsewhere.
     pub fn from_parts(
-        epk: EphemeralPublicKey,
+        kem_ciphertext: KemCiphertext,
         enc_ciphertext: [u8; NOTE_CIPHERTEXT_LEN],
         out_ciphertext: [u8; OUT_CIPHERTEXT_LEN],
     ) -> Self {
         Self {
-            epk,
+            kem_ciphertext,
             enc_ciphertext,
             out_ciphertext,
         }
@@ -84,13 +84,17 @@ impl EncryptedNote {
 
 impl Encodable for EncryptedNote {
     fn write(&self, w: &mut Writer) {
-        w.put(&self.epk.to_bytes())
+        w.put_u8(2)
+            .put(&self.kem_ciphertext.to_bytes())
             .put(&self.enc_ciphertext)
             .put(&self.out_ciphertext);
     }
     fn read(r: &mut Reader<'_>) -> Result<Self> {
-        let epk = EphemeralPublicKey::from_bytes(&r.take_array()?)?;
-        Ok(Self::from_parts(epk, r.take_array()?, r.take_array()?))
+        if r.take_u8()? != 2 {
+            return Err(Error::Malformed("unsupported encrypted-note version"));
+        }
+        let kem_ciphertext = KemCiphertext::from_bytes(r.take(KEM_CIPHERTEXT_LEN)?)?;
+        Ok(Self::from_parts(kem_ciphertext, r.take_array()?, r.take_array()?))
     }
 }
 
@@ -108,25 +112,22 @@ pub fn encrypt_note(
     cv: &ValueCommitment,
     rng: &mut (impl RngCore + CryptoRng),
 ) -> Result<EncryptedNote> {
-    let g_d = note.recipient().g_d()?;
-    let pk_d = note.recipient().pk_d();
-    let esk = note.esk();
-    let epk = esk.public_key(&g_d);
-    let key = esk.agree(pk_d).kdf(&epk);
+    let cmx = note.cmx()?.to_bytes();
+    let (kem_ciphertext, shared_secret) = note.recipient().kem_key().encapsulate(rng)?;
+    let key = shared_secret.note_key(&kem_ciphertext, &cmx);
     let enc_ciphertext = fixed(key.encrypt(&NotePlaintext::from_note(note, memo).encode()))?;
 
-    let cmx = note.cmx()?.to_bytes();
     let (ock, out_plaintext) = match ovk {
         Some(ovk) => (
-            SymmetricKey::outgoing(ovk, &cv.to_bytes(), &cmx, &epk.to_bytes()),
-            out_plaintext(pk_d, &esk),
+            SymmetricKey::outgoing_kem(ovk, &cv.to_bytes(), &cmx, &kem_ciphertext),
+            out_plaintext(note.recipient().pk_d(), note.recipient().kem_key(), &shared_secret),
         ),
         None => (SymmetricKey::random(rng), random_out_plaintext(rng)),
     };
     let out_ciphertext = fixed(ock.encrypt(&out_plaintext))?;
 
     Ok(EncryptedNote {
-        epk,
+        kem_ciphertext,
         enc_ciphertext,
         out_ciphertext,
     })
@@ -142,14 +143,17 @@ pub fn encrypt_note(
 /// match the action.
 pub fn decrypt_note_with_ivk(
     ivk: &IncomingViewingKey,
+    receiver_key: &ReceiverKey,
+    transmission_key: &TransmissionKey,
     encrypted: &EncryptedNote,
     rho: Rho,
     cmx: &ExtractedNoteCommitment,
 ) -> Result<(Note, Memo)> {
-    let key = encrypted.epk.agree(ivk).kdf(&encrypted.epk);
+    let shared_secret = receiver_key.decapsulate(&encrypted.kem_ciphertext)?;
+    let key = shared_secret.note_key(&encrypted.kem_ciphertext, &cmx.to_bytes());
     let plaintext = NotePlaintext::decode(&key.decrypt(&encrypted.enc_ciphertext)?)?;
     let pk_d = ivk.transmission_key(&plaintext.diversifier)?;
-    finish_decryption(plaintext, pk_d, rho, encrypted, cmx)
+    finish_decryption(plaintext, pk_d, transmission_key.clone(), rho, cmx)
 }
 
 /// Detects and rebuilds a note from the leading bytes of its ciphertext,
@@ -165,16 +169,19 @@ pub fn decrypt_note_with_ivk(
 /// does not match the commitment.
 pub fn detect_note_with_ivk(
     ivk: &IncomingViewingKey,
-    epk: &EphemeralPublicKey,
+    receiver_key: &ReceiverKey,
+    transmission_key: &TransmissionKey,
+    kem_ciphertext: &KemCiphertext,
     enc_lead: &[u8; COMPACT_NOTE_LEAD],
     rho: Rho,
     cmx: &ExtractedNoteCommitment,
 ) -> Result<Note> {
-    let key = epk.agree(ivk).kdf(epk);
+    let shared_secret = receiver_key.decapsulate(kem_ciphertext)?;
+    let key = shared_secret.note_key(kem_ciphertext, &cmx.to_bytes());
     let lead = key.decrypt_lead(enc_lead);
     let plaintext = NoteLead::decode(&lead)?;
     let pk_d = ivk.transmission_key(&plaintext.diversifier)?;
-    let recipient = RhombusAddress::from_parts(plaintext.diversifier, pk_d);
+    let recipient = RhombusAddress::from_parts(plaintext.diversifier, pk_d, transmission_key.clone());
     let note = Note::new(recipient, plaintext.value, rho, plaintext.rseed);
     if note.cmx()? != *cmx {
         return Err(Error::NoteDecryption("commitment mismatch"));
@@ -219,11 +226,11 @@ pub fn decrypt_note_with_ovk(
     rho: Rho,
     cmx: &ExtractedNoteCommitment,
 ) -> Result<(Note, Memo)> {
-    let (pk_d, esk) = recover_output_keys(ovk, encrypted, cv, cmx)?;
-    decrypt_note_with_keys(&pk_d, &esk, encrypted, rho, cmx)
+    let (pk_d, ek, shared_secret) = recover_output_keys(ovk, encrypted, cv, cmx)?;
+    decrypt_note_with_keys(&pk_d, &ek, &shared_secret, encrypted, rho, cmx)
 }
 
-/// Recovers, as the sender, the transmission key and ephemeral secret of
+/// Recovers, as the sender, the transmission key and KEM shared secret of
 /// an output: the two values that let anyone decrypt exactly that note.
 ///
 /// # Errors
@@ -234,18 +241,18 @@ pub fn recover_output_keys(
     encrypted: &EncryptedNote,
     cv: &ValueCommitment,
     cmx: &ExtractedNoteCommitment,
-) -> Result<(DiversifiedTransmissionKey, EphemeralSecretKey)> {
-    let ock = SymmetricKey::outgoing(
+) -> Result<(DiversifiedTransmissionKey, TransmissionKey, KemSharedSecret)> {
+    let ock = SymmetricKey::outgoing_kem(
         ovk,
         &cv.to_bytes(),
         &cmx.to_bytes(),
-        &encrypted.epk.to_bytes(),
+        &encrypted.kem_ciphertext,
     );
     let out_plaintext = ock.decrypt(&encrypted.out_ciphertext)?;
     parse_out_plaintext(&out_plaintext)
 }
 
-/// Decrypts one output with its ephemeral keys and checks it against the
+/// Decrypts one output with its recovered KEM secret and checks it against the
 /// action's public data.
 ///
 /// # Errors
@@ -254,33 +261,30 @@ pub fn recover_output_keys(
 /// does not match the action.
 pub fn decrypt_note_with_keys(
     pk_d: &DiversifiedTransmissionKey,
-    esk: &EphemeralSecretKey,
+    ek: &TransmissionKey,
+    shared_secret: &KemSharedSecret,
     encrypted: &EncryptedNote,
     rho: Rho,
     cmx: &ExtractedNoteCommitment,
 ) -> Result<(Note, Memo)> {
-    let key = esk.agree(pk_d).kdf(&encrypted.epk);
+    let key = shared_secret.note_key(&encrypted.kem_ciphertext, &cmx.to_bytes());
     let plaintext = NotePlaintext::decode(&key.decrypt(&encrypted.enc_ciphertext)?)?;
-    finish_decryption(plaintext, *pk_d, rho, encrypted, cmx)
+    finish_decryption(plaintext, *pk_d, ek.clone(), rho, cmx)
 }
 
 /// Rebuilds the note and checks it against the action's public data.
 fn finish_decryption(
     plaintext: NotePlaintext,
     pk_d: DiversifiedTransmissionKey,
+    ek: TransmissionKey,
     rho: Rho,
-    encrypted: &EncryptedNote,
     cmx: &ExtractedNoteCommitment,
 ) -> Result<(Note, Memo)> {
-    let g_d = plaintext.diversifier.base()?;
-    let recipient = RhombusAddress::from_parts(plaintext.diversifier, pk_d);
+    let recipient = RhombusAddress::from_parts(plaintext.diversifier, pk_d, ek);
     let note = Note::new(recipient, plaintext.value, rho, plaintext.rseed);
 
     if note.cmx()? != *cmx {
         return Err(Error::NoteDecryption("commitment mismatch"));
-    }
-    if note.esk().public_key(&g_d) != encrypted.epk {
-        return Err(Error::NoteDecryption("ephemeral key mismatch"));
     }
     Ok((note, plaintext.memo))
 }
@@ -340,9 +344,15 @@ fn fixed<const N: usize>(bytes: Vec<u8>) -> Result<[u8; N]> {
         .map_err(|_| Error::Malformed("unexpected ciphertext length"))
 }
 
-fn out_plaintext(pk_d: &DiversifiedTransmissionKey, esk: &EphemeralSecretKey) -> Vec<u8> {
+fn out_plaintext(
+    pk_d: &DiversifiedTransmissionKey,
+    ek: &TransmissionKey,
+    shared_secret: &KemSharedSecret,
+) -> Vec<u8> {
     let mut w = Writer::with_capacity(OUT_PLAINTEXT_LEN);
-    w.put(&pk_d.to_bytes()).put(&esk.to_bytes());
+    w.put(&pk_d.to_bytes())
+        .put(&ek.to_bytes())
+        .put(shared_secret.as_bytes());
     w.into_bytes()
 }
 
@@ -352,12 +362,15 @@ fn random_out_plaintext(rng: &mut (impl RngCore + CryptoRng)) -> Vec<u8> {
     bytes
 }
 
-fn parse_out_plaintext(bytes: &[u8]) -> Result<(DiversifiedTransmissionKey, EphemeralSecretKey)> {
+fn parse_out_plaintext(
+    bytes: &[u8],
+) -> Result<(DiversifiedTransmissionKey, TransmissionKey, KemSharedSecret)> {
     let mut r = Reader::new(bytes);
     let pk_d = DiversifiedTransmissionKey::from_bytes(&r.take_array::<ENCODED_LEN>()?)?;
-    let esk = EphemeralSecretKey::from_bytes(&r.take_array::<ENCODED_LEN>()?)?;
+    let ek = TransmissionKey::from_bytes(r.take(KEM_ENCAPSULATION_KEY_LEN)?)?;
+    let shared_secret = KemSharedSecret::from_bytes(r.take_array()?);
     r.finish()?;
-    Ok((pk_d, esk))
+    Ok((pk_d, ek, shared_secret))
 }
 
 #[cfg(test)]

@@ -8,7 +8,7 @@
 //! append to its witness tree, and every nullifier lets it detect spends.
 //! The block hash and height let it track its scan position and reorgs.
 
-use crypto::encryption::EphemeralPublicKey;
+use crypto::encryption::{KemCiphertext, KEM_CIPHERTEXT_LEN};
 
 use crate::block::{Block, BlockHash};
 use crate::bytes::{Encodable, Reader, Writer};
@@ -25,8 +25,8 @@ pub struct CompactAction {
     pub nullifier: Nullifier,
     /// The new note's commitment.
     pub cmx: ExtractedNoteCommitment,
-    /// The ephemeral public key.
-    pub epk: EphemeralPublicKey,
+    /// ML-KEM ciphertext used to derive this note's encryption key.
+    pub kem_ciphertext: KemCiphertext,
     /// The leading bytes of the note ciphertext.
     pub enc_lead: [u8; COMPACT_NOTE_LEAD],
 }
@@ -35,19 +35,19 @@ impl Encodable for CompactAction {
     fn write(&self, w: &mut Writer) {
         w.put(&self.nullifier.to_bytes())
             .put(&self.cmx.to_bytes())
-            .put(&self.epk.to_bytes())
+            .put(&self.kem_ciphertext.to_bytes())
             .put(&self.enc_lead);
     }
 
     fn read(r: &mut Reader<'_>) -> Result<Self> {
         let nullifier = Nullifier::from_bytes(&r.take_array()?)?;
         let cmx = ExtractedNoteCommitment::from_bytes(&r.take_array()?)?;
-        let epk = EphemeralPublicKey::from_bytes(&r.take_array()?)?;
+        let kem_ciphertext = KemCiphertext::from_bytes(r.take(KEM_CIPHERTEXT_LEN)?)?;
         let enc_lead = r.take_array()?;
         Ok(Self {
             nullifier,
             cmx,
-            epk,
+            kem_ciphertext,
             enc_lead,
         })
     }
@@ -78,7 +78,7 @@ impl CompactBlock {
                 actions.push(CompactAction {
                     nullifier: *body.nullifier(),
                     cmx: *body.cmx(),
-                    epk: *body.encrypted_note().epk(),
+                    kem_ciphertext: body.encrypted_note().kem_ciphertext().clone(),
                     enc_lead,
                 });
             }
@@ -135,10 +135,7 @@ mod tests {
         let action = CompactAction {
             nullifier: Nullifier::from_base(&crypto::pallas::Base::from(7u64)),
             cmx: ExtractedNoteCommitment::from_bytes(&[0; 32]).unwrap(),
-            epk: EphemeralPublicKey::from_bytes(&crypto::encoding::point_to_bytes(
-                &crypto::curve::Generator::SpendAuth.point(),
-            ))
-            .unwrap(),
+            kem_ciphertext: KemCiphertext::from_bytes(&[0u8; KEM_CIPHERTEXT_LEN]).unwrap(),
             enc_lead: [9u8; COMPACT_NOTE_LEAD],
         };
         let block = CompactBlock {

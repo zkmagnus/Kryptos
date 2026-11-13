@@ -322,8 +322,9 @@ impl Context {
             return Err(RpcError::new(REJECTED, "tip moved; ask again"));
         }
         let pk = self.proving_key().await?;
+        let payout_clone = payout.clone();
         let (header, transactions, binding_signature) = tokio::task::spawn_blocking(move || {
-            template.assemble(&payout, pk.as_ref(), &mut rand::rngs::OsRng)
+            template.assemble(&payout_clone, pk.as_ref(), &mut rand::rngs::OsRng)
         })
         .await
         .map_err(|_| Error::Stopped)??;

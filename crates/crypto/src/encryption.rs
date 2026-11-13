@@ -16,6 +16,8 @@ use chacha20::ChaCha20;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use ff::Field;
+use ml_kem::kem::{Decapsulate, Encapsulate};
+use ml_kem::{Ciphertext, EncodedSizeUser, KemCore, MlKem768, MlKem768Params};
 use pasta_curves::pallas;
 use rand_core::{CryptoRng, RngCore};
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -26,6 +28,168 @@ use crate::hash::{blake2b_short, NOTE_KDF, OCK, SHORT_OUTPUT_LEN};
 use crate::keys::{DiversifiedTransmissionKey, IncomingViewingKey, OutgoingViewingKey};
 use crate::secret::SecretScalar;
 use crate::{Error, Result};
+
+/// Byte length of an ML-KEM-768 encapsulation key.
+pub const KEM_ENCAPSULATION_KEY_LEN: usize = 1184;
+/// Byte length of the seed pair (`d || z`) used by deterministic ML-KEM keygen.
+pub const KEM_SEED_LEN: usize = 64;
+/// Byte length of an ML-KEM-768 ciphertext.
+pub const KEM_CIPHERTEXT_LEN: usize = 1088;
+/// Byte length of the ML-KEM shared secret.
+pub const KEM_SHARED_SECRET_LEN: usize = 32;
+
+/// Receiver's ML-KEM decapsulation key. It can read incoming notes but
+/// does not grant spend authority.
+pub struct ReceiverKey(ml_kem::kem::DecapsulationKey<MlKem768Params>);
+
+/// Public ML-KEM encapsulation key placed in a payment address.
+#[derive(Clone)]
+pub struct TransmissionKey(ml_kem::kem::EncapsulationKey<MlKem768Params>);
+
+/// Encapsulation sent to a receiver to establish a shared secret.
+#[derive(Clone, PartialEq, Eq)]
+pub struct KemCiphertext(Ciphertext<MlKem768>);
+
+/// Shared secret established by ML-KEM.
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct KemSharedSecret([u8; KEM_SHARED_SECRET_LEN]);
+
+impl ReceiverKey {
+    /// Deterministically derives the ML-KEM-768 key pair from `d || z`.
+    pub fn from_seed(seed: &[u8; KEM_SEED_LEN]) -> (Self, TransmissionKey) {
+        let (d, z) = seed.split_at(KEM_SEED_LEN / 2);
+        let d = ml_kem::B32::try_from(d).unwrap_or_default();
+        let z = ml_kem::B32::try_from(z).unwrap_or_default();
+        let (dk, ek) = MlKem768::generate_deterministic(&d, &z);
+        (Self(dk), TransmissionKey(ek))
+    }
+
+    /// Decapsulates an ML-KEM ciphertext.
+    pub fn decapsulate(&self, ciphertext: &KemCiphertext) -> Result<KemSharedSecret> {
+        let shared = self
+            .0
+            .decapsulate(&ciphertext.0)
+            .map_err(|_| Error::DecryptionFailed)?;
+        let mut bytes = [0u8; KEM_SHARED_SECRET_LEN];
+        bytes.copy_from_slice(shared.as_slice());
+        Ok(KemSharedSecret(bytes))
+    }
+}
+
+impl TransmissionKey {
+    /// Canonical FIPS 203 encoding of the encapsulation key.
+    pub fn to_bytes(&self) -> [u8; KEM_ENCAPSULATION_KEY_LEN] {
+        let encoded = self.0.as_bytes();
+        let mut bytes = [0u8; KEM_ENCAPSULATION_KEY_LEN];
+        bytes.copy_from_slice(encoded.as_slice());
+        bytes
+    }
+
+    /// Parses an encapsulation key from its fixed-size FIPS 203 encoding.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let bytes: &[u8; KEM_ENCAPSULATION_KEY_LEN] = bytes
+            .try_into()
+            .map_err(|_| Error::InvalidDerivation("ML-KEM encapsulation key length"))?;
+        Ok(Self(ml_kem::kem::EncapsulationKey::<MlKem768Params>::from_bytes(
+            bytes.into(),
+        )))
+    }
+
+    /// Encapsulates a fresh shared secret to this key.
+    pub fn encapsulate(
+        &self,
+        rng: &mut (impl RngCore + CryptoRng),
+    ) -> Result<(KemCiphertext, KemSharedSecret)> {
+        let (ciphertext, shared) = self.0.encapsulate(rng).map_err(|_| Error::DegenerateKey)?;
+        let mut bytes = [0u8; KEM_SHARED_SECRET_LEN];
+        bytes.copy_from_slice(shared.as_slice());
+        Ok((KemCiphertext(ciphertext), KemSharedSecret(bytes)))
+    }
+}
+
+impl KemCiphertext {
+    /// Canonical ML-KEM ciphertext encoding.
+    pub fn to_bytes(&self) -> [u8; KEM_CIPHERTEXT_LEN] {
+        let mut bytes = [0u8; KEM_CIPHERTEXT_LEN];
+        bytes.copy_from_slice(self.0.as_slice());
+        bytes
+    }
+
+    /// Decodes an ML-KEM ciphertext of the required fixed length.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let ciphertext = Ciphertext::<MlKem768>::try_from(bytes)
+            .map_err(|_| Error::InvalidDerivation("ML-KEM ciphertext length"))?;
+        Ok(Self(ciphertext))
+    }
+}
+
+impl KemSharedSecret {
+    /// Wraps a shared secret recovered from an authenticated outgoing payload.
+    pub fn from_bytes(bytes: [u8; KEM_SHARED_SECRET_LEN]) -> Self {
+        Self(bytes)
+    }
+
+    /// Borrows the raw 32-byte shared secret.
+    pub fn as_bytes(&self) -> &[u8; KEM_SHARED_SECRET_LEN] {
+        &self.0
+    }
+
+    /// Derives the note encryption key, binding the KEM ciphertext and note
+    /// commitment into the KDF.
+    pub fn note_key(&self, ciphertext: &KemCiphertext, cmx: &[u8; 32]) -> SymmetricKey {
+        SymmetricKey(blake2b_short(
+            NOTE_KDF,
+            &[&self.0, &ciphertext.to_bytes(), cmx],
+        ))
+    }
+}
+
+impl SymmetricKey {
+    /// Derives the outgoing-note cipher key for an ML-KEM output.
+    pub fn outgoing_kem(
+        ovk: &OutgoingViewingKey,
+        cv: &[u8; 32],
+        cmx: &[u8; 32],
+        ciphertext: &KemCiphertext,
+    ) -> Self {
+        Self(blake2b_short(
+            OCK,
+            &[ovk.as_bytes(), cv, cmx, &ciphertext.to_bytes()],
+        ))
+    }
+}
+
+impl core::fmt::Debug for KemCiphertext {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("KemCiphertext(..)")
+    }
+}
+
+impl core::fmt::Debug for KemSharedSecret {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("KemSharedSecret(<redacted>)")
+    }
+}
+
+impl PartialEq for TransmissionKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.to_bytes() == other.to_bytes()
+    }
+}
+
+impl Eq for TransmissionKey {}
+
+impl core::fmt::Debug for TransmissionKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("TransmissionKey(..)")
+    }
+}
+
+impl core::fmt::Debug for ReceiverKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("ReceiverKey(<redacted>)")
+    }
+}
 
 /// Byte length of the authentication tag appended to every ciphertext.
 pub const TAG_LEN: usize = 16;

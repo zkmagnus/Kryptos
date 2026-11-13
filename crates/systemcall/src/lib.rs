@@ -164,11 +164,7 @@ mod tests {
         let mut rng = ChaCha20Rng::seed_from_u64(seed);
         let sk = SpendingKey::random(&mut rng);
         let fvk = FullViewingKey::derive(&sk).unwrap();
-        let address = RhombusAddress::derive(
-            &fvk.incoming_viewing_key().unwrap(),
-            Diversifier::random(&mut rng),
-        )
-        .unwrap();
+        let address = RhombusAddress::derive(&fvk, Diversifier::random(&mut rng)).unwrap();
         let note = Note::new(
             address,
             Rhombus::from_raw(100_000).unwrap(),

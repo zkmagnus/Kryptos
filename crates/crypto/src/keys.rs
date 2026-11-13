@@ -28,7 +28,8 @@ use crate::diversifier::DiversifierKey;
 use crate::encoding::{
     base_from_bytes, base_to_bytes, point_from_bytes, point_to_bytes, Encoded, ENCODED_LEN,
 };
-use crate::hash::{blake2b_short, prf_expand, wide_to_base, wide_to_scalar, DK, OVK};
+use crate::encryption::{ReceiverKey, TransmissionKey, KEM_SEED_LEN};
+use crate::hash::{blake2b_short, prf_expand, wide_to_base, wide_to_scalar, DK, KEM_SEED, OVK};
 use crate::poseidon::ivk as poseidon_ivk;
 use crate::secret::{SecretBase, SecretScalar};
 use crate::{Error, Result};
@@ -44,6 +45,10 @@ const ASK_TAG: u8 = 0x06;
 const NK_TAG: u8 = 0x07;
 /// `PRF^expand` tag for the ivk commitment randomness.
 const RIVK_TAG: u8 = 0x08;
+/// `PRF^expand` tag for the ML-KEM seed.
+const KEM_TAG: u8 = 0x0A;
+
+const _: () = assert!(KEM_SEED_LEN == crate::hash::WIDE_OUTPUT_LEN);
 /// Byte length of an outgoing viewing key.
 pub const OUTGOING_VIEWING_KEY_LEN: usize = 32;
 
@@ -337,6 +342,20 @@ impl FullViewingKey {
     pub fn outgoing_viewing_key(&self) -> OutgoingViewingKey {
         let [rivk, ak, nk] = self.viewing_key_material();
         OutgoingViewingKey(blake2b_short(OVK, &[&rivk, &ak, &nk]))
+    }
+
+    /// The ML-KEM key pair derived from this full viewing key.
+    ///
+    /// The decapsulation key can detect incoming notes but cannot spend.
+    /// One encapsulation key is shared across the key's diversified addresses.
+    pub fn receiver_key(&self) -> (ReceiverKey, TransmissionKey) {
+        let [rivk, ak, nk] = self.viewing_key_material();
+        let mut key = blake2b_short(KEM_SEED, &[&rivk, &ak, &nk]);
+        let mut seed = prf_expand(&key, &[KEM_TAG]);
+        let pair = ReceiverKey::from_seed(&seed);
+        key.zeroize();
+        seed.zeroize();
+        pair
     }
 
     /// Derives the diversifier key, which maps indices to diversifiers.
@@ -662,6 +681,22 @@ mod tests {
             OutgoingViewingKey::from_bytes(*a.as_bytes()).as_bytes(),
             a.as_bytes()
         );
+    }
+
+    #[test]
+    fn receiver_key_is_deterministic_and_key_dependent() {
+        let a = FullViewingKey::derive(&sk(20)).unwrap().receiver_key().1;
+        let b = FullViewingKey::derive(&sk(20)).unwrap().receiver_key().1;
+        let c = FullViewingKey::derive(&sk(21)).unwrap().receiver_key().1;
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn receiver_key_survives_a_full_viewing_key_export() {
+        let fvk = FullViewingKey::derive(&sk(22)).unwrap();
+        let again = FullViewingKey::from_bytes(&fvk.to_bytes()).unwrap();
+        assert_eq!(fvk.receiver_key().1, again.receiver_key().1);
     }
 
     #[test]

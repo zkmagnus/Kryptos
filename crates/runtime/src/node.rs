@@ -518,7 +518,7 @@ pub async fn spawn(config: Config) -> Result<Handle> {
         }
         None => None,
     };
-    if let Some(payout) = config.mine_to {
+    if let Some(payout) = config.mine_to.clone() {
         spawn_miner(&mut tasks, payout, &config, &events, &tip);
     }
     let clock = events.clone();

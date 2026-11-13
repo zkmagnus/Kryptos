@@ -287,8 +287,7 @@ mod tests {
     fn fixture(seed: u64) -> Fixture {
         let mut rng = ChaCha20Rng::seed_from_u64(seed);
         let fvk = FullViewingKey::derive(&SpendingKey::random(&mut rng)).unwrap();
-        let ivk = fvk.incoming_viewing_key().unwrap();
-        let recipient = Address::derive(&ivk, Diversifier::random(&mut rng)).unwrap();
+        let recipient = Address::derive(&fvk, Diversifier::random(&mut rng)).unwrap();
         let rho = Rho::from_base(pallas::Base::from(seed));
         let note = Note::new(
             recipient,

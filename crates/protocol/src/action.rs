@@ -175,8 +175,7 @@ pub(crate) mod tests {
     pub(crate) fn sample_action(rng: &mut ChaCha20Rng, message: &[u8]) -> Action {
         let sk = SpendingKey::random(rng);
         let fvk = FullViewingKey::derive(&sk).unwrap();
-        let ivk = fvk.incoming_viewing_key().unwrap();
-        let address = Address::derive(&ivk, crypto::keys::Diversifier::random(rng)).unwrap();
+        let address = Address::derive(&fvk, crypto::keys::Diversifier::random(rng)).unwrap();
         let note = Note::new(
             address,
             Amount::from_raw(5).unwrap(),

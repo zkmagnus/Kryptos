@@ -281,7 +281,7 @@ fn build_selected(
     let ovk = Some(keys.outgoing_viewing_key().clone());
     for payment in payments {
         builder.add_output(OutputInfo::new(
-            payment.recipient,
+            payment.recipient.clone(),
             payment.amount,
             payment.memo.clone(),
             ovk.clone(),

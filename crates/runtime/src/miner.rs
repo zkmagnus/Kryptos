@@ -72,7 +72,7 @@ impl Template {
         let height = next_height(self.parent.height)?;
         let credit = self.credit()?;
         let mut coinbase = Builder::new(self.parent.commitment_root);
-        coinbase.add_output(OutputInfo::new(*miner, credit, Memo::empty(), None))?;
+        coinbase.add_output(OutputInfo::new(miner.clone(), credit, Memo::empty(), None))?;
         let (coinbase, coinbase_blinding) =
             coinbase.build_coinbase_with_opening(pk, credit, self.params.branch_at(height), rng)?;
 
@@ -231,6 +231,7 @@ pub fn start(
     let threads = threads.max(1);
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
+    let payout_for_task = payout.clone();
     let task = tokio::spawn(async move {
         let pk = Arc::new(
             tokio::task::spawn_blocking(ProvingKey::build)
@@ -241,7 +242,7 @@ pub fn start(
         let mut workers = Vec::with_capacity(threads);
         for _ in 0..threads {
             let worker = Worker {
-                payout,
+                payout: payout_for_task.clone(),
                 pow: pow.fork()?,
                 pk: Arc::clone(&pk),
                 stop: Arc::clone(&flag),
@@ -297,7 +298,7 @@ impl Worker {
                 }
                 Err(_) => return Err(Error::Stopped),
             };
-            let (payout, pow, pk) = (self.payout, self.pow.clone(), Arc::clone(&self.pk));
+            let (payout, pow, pk) = (self.payout.clone(), self.pow.clone(), Arc::clone(&self.pk));
             let (stop, tip, parent) = (
                 Arc::clone(&self.stop),
                 self.tip.clone(),

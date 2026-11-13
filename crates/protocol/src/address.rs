@@ -1,15 +1,17 @@
 //! Diversified payment addresses.
 //!
-//! An address is a diversifier plus the transmission key derived from it.
-//! Raw encoding is `d || pk_d` (43 bytes). Text encoding is Base58Check of
+//! An address contains a diversifier, a diversified Pallas transmission key,
+//! and a shared ML-KEM encapsulation key. Raw encoding is `d || pk_d || ek`.
+//! Text encoding is Base58Check of
 //! the raw address and a network-bound checksum, without a textual prefix.
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use crypto::diversifier::DiversifierIndex;
 use crypto::encoding::{Encoded, ENCODED_LEN};
+use crypto::encryption::{TransmissionKey, KEM_ENCAPSULATION_KEY_LEN};
 use crypto::hash::{blake2b_short, ADDRESS_CHECKSUM};
 use crypto::keys::{
-    DiversifiedTransmissionKey, Diversifier, FullViewingKey, IncomingViewingKey, DIVERSIFIER_LEN,
+    DiversifiedTransmissionKey, Diversifier, FullViewingKey, DIVERSIFIER_LEN,
 };
 use crypto::pallas;
 
@@ -35,13 +37,14 @@ impl AddressPrefix {
 }
 
 /// Length of the raw address encoding.
-pub const ADDRESS_LEN: usize = DIVERSIFIER_LEN + ENCODED_LEN;
+pub const ADDRESS_LEN: usize = DIVERSIFIER_LEN + ENCODED_LEN + KEM_ENCAPSULATION_KEY_LEN;
 
 /// A shielded payment address.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RhombusAddress {
     diversifier: Diversifier,
     pk_d: DiversifiedTransmissionKey,
+    ek: TransmissionKey,
 }
 
 impl RhombusAddress {
@@ -49,10 +52,12 @@ impl RhombusAddress {
     ///
     /// # Errors
     /// Fails if the diversifier is invalid.
-    pub fn derive(ivk: &IncomingViewingKey, diversifier: Diversifier) -> Result<Self> {
+    pub fn derive(fvk: &FullViewingKey, diversifier: Diversifier) -> Result<Self> {
+        let ivk = fvk.incoming_viewing_key()?;
         Ok(Self {
             diversifier,
             pk_d: ivk.transmission_key(&diversifier)?,
+            ek: fvk.receiver_key().1,
         })
     }
 
@@ -61,13 +66,33 @@ impl RhombusAddress {
     /// # Errors
     /// Fails if key derivation or the diversifier is invalid.
     pub fn from_index(fvk: &FullViewingKey, index: DiversifierIndex) -> Result<Self> {
+        let transmission_key = fvk.receiver_key().1;
+        Self::from_index_with_kem(fvk, index, &transmission_key)
+    }
+
+    /// Derives the address at `index` using a previously derived ML-KEM key.
+    /// This avoids repeating deterministic key generation for each address.
+    pub fn from_index_with_kem(
+        fvk: &FullViewingKey,
+        index: DiversifierIndex,
+        transmission_key: &TransmissionKey,
+    ) -> Result<Self> {
         let diversifier = fvk.diversifier_key().diversifier(index)?;
-        Self::derive(&fvk.incoming_viewing_key()?, diversifier)
+        let ivk = fvk.incoming_viewing_key()?;
+        Ok(Self {
+            diversifier,
+            pk_d: ivk.transmission_key(&diversifier)?,
+            ek: transmission_key.clone(),
+        })
     }
 
     /// Builds an address from already validated parts.
-    pub fn from_parts(diversifier: Diversifier, pk_d: DiversifiedTransmissionKey) -> Self {
-        Self { diversifier, pk_d }
+    pub fn from_parts(
+        diversifier: Diversifier,
+        pk_d: DiversifiedTransmissionKey,
+        ek: TransmissionKey,
+    ) -> Self {
+        Self { diversifier, pk_d, ek }
     }
 
     /// The diversifier.
@@ -80,6 +105,11 @@ impl RhombusAddress {
         &self.pk_d
     }
 
+    /// The shared ML-KEM encapsulation key for this viewing key.
+    pub fn kem_key(&self) -> &TransmissionKey {
+        &self.ek
+    }
+
     /// The diversified base `g_d`.
     ///
     /// # Errors
@@ -88,28 +118,32 @@ impl RhombusAddress {
         Ok(self.diversifier.base()?)
     }
 
-    /// Raw encoding `d || pk_d`.
+    /// Raw encoding `d || pk_d || ek`.
     pub fn to_bytes(&self) -> [u8; ADDRESS_LEN] {
         let mut out = [0u8; ADDRESS_LEN];
-        let (d, pk) = out.split_at_mut(DIVERSIFIER_LEN);
+        let (d, rest) = out.split_at_mut(DIVERSIFIER_LEN);
+        let (pk, ek) = rest.split_at_mut(ENCODED_LEN);
         d.copy_from_slice(self.diversifier.as_bytes());
         pk.copy_from_slice(&self.pk_d.to_bytes());
+        ek.copy_from_slice(&self.ek.to_bytes());
         out
     }
 
     /// Parses the raw encoding, validating both parts.
     ///
     /// # Errors
-    /// Fails on wrong length, invalid diversifier, or invalid transmission key.
+    /// Fails on wrong length, invalid diversifier, or invalid key encoding.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let raw: &[u8; ADDRESS_LEN] = bytes
             .try_into()
             .map_err(|_| Error::InvalidAddress("wrong length".into()))?;
-        let (d, pk) = raw.split_at(DIVERSIFIER_LEN);
+        let (d, rest) = raw.split_at(DIVERSIFIER_LEN);
+        let (pk, ek) = rest.split_at(ENCODED_LEN);
         let diversifier = Diversifier::from_bytes(array_from(d)?);
         diversifier.base()?;
         let pk_d = DiversifiedTransmissionKey::from_bytes(&array_from::<ENCODED_LEN>(pk)?)?;
-        Ok(Self::from_parts(diversifier, pk_d))
+        let ek = TransmissionKey::from_bytes(ek)?;
+        Ok(Self::from_parts(diversifier, pk_d, ek))
     }
 
     /// Base58Check of the raw address and network-bound checksum, without HRP.
@@ -133,7 +167,7 @@ impl RhombusAddress {
         const PAYLOAD_LEN: usize = ADDRESS_LEN + CHECKSUM_LEN;
         // A 47-byte payload needs at most 65 Base58 characters. Check
         // before allocating a decode buffer proportional to user input.
-        if text.len() > 65 {
+        if text.len() > ADDRESS_LEN.saturating_mul(2) {
             return Err(Error::InvalidAddress("wrong length".into()));
         }
 
@@ -277,11 +311,8 @@ mod tests {
 
     pub(crate) fn address(seed: u64) -> RhombusAddress {
         let mut rng = ChaCha20Rng::seed_from_u64(seed);
-        let ivk = FullViewingKey::derive(&SpendingKey::random(&mut rng))
-            .unwrap()
-            .incoming_viewing_key()
-            .unwrap();
-        RhombusAddress::derive(&ivk, Diversifier::random(&mut rng)).unwrap()
+        let fvk = FullViewingKey::derive(&SpendingKey::random(&mut rng)).unwrap();
+        RhombusAddress::derive(&fvk, Diversifier::random(&mut rng)).unwrap()
     }
 
     #[test]

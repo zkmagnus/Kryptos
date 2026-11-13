@@ -192,6 +192,8 @@ pub fn scan_block(
             let rho = Rho::from_nullifier(body.nullifier())?;
             let decrypted = decrypt_note_with_ivk(
                 keys.incoming_viewing_key(),
+                keys.receiver_key(),
+                keys.transmission_key(),
                 body.encrypted_note(),
                 rho,
                 body.cmx(),
@@ -242,7 +244,9 @@ pub fn scan_compact_block(
         let rho = Rho::from_nullifier(&action.nullifier)?;
         let detected = detect_note_with_ivk(
             keys.incoming_viewing_key(),
-            &action.epk,
+            keys.receiver_key(),
+            keys.transmission_key(),
+            &action.kem_ciphertext,
             &action.enc_lead,
             rho,
             &action.cmx,

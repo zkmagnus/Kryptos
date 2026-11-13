@@ -46,9 +46,9 @@ pub const POW_SOLUTION_LEN: usize = 32;
 pub const MAX_BLOCK_TRANSACTIONS: usize = 512;
 
 /// Initial block emission: 12.5 Rhombs.
-pub const BLOCK_EMISSION_START: u64 = 1_250_000_000;
+pub const BLOCK_EMISSION_START: u64 = 2_500_000_000;
 /// Permanent tail emission: 0.125 Rhombs.
-pub const TAIL_BLOCK_EMISSION: u64 = 12_500_000;
+pub const TAIL_BLOCK_EMISSION: u64 = 25_000_000;
 /// Number of emission intervals before subsidy reaches the permanent tail.
 pub const EMISSION_HALVINGS_TO_TAIL: u64 = 1;
 /// Length of each emission interval: approximately six months at 30 seconds

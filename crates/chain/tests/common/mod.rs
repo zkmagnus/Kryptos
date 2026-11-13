@@ -17,6 +17,7 @@ use chain::target::Target;
 use chain::validate::{header_lookback, recent_headers};
 use chain::Error;
 use crypto::commitment::ValueCommitTrapdoor;
+use crypto::encryption::TransmissionKey;
 use crypto::keys::{Diversifier, FullViewingKey, SpendingKey};
 use crypto::merkle::MerkleTree;
 use crypto::signature::BindingSigningKey;
@@ -45,6 +46,8 @@ pub fn proving_key() -> &'static ProvingKey {
 pub struct Wallet {
     pub sk: SpendingKey,
     pub fvk: FullViewingKey,
+    pub receiver_key: crypto::encryption::ReceiverKey,
+    pub transmission_key: TransmissionKey,
     pub address: RhombusAddress,
     /// Every commitment on the chain, in tree order, for witnesses.
     pub tree: MerkleTree,
@@ -56,14 +59,13 @@ impl Wallet {
     pub fn new(rng: &mut ChaCha20Rng) -> Self {
         let sk = SpendingKey::random(rng);
         let fvk = FullViewingKey::derive(&sk).unwrap();
-        let address = RhombusAddress::derive(
-            &fvk.incoming_viewing_key().unwrap(),
-            Diversifier::random(rng),
-        )
-        .unwrap();
+        let (receiver_key, transmission_key) = fvk.receiver_key();
+        let address = RhombusAddress::derive(&fvk, Diversifier::random(rng)).unwrap();
         Self {
             sk,
             fvk,
+            receiver_key,
+            transmission_key,
             address,
             tree: MerkleTree::new(),
             notes: Vec::new(),
@@ -79,8 +81,14 @@ impl Wallet {
                 let body = action.body();
                 let position = self.tree.append(*body.cmx().inner()).unwrap();
                 let rho = Rho::from_nullifier(body.nullifier()).unwrap();
-                if let Ok((note, _)) =
-                    decrypt_note_with_ivk(&ivk, body.encrypted_note(), rho, body.cmx())
+                if let Ok((note, _)) = decrypt_note_with_ivk(
+                    &ivk,
+                    &self.receiver_key,
+                    &self.transmission_key,
+                    body.encrypted_note(),
+                    rho,
+                    body.cmx(),
+                )
                 {
                     if note.value().raw() > 0 {
                         self.notes.push((note, position));
@@ -97,6 +105,8 @@ impl Wallet {
         Self {
             sk: self.sk.clone(),
             fvk: FullViewingKey::derive(&self.sk).unwrap(),
+            receiver_key: self.fvk.receiver_key().0,
+            transmission_key: self.fvk.receiver_key().1,
             address: self.address,
             tree: self.tree.clone(),
             notes,

@@ -117,8 +117,8 @@ fn random_address(
     sk: &SpendingKey,
     rng: &mut (impl RngCore + CryptoRng),
 ) -> Result<RhombusAddress> {
-    let ivk = FullViewingKey::derive(sk)?.incoming_viewing_key()?;
-    RhombusAddress::derive(&ivk, Diversifier::random(rng))
+    let fvk = FullViewingKey::derive(sk)?;
+    RhombusAddress::derive(&fvk, Diversifier::random(rng))
 }
 
 /// Collects spends and outputs, then builds the transaction.
@@ -375,7 +375,7 @@ fn prepare_action(
     let nullifier = spend.note.nullifier(fvk.nk())?;
 
     let rho = Rho::from_nullifier(&nullifier)?;
-    let note = Note::new(output.recipient, output.value, rho, RandomSeed::random(rng));
+    let note = Note::new(output.recipient.clone(), output.value, rho, RandomSeed::random(rng));
     let cmx = note.cmx()?;
 
     let rcv = ValueCommitTrapdoor::random(rng);
@@ -466,11 +466,7 @@ mod tests {
     fn wallet(rng: &mut ChaCha20Rng) -> Wallet {
         let sk = SpendingKey::random(rng);
         let fvk = FullViewingKey::derive(&sk).unwrap();
-        let address = Address::derive(
-            &fvk.incoming_viewing_key().unwrap(),
-            Diversifier::random(rng),
-        )
-        .unwrap();
+        let address = Address::derive(&fvk, Diversifier::random(rng)).unwrap();
         Wallet { sk, fvk, address }
     }
 

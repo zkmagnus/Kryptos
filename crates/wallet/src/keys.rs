@@ -1,6 +1,7 @@
 //! A wallet's key material, derived from its spending key.
 
 use crypto::diversifier::DiversifierIndex;
+use crypto::encryption::{ReceiverKey, TransmissionKey};
 use crypto::hash::{blake2b_short, PIN};
 use crypto::keys::{
     FullViewingKey, IncomingViewingKey, NullifierKey, OutgoingViewingKey, SpendingKey,
@@ -15,6 +16,8 @@ pub struct WalletKeys {
     fvk: FullViewingKey,
     ivk: IncomingViewingKey,
     ovk: OutgoingViewingKey,
+    receiver_key: ReceiverKey,
+    transmission_key: TransmissionKey,
 }
 
 impl WalletKeys {
@@ -26,11 +29,14 @@ impl WalletKeys {
         let fvk = FullViewingKey::derive(&sk)?;
         let ivk = fvk.incoming_viewing_key()?;
         let ovk = fvk.outgoing_viewing_key();
+        let (receiver_key, transmission_key) = fvk.receiver_key();
         Ok(Self {
             spending: sk,
             fvk,
             ivk,
             ovk,
+            receiver_key,
+            transmission_key,
         })
     }
 
@@ -59,12 +65,26 @@ impl WalletKeys {
         &self.ovk
     }
 
+    /// ML-KEM decapsulation key for incoming note scanning.
+    pub fn receiver_key(&self) -> &ReceiverKey {
+        &self.receiver_key
+    }
+
+    /// Public ML-KEM key shared by this wallet's diversified addresses.
+    pub fn transmission_key(&self) -> &TransmissionKey {
+        &self.transmission_key
+    }
+
     /// The address at a diversifier index.
     ///
     /// # Errors
     /// Fails if the index yields an invalid diversifier.
     pub fn address(&self, index: DiversifierIndex) -> Result<RhombusAddress> {
-        Ok(RhombusAddress::from_index(&self.fvk, index)?)
+        Ok(RhombusAddress::from_index_with_kem(
+            &self.fvk,
+            index,
+            &self.transmission_key,
+        )?)
     }
 
     /// The address at index zero.
@@ -82,7 +102,7 @@ impl WalletKeys {
             .diversifier_key()
             .index(address.diversifier())
             .ok()
-            .filter(|index| self.address(*index).is_ok_and(|ours| ours == *address))
+            .filter(|index| self.address(*index).is_ok_and(|ours| &ours == address))
     }
 }
 

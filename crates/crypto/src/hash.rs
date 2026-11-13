@@ -45,6 +45,9 @@ pub const OCK: Domain = Domain(b"DeriveOck_______");
 /// Derivation of the diversifier key from the full viewing key.
 pub const DK: Domain = Domain(b"DkDerive________");
 
+/// Derivation of the ML-KEM seed from full viewing key material.
+pub const KEM_SEED: Domain = Domain(b"KemSeed_________");
+
 /// Master key derivation from a seed.
 pub const ZIP32_MASTER: Domain = Domain(b"IP32Master______");
 
