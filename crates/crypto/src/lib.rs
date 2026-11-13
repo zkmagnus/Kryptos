@@ -11,11 +11,11 @@
 //! - [`secret`]: zeroizing, constant-time wrappers around field elements.
 //! - [`curve`]: fixed generators, hash-to-curve and Pedersen helpers.
 //! - [`keys`]: the spending key hierarchy and diversified addresses.
-//! - [`commitment`]: value and note commitments.
+//! - [`commitment`]: value and coin commitments.
 //! - [`signature`]: `RedPallas` spend authorization and binding signatures.
-//! - [`encryption`]: key agreement and authenticated encryption for notes.
+//! - [`encryption`]: key agreement and authenticated encryption for coins.
 //! - [`poseidon`]: the circuit-friendly hash, one typed function per use.
-//! - [`merkle`]: the note commitment tree primitives.
+//! - [`merkle`]: the coin commitment tree primitives.
 //! - [`diversifier`]: diversifier indices and their encryption into diversifiers.
 //! - [`zip32`]: hierarchical derivation of spending keys from a seed.
 #![cfg_attr(

@@ -1,9 +1,9 @@
-//! Value commitments and note commitments.
+//! Value commitments and coin commitments.
 //!
 //! Value commitments are Pedersen commitments over the generators in
 //! [`crate::curve::Generator`]; they are additively homomorphic, which is
 //! what lets a verifier check that inputs balance outputs without seeing
-//! any amount. Note commitments are Poseidon hashes with a random trapdoor,
+//! any amount. Coin commitments are Poseidon hashes with a random trapdoor,
 //! which the circuit can recompute cheaply.
 
 use core::ops::{Add, Neg, Sub};
@@ -16,7 +16,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::curve::{pedersen, Generator};
 use crate::encoding::{base_from_bytes, base_to_bytes, point_from_bytes, point_to_bytes, Encoded};
-use crate::poseidon::note_commitment;
+use crate::poseidon::coin_commitment;
 use crate::secret::{SecretBase, SecretScalar};
 use crate::Result;
 
@@ -158,11 +158,11 @@ fn signed_to_scalar(value: i64) -> pallas::Scalar {
     }
 }
 
-/// `rcm`: the blinding factor of a note commitment.
+/// `rcm`: the blinding factor of a coin commitment.
 #[derive(Clone, Debug, Zeroize, ZeroizeOnDrop)]
-pub struct NoteCommitTrapdoor(SecretBase);
+pub struct CoinCommitTrapdoor(SecretBase);
 
-impl NoteCommitTrapdoor {
+impl CoinCommitTrapdoor {
     /// Wraps a base field element.
     pub fn from_base(value: pallas::Base) -> Self {
         Self(SecretBase::new(value))
@@ -179,9 +179,9 @@ impl NoteCommitTrapdoor {
     }
 }
 
-/// The public fields of a note, borrowed for commitment.
+/// The public fields of a coin, borrowed for commitment.
 #[derive(Clone, Copy, Debug)]
-pub struct NoteCommitInputs<'a> {
+pub struct CoinCommitInputs<'a> {
     /// The diversified base of the recipient.
     pub g_d: &'a pallas::Point,
     /// The transmission key of the recipient.
@@ -194,16 +194,16 @@ pub struct NoteCommitInputs<'a> {
     pub psi: &'a pallas::Base,
 }
 
-/// `cm`: a hiding, binding Poseidon commitment to the contents of a note.
+/// `cm`: a hiding, binding Poseidon commitment to the contents of a coin.
 ///
 /// It is a base field element, so it is also directly the tree leaf.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct NoteCommitment(pallas::Base);
+pub struct CoinCommitment(pallas::Base);
 
-impl NoteCommitment {
+impl CoinCommitment {
     /// Commits to `inputs` with blinding `rcm`.
-    pub fn commit(inputs: &NoteCommitInputs<'_>, rcm: &NoteCommitTrapdoor) -> Self {
-        Self(note_commitment(
+    pub fn commit(inputs: &CoinCommitInputs<'_>, rcm: &CoinCommitTrapdoor) -> Self {
+        Self(coin_commitment(
             inputs.g_d,
             inputs.pk_d,
             inputs.value,
@@ -331,8 +331,8 @@ mod tests {
         p: &'a pallas::Point,
         value: u64,
         rho: &'a pallas::Base,
-    ) -> NoteCommitInputs<'a> {
-        NoteCommitInputs {
+    ) -> CoinCommitInputs<'a> {
+        CoinCommitInputs {
             g_d: g,
             pk_d: p,
             value,
@@ -342,7 +342,7 @@ mod tests {
     }
 
     #[test]
-    fn note_commitment_is_hiding_and_binding() {
+    fn coin_commitment_is_hiding_and_binding() {
         let mut rng = rng(6);
         let (g, p) = (
             pallas::Point::random(&mut rng),
@@ -350,44 +350,44 @@ mod tests {
         );
         let rho = pallas::Base::random(&mut rng);
         let (r1, r2) = (
-            NoteCommitTrapdoor::random(&mut rng),
-            NoteCommitTrapdoor::random(&mut rng),
+            CoinCommitTrapdoor::random(&mut rng),
+            CoinCommitTrapdoor::random(&mut rng),
         );
-        let base = NoteCommitment::commit(&inputs(&g, &p, 1, &rho), &r1);
-        assert_eq!(base, NoteCommitment::commit(&inputs(&g, &p, 1, &rho), &r1));
+        let base = CoinCommitment::commit(&inputs(&g, &p, 1, &rho), &r1);
+        assert_eq!(base, CoinCommitment::commit(&inputs(&g, &p, 1, &rho), &r1));
         assert_ne!(
             base,
-            NoteCommitment::commit(&inputs(&g, &p, 1, &rho), &r2),
+            CoinCommitment::commit(&inputs(&g, &p, 1, &rho), &r2),
             "same fields, other rcm"
         );
         assert_ne!(
             base,
-            NoteCommitment::commit(&inputs(&g, &p, 2, &rho), &r1),
+            CoinCommitment::commit(&inputs(&g, &p, 2, &rho), &r1),
             "other value, same rcm"
         );
         assert_ne!(
             base,
-            NoteCommitment::commit(&inputs(&p, &g, 1, &rho), &r1),
+            CoinCommitment::commit(&inputs(&p, &g, 1, &rho), &r1),
             "keys swapped"
         );
     }
 
     #[test]
-    fn note_commitment_roundtrips_bytes() {
+    fn coin_commitment_roundtrips_bytes() {
         let mut rng = rng(7);
         let (g, p) = (
             pallas::Point::random(&mut rng),
             pallas::Point::random(&mut rng),
         );
         let rho = pallas::Base::random(&mut rng);
-        let cm = NoteCommitment::commit(
+        let cm = CoinCommitment::commit(
             &inputs(&g, &p, 3, &rho),
-            &NoteCommitTrapdoor::random(&mut rng),
+            &CoinCommitTrapdoor::random(&mut rng),
         );
-        assert_eq!(NoteCommitment::from_bytes(&cm.to_bytes()), Ok(cm));
-        assert!(NoteCommitment::from_bytes(&[0xFF; 32]).is_err());
+        assert_eq!(CoinCommitment::from_bytes(&cm.to_bytes()), Ok(cm));
+        assert!(CoinCommitment::from_bytes(&[0xFF; 32]).is_err());
         assert_eq!(
-            NoteCommitTrapdoor::from_base(pallas::Base::ONE).expose(),
+            CoinCommitTrapdoor::from_base(pallas::Base::ONE).expose(),
             pallas::Base::ONE
         );
     }

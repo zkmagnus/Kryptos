@@ -457,8 +457,8 @@ mod tests {
         Anchor::from_base(pallas::Base::from(v))
     }
 
-    fn cmx(v: u64) -> protocol::note::ExtractedNoteCommitment {
-        protocol::note::ExtractedNoteCommitment::from_bytes(&crypto::encoding::base_to_bytes(
+    fn cmx(v: u64) -> protocol::coin::ExtractedCoinCommitment {
+        protocol::coin::ExtractedCoinCommitment::from_bytes(&crypto::encoding::base_to_bytes(
             &pallas::Base::from(v),
         ))
         .unwrap()

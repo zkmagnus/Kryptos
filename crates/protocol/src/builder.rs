@@ -1,7 +1,7 @@
 //! Builds a balanced, padded, signed and proven transaction from spends
 //! and outputs.
 //!
-//! Callers choose which notes to spend and what to create. The builder
+//! Callers choose which coins to spend and what to create. The builder
 //! pads to the next action class with dummy actions, shuffles so position
 //! reveals nothing, derives every per-action secret, signs once the
 //! sighash is known, and proves every action in one action proof wrapped
@@ -15,37 +15,37 @@ use crypto::keys::{
 use crypto::merkle::{MerklePath, EMPTY_LEAF, MERKLE_DEPTH};
 use crypto::signature::{BindingSigningKey, RandomizedSigningKey, SpendAuthRandomizer};
 use rand_core::{CryptoRng, RngCore};
-use systemcall_circuit::{ActionWitness, NoteWitness, SpendWitness};
+use systemcall_circuit::{ActionWitness, CoinWitness, SpendWitness};
 use systemcall_proof::{PrivateTransactionProofV2, ProvingKey};
 
 use crate::action::{Action, ActionBody};
 use crate::address::RhombusAddress;
-use crate::coin::{Rhombus, ValueSum};
+use crate::amount::{Amount, ValueSum};
+use crate::coin::{Coin, RandomSeed, Rho};
 use crate::consensus::action_class_for;
 use crate::consensus::{BranchId, COINBASE_ENTRYPOINT, TRANSFER_ENTRYPOINT};
+use crate::encryption::encrypt_coin;
 use crate::fee::FeeOpening;
 use crate::memo::Memo;
-use crate::note::{Note, RandomSeed, Rho};
-use crate::note_encryption::encrypt_note;
 use crate::transaction::{sighash_of, Anchor, Transaction};
 use crate::{Error, Result};
 
-/// A note to spend, the key that can spend it, and its place in the tree.
+/// A coin to spend, the key that can spend it, and its place in the tree.
 #[derive(Clone, Debug)]
 pub struct SpendInfo {
     sk: SpendingKey,
-    note: Note,
+    coin: Coin,
     path: MerklePath,
 }
 
 impl SpendInfo {
-    /// A real spend. `path` must lead from the note's commitment to the
+    /// A real spend. `path` must lead from the coin's commitment to the
     /// anchor the transaction is built against.
-    pub fn new(sk: SpendingKey, note: Note, path: MerklePath) -> Self {
-        Self { sk, note, path }
+    pub fn new(sk: SpendingKey, coin: Coin, path: MerklePath) -> Self {
+        Self { sk, coin, path }
     }
 
-    /// A zero-valued spend of a note that never existed. Its nullifier is
+    /// A zero-valued spend of a coin that never existed. Its nullifier is
     /// well formed and unique, and the circuit accepts it because the
     /// value is zero, so the path is never checked.
     ///
@@ -54,39 +54,40 @@ impl SpendInfo {
     pub fn dummy(rng: &mut (impl RngCore + CryptoRng)) -> Result<Self> {
         let sk = SpendingKey::random(rng);
         let address = random_address(&sk, rng)?;
-        let note = Note::new(
-            address,
-            Rhombus::ZERO,
+        let coin = Coin::new(
+            *address.diversifier(),
+            *address.pk_d(),
+            Amount::ZERO,
             Rho::random(rng),
             RandomSeed::random(rng),
         );
         Ok(Self {
             sk,
-            note,
+            coin,
             path: MerklePath::new(0, [EMPTY_LEAF; MERKLE_DEPTH]),
         })
     }
 
-    /// The spent note.
-    pub fn note(&self) -> &Note {
-        &self.note
+    /// The spent coin.
+    pub fn coin(&self) -> &Coin {
+        &self.coin
     }
 }
 
-/// A note to create.
+/// A coin to create.
 #[derive(Clone, Debug)]
 pub struct OutputInfo {
     recipient: RhombusAddress,
-    value: Rhombus,
+    value: Amount,
     memo: Memo,
     ovk: Option<OutgoingViewingKey>,
 }
 
 impl OutputInfo {
-    /// A real output. Pass `ovk` so the sender can later recover the note.
+    /// A real output. Pass `ovk` so the sender can later recover the coin.
     pub fn new(
         recipient: RhombusAddress,
-        value: Rhombus,
+        value: Amount,
         memo: Memo,
         ovk: Option<OutgoingViewingKey>,
     ) -> Self {
@@ -104,11 +105,11 @@ impl OutputInfo {
     /// Fails only if key derivation fails, which has negligible probability.
     pub fn dummy(rng: &mut (impl RngCore + CryptoRng)) -> Result<Self> {
         let recipient = random_address(&SpendingKey::random(rng), rng)?;
-        Ok(Self::new(recipient, Rhombus::ZERO, Memo::empty(), None))
+        Ok(Self::new(recipient, Amount::ZERO, Memo::empty(), None))
     }
 
     /// The value.
-    pub fn value(&self) -> Rhombus {
+    pub fn value(&self) -> Amount {
         self.value
     }
 }
@@ -175,7 +176,7 @@ impl Builder {
         branch: BranchId,
         rng: &mut (impl RngCore + CryptoRng),
     ) -> Result<Transaction> {
-        self.build_with_fee(Rhombus::ZERO, pk, branch, rng)
+        self.build_with_fee(Amount::ZERO, pk, branch, rng)
     }
 
     /// Builds a transfer offering the explicit public `fee` to the block
@@ -185,7 +186,7 @@ impl Builder {
     /// Returns [`Error::Unbalanced`] unless spends equal outputs plus fee.
     pub fn build_with_fee(
         self,
-        fee: Rhombus,
+        fee: Amount,
         pk: &ProvingKey,
         branch: BranchId,
         rng: &mut (impl RngCore + CryptoRng),
@@ -198,7 +199,7 @@ impl Builder {
     /// metadata. The opening must not be added to the transaction or block.
     pub fn build_with_fee_opening(
         self,
-        fee: Rhombus,
+        fee: Amount,
         pk: &ProvingKey,
         branch: BranchId,
         rng: &mut (impl RngCore + CryptoRng),
@@ -211,7 +212,7 @@ impl Builder {
 
     fn build_v2_with_balance(
         mut self,
-        fee: Rhombus,
+        fee: Amount,
         pk: &ProvingKey,
         branch: BranchId,
         spent_minus_created: ValueSum,
@@ -302,7 +303,7 @@ impl Builder {
     pub fn build_coinbase(
         self,
         pk: &ProvingKey,
-        credit: Rhombus,
+        credit: Amount,
         branch: BranchId,
         rng: &mut (impl RngCore + CryptoRng),
     ) -> Result<Transaction> {
@@ -315,7 +316,7 @@ impl Builder {
     pub fn build_coinbase_with_opening(
         self,
         pk: &ProvingKey,
-        credit: Rhombus,
+        credit: Amount,
         branch: BranchId,
         rng: &mut (impl RngCore + CryptoRng),
     ) -> Result<(Transaction, ValueCommitTrapdoor)> {
@@ -327,7 +328,7 @@ impl Builder {
             .checked_neg()
             .ok_or(Error::AmountOutOfRange)?;
         self.build_v2_with_balance(
-            Rhombus::ZERO,
+            Amount::ZERO,
             pk,
             branch,
             ValueSum::ZERO.minus(credit),
@@ -338,7 +339,7 @@ impl Builder {
 
     /// Spent minus created must equal the required difference.
     fn check_balance(&self, spent_minus_created: ValueSum) -> Result<()> {
-        let spent = ValueSum::sum(self.spends.iter().map(|s| s.note.value()));
+        let spent = ValueSum::sum(self.spends.iter().map(|s| s.coin.value()));
         let created = ValueSum::sum(self.outputs.iter().map(|o| o.value));
         if spent.minus_sum(created) == spent_minus_created {
             Ok(())
@@ -372,15 +373,21 @@ fn prepare_action(
     rng: &mut (impl RngCore + CryptoRng),
 ) -> Result<PreparedAction> {
     let fvk = FullViewingKey::derive(&spend.sk)?;
-    let nullifier = spend.note.nullifier(fvk.nk())?;
+    let nullifier = spend.coin.nullifier(fvk.nk())?;
 
     let rho = Rho::from_nullifier(&nullifier)?;
-    let note = Note::new(output.recipient.clone(), output.value, rho, RandomSeed::random(rng));
-    let cmx = note.cmx()?;
+    let coin = Coin::new(
+        *output.recipient.diversifier(),
+        *output.recipient.pk_d(),
+        output.value,
+        rho,
+        RandomSeed::random(rng),
+    );
+    let cmx = coin.cmx()?;
 
     let rcv = ValueCommitTrapdoor::random(rng);
     let net_value = spend
-        .note
+        .coin
         .value()
         .to_i64()?
         .checked_sub(output.value.to_i64()?)
@@ -391,18 +398,25 @@ fn prepare_action(
     let rsk = RandomizedSigningKey::new(&SpendAuthorizingKey::derive(&spend.sk)?, &alpha)?;
     let rk = rsk.verification_key();
 
-    let encrypted = encrypt_note(&note, &output.memo, output.ovk.as_ref(), &cv_net, rng)?;
+    let encrypted = encrypt_coin(
+        &coin,
+        &output.recipient.kem_key(),
+        &output.memo,
+        output.ovk.as_ref(),
+        &cv_net,
+        rng,
+    )?;
 
     let witness = ActionWitness {
         spend: SpendWitness {
-            note: note_witness(&spend.note)?,
+            coin: coin_witness(&spend.coin)?,
             path: spend.path.clone(),
             ak: fvk.ak().to_point()?,
             nk: fvk.nk().expose(),
             rivk: fvk.rivk().expose(),
             alpha: alpha.expose(),
         },
-        output: note_witness(&note)?,
+        output: coin_witness(&coin)?,
         rcv: rcv.expose(),
         transaction_net: 0,
         transaction_rcv: crypto::pallas::Scalar::zero(),
@@ -416,15 +430,15 @@ fn prepare_action(
     })
 }
 
-/// The circuit's view of a note.
-fn note_witness(note: &Note) -> Result<NoteWitness> {
-    Ok(NoteWitness {
-        g_d: note.recipient().g_d()?,
-        pk_d: *note.recipient().pk_d().as_point(),
-        value: note.value().raw(),
-        rho: *note.rho().inner(),
-        psi: note.psi(),
-        rcm: note.rseed().rcm(note.rho()).expose(),
+/// The circuit's view of a coin.
+fn coin_witness(coin: &Coin) -> Result<CoinWitness> {
+    Ok(CoinWitness {
+        g_d: coin.diversifier().base()?,
+        pk_d: *coin.pk_d().as_point(),
+        value: coin.value().raw(),
+        rho: *coin.rho().inner(),
+        psi: coin.psi(),
+        rcm: coin.rseed().rcm(coin.rho()).expose(),
     })
 }
 
@@ -443,7 +457,7 @@ fn shuffle<T>(items: &mut [T], rng: &mut (impl RngCore + CryptoRng)) {
 #[cfg(test)]
 mod tests {
     use crate::address::RhombusAddress as Address;
-    use crate::coin::Rhombus as Amount;
+    use crate::amount::Amount;
     /// The branch every test transaction is signed for.
     const BRANCH: BranchId = BranchId::new(1);
 
@@ -453,7 +467,7 @@ mod tests {
     use systemcall_circuit::PublicInputs;
 
     use super::*;
-    use crate::note_encryption::{decrypt_note_with_ivk, decrypt_note_with_ovk};
+    use crate::encryption::{decrypt_coin_with_ivk, decrypt_coin_with_ovk};
     use crate::test_keys;
     use crate::validate;
 
@@ -470,23 +484,23 @@ mod tests {
         Wallet { sk, fvk, address }
     }
 
-    /// A tree of note commitments standing in for the chain.
+    /// A tree of coin commitments standing in for the chain.
     #[derive(Default)]
     struct Ledger {
         tree: MerkleTree,
     }
 
     impl Ledger {
-        /// Creates a note for `w` worth `value` and records it in the tree.
+        /// Creates a coin for `w` worth `value` and records it in the tree.
         fn fund(&mut self, rng: &mut ChaCha20Rng, w: &Wallet, value: u64) -> SpendInfo {
-            let note = Note::new(
+            let coin = Coin::new(
                 w.address,
                 amount(value),
                 Rho::random(rng),
                 RandomSeed::random(rng),
             );
-            let position = self.tree.append(*note.cmx().unwrap().inner()).unwrap();
-            SpendInfo::new(w.sk.clone(), note, self.tree.path(position).unwrap())
+            let position = self.tree.append(*coin.cmx().unwrap().inner()).unwrap();
+            SpendInfo::new(w.sk.clone(), coin, self.tree.path(position).unwrap())
         }
 
         fn anchor(&self) -> Anchor {
@@ -507,7 +521,7 @@ mod tests {
         validate::verify_with_balance(tx, 0, branch, vk, rng)
     }
 
-    /// Alice pays Bob `3_000` from a `100_000` note, keeping the change.
+    /// Alice pays Bob `3_000` from a `100_000` coin, keeping the change.
     fn payment(seed: u64) -> (ChaCha20Rng, Wallet, Wallet, Transaction) {
         let mut rng = ChaCha20Rng::seed_from_u64(seed);
         let (alice, bob) = (wallet(&mut rng), wallet(&mut rng));
@@ -558,21 +572,21 @@ mod tests {
         for action in tx.actions() {
             let body = action.body();
             let rho = Rho::from_nullifier(body.nullifier()).unwrap();
-            if let Ok((note, memo)) =
-                decrypt_note_with_ivk(&bob_ivk, body.encrypted_note(), rho, body.cmx())
+            if let Ok((coin, memo)) =
+                decrypt_coin_with_ivk(&bob_ivk, body.encrypted_coin(), rho, body.cmx())
             {
-                assert_eq!(note.value(), amount(3_000));
+                assert_eq!(coin.value(), amount(3_000));
                 assert_eq!(memo.to_text(), Some("hi"));
                 bob_found += 1;
             }
-            if let Ok((note, _)) = decrypt_note_with_ovk(
+            if let Ok((coin, _)) = decrypt_coin_with_ovk(
                 &alice_ovk,
-                body.encrypted_note(),
+                body.encrypted_coin(),
                 body.cv_net(),
                 rho,
                 body.cmx(),
             ) {
-                alice_found.push(note.value().raw());
+                alice_found.push(coin.value().raw());
             }
         }
         assert_eq!(bob_found, 1);
@@ -734,10 +748,10 @@ mod tests {
         let mut rng = ChaCha20Rng::seed_from_u64(7);
         let a = SpendInfo::dummy(&mut rng).unwrap();
         let b = SpendInfo::dummy(&mut rng).unwrap();
-        assert_eq!(a.note().value(), Amount::ZERO);
+        assert_eq!(a.coin().value(), Amount::ZERO);
         assert_eq!(OutputInfo::dummy(&mut rng).unwrap().value(), Amount::ZERO);
         let nf = |s: &SpendInfo| {
-            s.note()
+            s.coin()
                 .nullifier(FullViewingKey::derive(&s.sk).unwrap().nk())
                 .unwrap()
         };

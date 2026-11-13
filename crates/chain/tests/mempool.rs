@@ -13,7 +13,7 @@ mod common;
 use chain::mempool::{Mempool, Rejection};
 use chain::params::{ChainParams, Upgrade};
 use chain::Error;
-use common::{proving_key, spend_first_note, spend_first_note_for, Harness, Wallet};
+use common::{proving_key, spend_first_coin, spend_first_coin_for, Harness, Wallet};
 use protocol::consensus::BranchId;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
@@ -47,10 +47,10 @@ fn valid_transactions_are_admitted_in_arrival_order_and_mined() {
     let mut pool = Mempool::new(8);
     let w = h.miner.clone_for_test(0);
 
-    let tx1 = spend_first_note(&mut h, &w, &other.address, 1_000);
+    let tx1 = spend_first_coin(&mut h, &w, &other.address, 1_000);
     let w = h.miner.clone_for_test(1);
 
-    let tx2 = spend_first_note(&mut h, &w, &other.address, 2_000);
+    let tx2 = spend_first_coin(&mut h, &w, &other.address, 2_000);
     let id1 = insert(&mut pool, &mut h, tx1.clone()).unwrap();
     let id2 = insert(&mut pool, &mut h, tx2.clone()).unwrap();
     assert_eq!(pool.len(), 2);
@@ -86,10 +86,10 @@ fn conflicting_spends_are_refused() {
     let mut pool = Mempool::new(8);
     let w = h.miner.clone_for_test(0);
 
-    let a = spend_first_note(&mut h, &w, &other.address, 1_000);
+    let a = spend_first_coin(&mut h, &w, &other.address, 1_000);
     let w = h.miner.clone_for_test(0);
 
-    let b = spend_first_note(&mut h, &w, &other.address, 1_500);
+    let b = spend_first_coin(&mut h, &w, &other.address, 1_500);
     insert(&mut pool, &mut h, a).unwrap();
     assert!(matches!(
         insert(&mut pool, &mut h, b),
@@ -103,10 +103,10 @@ fn a_block_spending_a_pooled_nullifier_evicts_the_conflict() {
     let mut pool = Mempool::new(8);
     let w = h.miner.clone_for_test(0);
 
-    let pooled = spend_first_note(&mut h, &w, &other.address, 1_000);
+    let pooled = spend_first_coin(&mut h, &w, &other.address, 1_000);
     let w = h.miner.clone_for_test(0);
 
-    let mined = spend_first_note(&mut h, &w, &other.address, 1_500);
+    let mined = spend_first_coin(&mut h, &w, &other.address, 1_500);
     insert(&mut pool, &mut h, pooled).unwrap();
     let block = h.extend(vec![mined]);
     pool.on_block_applied(&block, h.chain.store(), h.chain.params())
@@ -123,10 +123,10 @@ fn capacity_and_stale_anchors_are_enforced() {
     let mut pool = Mempool::new(1);
     let wallet = h.miner.clone_for_test(0);
 
-    let first = spend_first_note(&mut h, &wallet, &other.address, 1_000);
+    let first = spend_first_coin(&mut h, &wallet, &other.address, 1_000);
     let wallet = h.miner.clone_for_test(1);
 
-    let second = spend_first_note(&mut h, &wallet, &other.address, 1_000);
+    let second = spend_first_coin(&mut h, &wallet, &other.address, 1_000);
     insert(&mut pool, &mut h, first).unwrap();
     assert!(matches!(
         insert(&mut pool, &mut h, second),
@@ -139,7 +139,7 @@ fn capacity_and_stale_anchors_are_enforced() {
     params.anchor_max_age = 0;
     let wallet = h.miner.clone_for_test(1);
 
-    let third = spend_first_note(&mut h, &wallet, &other.address, 1_000);
+    let third = spend_first_coin(&mut h, &wallet, &other.address, 1_000);
     h.extend(Vec::new());
     let vk = proving_key().verifying_key();
     assert!(matches!(
@@ -154,7 +154,7 @@ fn readmit_restores_reverted_transactions_that_still_fit() {
     let mut pool = Mempool::new(8);
     let w = h.miner.clone_for_test(0);
 
-    let tx = spend_first_note(&mut h, &w, &other.address, 1_000);
+    let tx = spend_first_coin(&mut h, &w, &other.address, 1_000);
     let block = h.extend(vec![tx.clone()]);
     pool.on_block_applied(&block, h.chain.store(), h.chain.params())
         .unwrap();
@@ -191,7 +191,7 @@ fn the_pool_empties_at_an_upgrade_and_admits_only_the_new_branch_after() {
 
     // Tip 1: the next block is under the old branch.
     let w = h.miner.clone_for_test(0);
-    let signed_old = spend_first_note_for(&mut h, &w, &other.address, 1_000, old);
+    let signed_old = spend_first_coin_for(&mut h, &w, &other.address, 1_000, old);
     insert(&mut pool, &mut h, signed_old).unwrap();
     assert_eq!(pool.len(), 1);
 
@@ -209,14 +209,14 @@ fn the_pool_empties_at_an_upgrade_and_admits_only_the_new_branch_after() {
     assert!(pool.is_empty());
 
     let w = h.miner.clone_for_test(0);
-    let stale = spend_first_note_for(&mut h, &w, &other.address, 1_000, old);
+    let stale = spend_first_coin_for(&mut h, &w, &other.address, 1_000, old);
     assert!(matches!(
         insert(&mut pool, &mut h, stale),
         Err(Error::Protocol(protocol::Error::Crypto(
             crypto::Error::InvalidSignature
         )))
     ));
-    let fresh = spend_first_note_for(&mut h, &w, &other.address, 1_000, new);
+    let fresh = spend_first_coin_for(&mut h, &w, &other.address, 1_000, new);
     insert(&mut pool, &mut h, fresh).unwrap();
     assert_eq!(pool.len(), 1);
 }
@@ -239,7 +239,7 @@ fn a_reorganization_below_an_activation_empties_the_pool_too() {
     let mut pool = Mempool::new(8);
 
     // Tip 3: the pool is verified for the new branch.
-    let signed_new = spend_first_note_for(&mut h, &at_tip_3, &other.address, 1_000, new);
+    let signed_new = spend_first_coin_for(&mut h, &at_tip_3, &other.address, 1_000, new);
     insert(&mut pool, &mut h, signed_new).unwrap();
     assert_eq!(pool.len(), 1);
 
@@ -252,7 +252,7 @@ fn a_reorganization_below_an_activation_empties_the_pool_too() {
     assert_eq!(pool.select(h.chain.store(), &params, 8).unwrap().len(), 0);
     assert!(pool.is_empty());
 
-    let signed_old = spend_first_note_for(&mut h, &at_tip_1, &other.address, 1_000, old);
+    let signed_old = spend_first_coin_for(&mut h, &at_tip_1, &other.address, 1_000, old);
     insert(&mut pool, &mut h, signed_old).unwrap();
     assert_eq!(pool.len(), 1);
 }

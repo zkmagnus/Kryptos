@@ -4,8 +4,8 @@ use crypto::commitment::{ValueCommitTrapdoor, ValueCommitment};
 use crypto::encoding::{scalar_from_bytes, scalar_to_bytes};
 use crypto::pallas;
 
+use crate::amount::Amount;
 use crate::bytes::{Encodable, Reader, Writer};
-use crate::coin::Rhombus;
 use crate::{Error, Result};
 
 /// Encoded length of a fee opening: raw amount plus Pedersen blinding scalar.
@@ -16,7 +16,7 @@ pub const FEE_OPENING_LEN: usize = 8 + crypto::encoding::ENCODED_LEN;
 /// transaction or block encoding.
 #[derive(Clone, Debug)]
 pub struct FeeOpening {
-    fee: Rhombus,
+    fee: Amount,
     blinding: ValueCommitTrapdoor,
 }
 
@@ -30,12 +30,12 @@ impl Eq for FeeOpening {}
 
 impl FeeOpening {
     /// Creates an opening from the fee and aggregate commitment blinding.
-    pub fn new(fee: Rhombus, blinding: ValueCommitTrapdoor) -> Self {
+    pub fn new(fee: Amount, blinding: ValueCommitTrapdoor) -> Self {
         Self { fee, blinding }
     }
 
     /// The opened fee amount.
-    pub fn fee(&self) -> Rhombus {
+    pub fn fee(&self) -> Amount {
         self.fee
     }
 
@@ -72,7 +72,7 @@ impl Encodable for FeeOpening {
     }
 
     fn read(r: &mut Reader<'_>) -> Result<Self> {
-        let fee = Rhombus::from_raw(r.take_u64_le()?)?;
+        let fee = Amount::from_raw(r.take_u64_le()?)?;
         let scalar = scalar_from_bytes(&r.take_array()?)?;
         Ok(Self::new(fee, ValueCommitTrapdoor::from_scalar(scalar)))
     }
@@ -92,14 +92,14 @@ mod tests {
         let mut rng = ChaCha20Rng::seed_from_u64(1);
         let blinding = ValueCommitTrapdoor::random(&mut rng);
         let commitment = ValueCommitment::commit(1234, &blinding);
-        let opening = FeeOpening::new(Rhombus::from_raw(1234).unwrap(), blinding.clone());
+        let opening = FeeOpening::new(Amount::from_raw(1234).unwrap(), blinding.clone());
         assert!(opening.verify([&commitment]).is_ok());
 
-        let wrong_amount = FeeOpening::new(Rhombus::from_raw(1235).unwrap(), blinding.clone());
+        let wrong_amount = FeeOpening::new(Amount::from_raw(1235).unwrap(), blinding.clone());
         assert!(wrong_amount.verify([&commitment]).is_err());
 
         let wrong_blinding = FeeOpening::new(
-            Rhombus::from_raw(1234).unwrap(),
+            Amount::from_raw(1234).unwrap(),
             ValueCommitTrapdoor::random(&mut rng),
         );
         assert!(wrong_blinding.verify([&commitment]).is_err());
@@ -107,7 +107,7 @@ mod tests {
 
     #[test]
     fn opening_has_canonical_fixed_length_encoding() {
-        let opening = FeeOpening::new(Rhombus::from_raw(42).unwrap(), ValueCommitTrapdoor::zero());
+        let opening = FeeOpening::new(Amount::from_raw(42).unwrap(), ValueCommitTrapdoor::zero());
         let bytes = opening.to_vec();
         assert_eq!(bytes.len(), FEE_OPENING_LEN);
         assert_eq!(FeeOpening::from_slice(&bytes), Ok(opening));

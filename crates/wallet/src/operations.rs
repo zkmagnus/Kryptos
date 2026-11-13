@@ -1,10 +1,10 @@
 //! Persisted send operations: what a wallet was asked to pay, how far it
-//! got, and which notes it has set aside for it. An operation survives a
+//! got, and which coins it has set aside for it. An operation survives a
 //! restart and is rebuilt if its transaction fails to be mined.
 
 use protocol::address::RhombusAddress;
+use protocol::amount::Amount;
 use protocol::bytes::{Encodable, Reader, Writer};
-use protocol::coin::Rhombus;
 use protocol::fee::FeeOpening;
 use protocol::memo::Memo;
 use protocol::transaction::TxId;
@@ -46,7 +46,7 @@ pub enum OperationStatus {
 }
 
 impl OperationStatus {
-    /// Whether the operation still holds its notes and may still be mined.
+    /// Whether the operation still holds its coins and may still be mined.
     pub fn is_pending(&self) -> bool {
         matches!(
             self,
@@ -88,7 +88,7 @@ pub struct Operation {
     pub min_confirmations: u32,
     /// Where it is.
     pub status: OperationStatus,
-    /// Positions of the notes set aside for it while pending.
+    /// Positions of the coins set aside for it while pending.
     pub locked: Vec<u64>,
     /// The built transaction, kept for resubmission.
     pub transaction: Option<Vec<u8>>,
@@ -174,7 +174,7 @@ impl Encodable for Payment {
     fn read(r: &mut Reader<'_>) -> protocol::Result<Self> {
         Ok(Self {
             recipient: RhombusAddress::read(r)?,
-            amount: Rhombus::from_raw(r.take_u64_le()?)?,
+            amount: Amount::from_raw(r.take_u64_le()?)?,
             memo: Memo::read(r)?,
         })
     }
@@ -331,7 +331,7 @@ impl Encodable for Operation {
 #[cfg(test)]
 mod tests {
     use crypto::keys::SpendingKey;
-    use protocol::coin::Rhombus as Amount;
+    use protocol::amount::Amount;
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
 
@@ -390,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_means_notes_stay_locked() {
+    fn pending_means_coins_stay_locked() {
         let txid = TxId::from_bytes([1; 32]);
         assert!(OperationStatus::Queued.is_pending());
         assert!(OperationStatus::Proving.is_pending());

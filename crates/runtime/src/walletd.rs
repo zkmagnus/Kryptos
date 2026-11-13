@@ -1,4 +1,4 @@
-//! The wallet daemon `rhombus-wallet-rpc`: a long-running process that
+//! The wallet daemon `Amount-wallet-rpc`: a long-running process that
 //! holds one wallet file, keeps it synced from a node, serves the wallet
 //! methods over JSON-RPC, and carries send operations from request to
 //! confirmation, rebuilding them if their transaction is not mined.
@@ -18,8 +18,8 @@ use chain::params::ChainParams;
 use clap::Parser;
 use crypto::encoding::to_hex;
 use protocol::address::RhombusAddress;
+use protocol::amount::Amount;
 use protocol::bytes::Encodable;
-use protocol::coin::Rhombus;
 use protocol::consensus::next_height;
 use protocol::memo::Memo;
 use protocol::transaction::{Transaction, TxId};
@@ -28,7 +28,7 @@ use systemcall_proof::ProvingKey;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use wallet::operations::{Operation, OperationStatus};
-use wallet::scan::OwnedNote;
+use wallet::scan::OwnedCoin;
 use wallet::spend::{build_payments, quote_payments, Built, Payment, MAX_RECIPIENTS};
 use wallet::wallet::Wallet;
 
@@ -72,14 +72,14 @@ pub const METHODS: &[&str] = &[
     "help",
 ];
 
-/// Command line of `rhombus-wallet-rpc`.
+/// Command line of `Amount-wallet-rpc`.
 #[derive(Parser, Debug)]
 #[command(
-    name = "rhombus-wallet-rpc",
+    name = "Amount-wallet-rpc",
     about = "Wallet daemon: sync, addresses, sends, JSON-RPC"
 )]
 pub struct Args {
-    /// Wallet file, created with `rhombus create` or the desktop app;
+    /// Wallet file, created with `Amount create` or the desktop app;
     /// defaults to `<user data>/<network>/wallet.redb`.
     #[arg(long)]
     pub wallet: Option<PathBuf>,
@@ -98,7 +98,7 @@ pub struct Args {
     )]
     pub node_token: Option<String>,
     /// File holding the node's token; defaults to the `rpc.token` a
-    /// default `rhombus run` writes, `<user data>/<network>/chain/rpc.token`.
+    /// default `Amount run` writes, `<user data>/<network>/chain/rpc.token`.
     #[arg(long)]
     pub node_token_file: Option<PathBuf>,
     /// Address to serve the wallet's JSON-RPC on.
@@ -265,7 +265,7 @@ fn node_token(text: Option<String>, file: Option<PathBuf>, network: Network) -> 
     }
 }
 
-/// Runs the `rhombus-wallet-rpc` command line: opens the wallet, starts the
+/// Runs the `Amount-wallet-rpc` command line: opens the wallet, starts the
 /// daemon and waits for a stop request.
 ///
 /// # Errors
@@ -284,7 +284,7 @@ pub async fn main(args: Args) -> Result<()> {
     // an empty file behind a mistyped or missing path.
     if !wallet_path.try_exists()? {
         return Err(Error::Argument(format!(
-            "no wallet at {}; create one with the desktop app or `rhombus create --wallet <file>`",
+            "no wallet at {}; create one with the desktop app or `Amount create --wallet <file>`",
             wallet_path.display()
         )));
     }
@@ -313,7 +313,7 @@ pub async fn main(args: Args) -> Result<()> {
     })
     .await?;
     logging::info(&format!(
-        "rhombus-wallet-rpc up on the {} network, json-rpc http://{}/",
+        "Amount-wallet-rpc up on the {} network, json-rpc http://{}/",
         args.network, handle.addr
     ));
     shutdown.requested().await;
@@ -393,7 +393,7 @@ impl WalletDaemon {
         let mut client = self.0.node.connect().await?;
         let tip = self.scan(&mut client).await?;
         // Restore reservations for every removed confirmation before a queued
-        // payment can select notes, including stale records from older writers.
+        // payment can select coins, including stale records from older writers.
         self.reconcile_operations(&mut client, tip).await?;
         for operation in self.0.wallet.operations()? {
             match operation.status.clone() {
@@ -440,7 +440,7 @@ impl WalletDaemon {
     }
 
     async fn reconcile_operations(&self, client: &mut impl Control, tip: u32) -> Result<()> {
-        let notes = self.0.wallet.notes()?;
+        let coins = self.0.wallet.coins()?;
         for previous in self.0.wallet.operations()? {
             if !previous.status.is_pending()
                 && !matches!(previous.status, OperationStatus::Confirmed { .. })
@@ -461,7 +461,7 @@ impl WalletDaemon {
                 };
             }
             if op.status.is_pending() {
-                Self::reserve_recorded_inputs(&mut op, &notes)?;
+                Self::reserve_recorded_inputs(&mut op, &coins)?;
             }
             if op != previous {
                 self.0.wallet.compare_and_swap_operation(&previous, &op)?;
@@ -470,18 +470,18 @@ impl WalletDaemon {
         Ok(())
     }
 
-    fn reserve_recorded_inputs(op: &mut Operation, notes: &[OwnedNote]) -> Result<()> {
+    fn reserve_recorded_inputs(op: &mut Operation, coins: &[OwnedCoin]) -> Result<()> {
         let mut positions = op.locked.clone();
         for bytes in op.transactions() {
             let tx = Transaction::from_slice(bytes)?;
-            positions.extend(notes.iter().filter_map(|note| {
+            positions.extend(coins.iter().filter_map(|coin| {
                 tx.actions()
                     .iter()
-                    .any(|action| action.body().nullifier() == &note.nullifier)
-                    .then_some(note.position)
+                    .any(|action| action.body().nullifier() == &coin.nullifier)
+                    .then_some(coin.position)
             }));
         }
-        // A reorg can put the same note at a different tree position. Nullifiers
+        // A reorg can put the same coin at a different tree position. Nullifiers
         // identify inputs; retained positions alone cannot reserve them safely.
         positions.sort_unstable();
         positions.dedup();
@@ -500,7 +500,7 @@ impl WalletDaemon {
                 transaction_status(client, transaction.txid()).await?
             {
                 if height > tip {
-                    // Catch up before releasing the spent notes to selection.
+                    // Catch up before releasing the spent coins to selection.
                     return Err(Error::Argument("node advanced during wallet sync".into()));
                 }
                 return Ok(Some((transaction, height)));
@@ -548,8 +548,8 @@ impl WalletDaemon {
         }
 
         let branch = self.0.params.branch_at(next_height(tip)?);
-        // A note at height h has tip - h + 1 confirmations.
-        let max_note_height = tip
+        // A coin at height h has tip - h + 1 confirmations.
+        let max_coin_height = tip
             .saturating_add(1)
             .saturating_sub(op.min_confirmations.max(1));
         let excluded = self.excluded_positions(&op)?;
@@ -563,7 +563,7 @@ impl WalletDaemon {
                 pk.as_ref(),
                 branch,
                 &excluded,
-                max_note_height,
+                max_coin_height,
                 &mut rand::rngs::OsRng,
             )
         })
@@ -575,7 +575,7 @@ impl WalletDaemon {
         }
     }
 
-    /// Notes set aside by pending operations other than `except`.
+    /// Coins set aside by pending operations other than `except`.
     fn pending_locks(&self, except: Option<u64>) -> Result<Vec<u64>> {
         Ok(self
             .0
@@ -594,16 +594,16 @@ impl WalletDaemon {
             .map(|bytes| Transaction::from_slice(bytes))
             .collect::<protocol::Result<Vec<_>>>()?;
         // Every replacement must conflict with every retained attempt, including
-        // after a reorg changes note positions or selects an older confirmation.
-        excluded.extend(self.0.wallet.unspent()?.iter().filter_map(|note| {
+        // after a reorg changes coin positions or selects an older confirmation.
+        excluded.extend(self.0.wallet.unspent()?.iter().filter_map(|coin| {
             attempts
                 .iter()
                 .any(|tx| {
                     !tx.actions()
                         .iter()
-                        .any(|action| action.body().nullifier() == &note.nullifier)
+                        .any(|action| action.body().nullifier() == &coin.nullifier)
                 })
-                .then_some(note.position)
+                .then_some(coin.position)
         }));
         Ok(excluded)
     }
@@ -711,7 +711,7 @@ impl WalletDaemon {
         }))
     }
 
-    /// Labels by address index, for annotating notes.
+    /// Labels by address index, for annotating coins.
     fn labels(&self) -> Result<std::collections::HashMap<u64, String>> {
         Ok(self
             .0
@@ -722,27 +722,32 @@ impl WalletDaemon {
             .collect())
     }
 
-    fn note_json(
+    fn coin_json(
         &self,
-        note: &OwnedNote,
+        coin: &OwnedCoin,
         labels: &std::collections::HashMap<u64, String>,
         locked: &[u64],
     ) -> Result<Value> {
-        let index = self.0.wallet.address_index_of(note.note.recipient());
+        let address = RhombusAddress::from_parts(
+            *coin.coin.diversifier(),
+            *coin.coin.pk_d(),
+            self.0.wallet.keys().transmission_key().clone(),
+        );
+        let index = self.0.wallet.address_index_of(&address);
         Ok(json!({
-            "position": note.position,
-            "txid": note.txid.map(|t| t.to_string()),
-            "height": note.height,
-            "confirmations": self.confirmations(note.height)?,
-            "amount": note.note.value().raw().to_string(),
-            "address": note.note.recipient().encode(self.0.params.address_prefix),
+            "position": coin.position,
+            "txid": coin.txid.map(|t| t.to_string()),
+            "height": coin.height,
+            "confirmations": self.confirmations(coin.height)?,
+            "amount": coin.coin.value().raw().to_string(),
+            "address": address.encode(self.0.params.address_prefix),
             "address_index": index,
             "label": index.and_then(|i| labels.get(&i).cloned()),
-            "memo": memo_json(&note.memo),
-            "spent": note.spent_at.is_some(),
-            "spent_at": note.spent_at,
-            "spent_by": note.spent_by.map(|t| t.to_string()),
-            "locked": locked.contains(&note.position),
+            "memo": memo_json(&coin.memo),
+            "spent": coin.spent_at.is_some(),
+            "spent_at": coin.spent_at,
+            "spent_by": coin.spent_by.map(|t| t.to_string()),
+            "locked": locked.contains(&coin.position),
         }))
     }
 
@@ -819,7 +824,7 @@ fn is_cancellable(op: &Operation) -> bool {
 
 /// A memo as text when it is text, else as hex, else null when empty.
 /// An amount given as a decimal string or a number, in smallest units.
-fn parse_amount(value: Option<&Value>) -> core::result::Result<Rhombus, RpcError> {
+fn parse_amount(value: Option<&Value>) -> core::result::Result<Amount, RpcError> {
     let raw = match value {
         Some(Value::String(text)) => text
             .parse::<u64>()
@@ -829,7 +834,7 @@ fn parse_amount(value: Option<&Value>) -> core::result::Result<Rhombus, RpcError
             .ok_or_else(|| RpcError::invalid_params("amount must be a whole number"))?,
         _ => return Err(RpcError::invalid_params("amount")),
     };
-    Ok(Rhombus::from_raw(raw)?)
+    Ok(Amount::from_raw(raw)?)
 }
 
 impl Dispatch for WalletDaemon {
@@ -844,7 +849,7 @@ impl Dispatch for WalletDaemon {
                 self.0.wake.notify_one();
                 Ok(json!({ "scanned_height": self.scanned_height()? }))
             }
-            _ => self.note_methods(method, params),
+            _ => self.coin_methods(method, params),
         }
     }
 }
@@ -861,7 +866,7 @@ impl WalletDaemon {
             "getwalletinfo" => {
                 let scanned = self.scanned_height()?;
                 let node = self.node_height();
-                let notes = wallet.notes()?;
+                let coins = wallet.coins()?;
                 let pending = wallet
                     .operations()?
                     .iter()
@@ -872,8 +877,8 @@ impl WalletDaemon {
                     "scanned_height": scanned,
                     "node_height": node,
                     "synced": scanned.is_some() && scanned == node,
-                    "notes": notes.len(),
-                    "unspent": notes.iter().filter(|n| n.spent_at.is_none()).count(),
+                    "coins": coins.len(),
+                    "unspent": coins.iter().filter(|n| n.spent_at.is_none()).count(),
                     "balance": wallet.balance()?.to_string(),
                     "pending_operations": pending,
                     "last_error": self.0.last_error.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone(),
@@ -912,7 +917,7 @@ impl WalletDaemon {
         }
     }
 
-    fn note_methods(&self, method: &str, params: &Params) -> core::result::Result<Value, RpcError> {
+    fn coin_methods(&self, method: &str, params: &Params) -> core::result::Result<Value, RpcError> {
         let wallet = &self.0.wallet;
         match method {
             "getbalance" => {
@@ -924,15 +929,15 @@ impl WalletDaemon {
                 let since: u32 = params.opt(1, "since_height")?.unwrap_or(0);
                 let labels = self.labels()?;
                 let locked = wallet.locked_positions()?;
-                let notes = if method == "listunspent" {
+                let coins = if method == "listunspent" {
                     wallet.unspent()?
                 } else {
-                    wallet.notes()?
+                    wallet.coins()?
                 };
                 let mut out = Vec::new();
-                for note in notes.iter().filter(|n| n.height >= since) {
-                    if self.confirmations(note.height)? >= min {
-                        out.push(self.note_json(note, &labels, &locked)?);
+                for coin in coins.iter().filter(|n| n.height >= since) {
+                    if self.confirmations(coin.height)? >= min {
+                        out.push(self.coin_json(coin, &labels, &locked)?);
                     }
                 }
                 Ok(Value::Array(out))
@@ -995,7 +1000,7 @@ impl WalletDaemon {
 
 impl WalletDaemon {
     /// Unspent value split by what a send may use now.
-    /// The exact total `recipients` would send if queued now, selecting notes
+    /// The exact total `recipients` would send if queued now, selecting coins
     /// as the payment worker would at the wallet's scanned height.
     fn quote_json(
         &self,
@@ -1003,12 +1008,12 @@ impl WalletDaemon {
         min_confirmations: u32,
     ) -> core::result::Result<Value, RpcError> {
         let tip = self.scanned_height()?.unwrap_or(0);
-        // A note at height h has tip - h + 1 confirmations.
-        let max_note_height = tip
+        // A coin at height h has tip - h + 1 confirmations.
+        let max_coin_height = tip
             .saturating_add(1)
             .saturating_sub(min_confirmations.max(1));
         let excluded = self.pending_locks(None)?;
-        let quote = quote_payments(&self.0.wallet, recipients, &excluded, max_note_height)
+        let quote = quote_payments(&self.0.wallet, recipients, &excluded, max_coin_height)
             .map_err(|error| match error {
                 wallet::Error::InsufficientFunds { .. } => {
                     RpcError::new(REJECTED, error.to_string())
@@ -1017,7 +1022,7 @@ impl WalletDaemon {
             })?;
         let sent = recipients
             .iter()
-            .try_fold(Rhombus::ZERO, |acc, p| acc.checked_add(p.amount))
+            .try_fold(Amount::ZERO, |acc, p| acc.checked_add(p.amount))
             .map_err(|e| RpcError::from(Error::from(e)))?;
         Ok(json!({
             "total": sent.raw().to_string(),
@@ -1031,11 +1036,11 @@ impl WalletDaemon {
         let mut confirmed = 0u64;
         let mut pending = 0u64;
         let mut set_aside = 0u64;
-        for note in self.0.wallet.unspent()? {
-            let value = note.note.value().raw();
-            if self.confirmations(note.height)? < min_confirmations {
+        for coin in self.0.wallet.unspent()? {
+            let value = coin.coin.value().raw();
+            if self.confirmations(coin.height)? < min_confirmations {
                 pending = pending.saturating_add(value);
-            } else if locked.contains(&note.position) {
+            } else if locked.contains(&coin.position) {
                 set_aside = set_aside.saturating_add(value);
             } else {
                 confirmed = confirmed.saturating_add(value);
@@ -1052,27 +1057,27 @@ impl WalletDaemon {
         }))
     }
 
-    /// Our side of one transaction: notes it gave us and notes it spent.
+    /// Our side of one transaction: coins it gave us and coins it spent.
     fn transaction_json(&self, txid: TxId) -> core::result::Result<Value, RpcError> {
         let labels = self.labels()?;
         let locked = self.0.wallet.locked_positions()?;
-        let notes = self.0.wallet.notes()?;
-        let received: Vec<&OwnedNote> = notes.iter().filter(|n| n.txid == Some(txid)).collect();
-        let spent: Vec<&OwnedNote> = notes.iter().filter(|n| n.spent_by == Some(txid)).collect();
+        let coins = self.0.wallet.coins()?;
+        let received: Vec<&OwnedCoin> = coins.iter().filter(|n| n.txid == Some(txid)).collect();
+        let spent: Vec<&OwnedCoin> = coins.iter().filter(|n| n.spent_by == Some(txid)).collect();
         if received.is_empty() && spent.is_empty() {
             return Err(RpcError::not_found("transaction"));
         }
-        let sum = |notes: &[&OwnedNote]| -> i128 {
-            notes.iter().map(|n| i128::from(n.note.value().raw())).sum()
+        let sum = |coins: &[&OwnedCoin]| -> i128 {
+            coins.iter().map(|n| i128::from(n.coin.value().raw())).sum()
         };
         let height = received
             .first()
             .map(|n| n.height)
             .or_else(|| spent.first().and_then(|n| n.spent_at));
-        let render = |notes: &[&OwnedNote]| -> Result<Vec<Value>> {
-            notes
+        let render = |coins: &[&OwnedCoin]| -> Result<Vec<Value>> {
+            coins
                 .iter()
-                .map(|n| self.note_json(n, &labels, &locked))
+                .map(|n| self.coin_json(n, &labels, &locked))
                 .collect()
         };
         Ok(json!({
@@ -1107,7 +1112,7 @@ mod tests {
 
     #[test]
     fn the_wallet_daemon_defaults_to_the_main_network() {
-        let args = Args::try_parse_from(["rhombus-wallet-rpc"]).unwrap();
+        let args = Args::try_parse_from(["Amount-wallet-rpc"]).unwrap();
         assert_eq!(args.network, Network::Main);
     }
 
@@ -1152,7 +1157,7 @@ mod tests {
             .add_operation(
                 vec![Payment {
                     recipient: wallet.keys().address(1u64.into()).unwrap(),
-                    amount: Rhombus::from_raw(1_000).unwrap(),
+                    amount: Amount::from_raw(1_000).unwrap(),
                     memo: Memo::empty(),
                 }],
                 1,
@@ -1170,7 +1175,7 @@ mod tests {
         builder
             .add_output(protocol::builder::OutputInfo::new(
                 keys.default_address().unwrap(),
-                Rhombus::ZERO,
+                Amount::ZERO,
                 Memo::empty(),
                 None,
             ))
@@ -1178,7 +1183,7 @@ mod tests {
         builder
             .build_coinbase(
                 &ProvingKey::build().unwrap(),
-                Rhombus::ZERO,
+                Amount::ZERO,
                 Network::Test.params().genesis_branch,
                 &mut rng,
             )
@@ -1194,7 +1199,7 @@ mod tests {
         };
         op.transaction = Some(tx.to_vec());
         op.fee_opening = Some(protocol::fee::FeeOpening::new(
-            Rhombus::ZERO,
+            Amount::ZERO,
             ValueCommitTrapdoor::zero(),
         ));
         op.locked = vec![0];
@@ -1284,7 +1289,7 @@ mod tests {
                         transaction: tx.clone(),
                         spent: vec![0],
                         fee_opening: protocol::fee::FeeOpening::new(
-                            Rhombus::ZERO,
+                            Amount::ZERO,
                             ValueCommitTrapdoor::zero(),
                         ),
                     },
@@ -1335,7 +1340,7 @@ mod tests {
         );
         assert_eq!(
             daemon
-                .note_methods("canceloperation", &Params::new(json!([resumable.id])))
+                .coin_methods("canceloperation", &Params::new(json!([resumable.id])))
                 .unwrap()["status"],
             "cancelled"
         );
@@ -1350,7 +1355,7 @@ mod tests {
         wallet.put_operation(&op).unwrap();
         drop(wallet);
         let daemon = offline_daemon(reopen(&dir));
-        // This also works for compact scans, which have no note.spent_by txids.
+        // This also works for compact scans, which have no coin.spent_by txids.
         assert!(daemon.0.light);
         let mut client = ScriptedControl::new([
             Ok("unknown".into()),
@@ -1401,7 +1406,7 @@ mod tests {
         assert_eq!(queued.transaction, op.transaction);
         assert_eq!(queued.locked, op.locked);
         assert!(daemon
-            .note_methods("canceloperation", &Params::new(json!([op.id])))
+            .coin_methods("canceloperation", &Params::new(json!([op.id])))
             .is_err());
         // An old transaction mined while a replacement was queued wins before
         // another proof starts.
@@ -1483,7 +1488,7 @@ mod tests {
             .await
             .is_err());
         assert_eq!(daemon.wallet().operation(op.id).unwrap(), pending);
-        // A newly present note at a formerly locked position is insufficient:
+        // A newly present coin at a formerly locked position is insufficient:
         // the nullifier must belong to every previous transaction attempt.
         let owned_position = daemon.wallet().unspent().unwrap()[0].position;
         assert!(daemon
@@ -1498,7 +1503,7 @@ mod tests {
         let queued = payment(&wallet);
         let daemon = offline_daemon(wallet);
         daemon
-            .note_methods("canceloperation", &Params::new(json!([queued.id])))
+            .coin_methods("canceloperation", &Params::new(json!([queued.id])))
             .unwrap();
         let mut client = ScriptedControl::new([]);
         daemon
@@ -1571,13 +1576,13 @@ mod tests {
         let recovered = self::daemon(reopen(&dir), source);
         recovered.sync_once().await.unwrap();
         assert_eq!(recovered.wallet().operation(op.id).unwrap(), submitted);
-        let mut relocated = recovered.wallet().notes().unwrap()[0].clone();
+        let mut relocated = recovered.wallet().coins().unwrap()[0].clone();
         relocated.position = 42;
         let mut reserved = submitted.clone();
         WalletDaemon::reserve_recorded_inputs(&mut reserved, &[relocated]).unwrap();
         assert!(
             reserved.locked.contains(&42),
-            "a reorg cannot bypass input reservations by moving a note"
+            "a reorg cannot bypass input reservations by moving a coin"
         );
         assert_eq!(
             transaction_status(&mut client, txid).await.unwrap(),
@@ -1627,7 +1632,7 @@ mod tests {
             .unwrap()
             .encode(Network::Test.address_prefix());
         let daemon = offline_daemon(wallet);
-        let quote = |params: Value| daemon.note_methods("quotepayment", &Params::new(params));
+        let quote = |params: Value| daemon.coin_methods("quotepayment", &Params::new(params));
         let unfunded = quote(json!([[{ "address": address, "amount": "1000" }]])).unwrap_err();
         assert_eq!(unfunded.code, REJECTED);
         assert!(unfunded.message.contains("insufficient funds"));
@@ -1652,7 +1657,7 @@ mod tests {
         );
         let daemon = offline_daemon(wallet);
         let listed = daemon
-            .note_methods("getoperationstatus", &Params::new(json!([fresh.id])))
+            .coin_methods("getoperationstatus", &Params::new(json!([fresh.id])))
             .unwrap();
         assert_eq!(listed["cancellable"], true);
     }

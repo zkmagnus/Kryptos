@@ -28,7 +28,7 @@ struct Args {
     /// Scan compact blocks. Memos will not be recovered.
     #[arg(long)]
     light: bool,
-    /// Print each note found while scanning.
+    /// Print each coin found while scanning.
     #[arg(long)]
     verbose: bool,
 }
@@ -93,16 +93,16 @@ fn run(args: Args) -> runtime::Result<()> {
             wallet.scan(&block)?;
         }
         if args.verbose {
-            for note in wallet
-                .notes()?
+            for coin in wallet
+                .coins()?
                 .into_iter()
-                .filter(|note| note.height == next && note.txid.is_some())
+                .filter(|coin| coin.height == next && coin.txid.is_some())
             {
                 println!(
-                    "found note: height={} position={} value={}",
-                    note.height,
-                    note.position,
-                    note.note.value().raw()
+                    "found coin: height={} position={} value={}",
+                    coin.height,
+                    coin.position,
+                    coin.coin.value().raw()
                 );
             }
         }
@@ -117,6 +117,6 @@ fn run(args: Args) -> runtime::Result<()> {
         tip.height.saturating_add(1).saturating_sub(start)
     );
     println!("balance: {} raw", wallet.balance()?);
-    println!("unspent notes: {}", wallet.unspent()?.len());
+    println!("unspent coins: {}", wallet.unspent()?.len());
     Ok(())
 }

@@ -1,4 +1,4 @@
-//! Key agreement and authenticated encryption for note ciphertexts.
+//! Key agreement and authenticated encryption for coin ciphertexts.
 //!
 //! ```text
 //! sender:    esk random,  epk = [esk] g_d,  shared = [esk] pk_d
@@ -9,7 +9,7 @@
 //!
 //! The nonce is zero because every key is used exactly once. The outgoing
 //! cipher key `ock` lets the sender, or anyone with its `ovk`, recover
-//! `pk_d` and `esk` and therefore the note.
+//! `pk_d` and `esk` and therefore the coin.
 
 use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 use chacha20::ChaCha20;
@@ -24,7 +24,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::curve::is_identity;
 use crate::encoding::{point_from_bytes, point_to_bytes, Encoded};
-use crate::hash::{blake2b_short, NOTE_KDF, OCK, SHORT_OUTPUT_LEN};
+use crate::hash::{blake2b_short, COIN_KDF, OCK, SHORT_OUTPUT_LEN};
 use crate::keys::{DiversifiedTransmissionKey, IncomingViewingKey, OutgoingViewingKey};
 use crate::secret::SecretScalar;
 use crate::{Error, Result};
@@ -38,7 +38,7 @@ pub const KEM_CIPHERTEXT_LEN: usize = 1088;
 /// Byte length of the ML-KEM shared secret.
 pub const KEM_SHARED_SECRET_LEN: usize = 32;
 
-/// Receiver's ML-KEM decapsulation key. It can read incoming notes but
+/// Receiver's ML-KEM decapsulation key. It can read incoming coins but
 /// does not grant spend authority.
 pub struct ReceiverKey(ml_kem::kem::DecapsulationKey<MlKem768Params>);
 
@@ -90,9 +90,9 @@ impl TransmissionKey {
         let bytes: &[u8; KEM_ENCAPSULATION_KEY_LEN] = bytes
             .try_into()
             .map_err(|_| Error::InvalidDerivation("ML-KEM encapsulation key length"))?;
-        Ok(Self(ml_kem::kem::EncapsulationKey::<MlKem768Params>::from_bytes(
-            bytes.into(),
-        )))
+        Ok(Self(
+            ml_kem::kem::EncapsulationKey::<MlKem768Params>::from_bytes(bytes.into()),
+        ))
     }
 
     /// Encapsulates a fresh shared secret to this key.
@@ -134,18 +134,18 @@ impl KemSharedSecret {
         &self.0
     }
 
-    /// Derives the note encryption key, binding the KEM ciphertext and note
+    /// Derives the coin encryption key, binding the KEM ciphertext and coin
     /// commitment into the KDF.
-    pub fn note_key(&self, ciphertext: &KemCiphertext, cmx: &[u8; 32]) -> SymmetricKey {
+    pub fn coin_key(&self, ciphertext: &KemCiphertext, cmx: &[u8; 32]) -> SymmetricKey {
         SymmetricKey(blake2b_short(
-            NOTE_KDF,
+            COIN_KDF,
             &[&self.0, &ciphertext.to_bytes(), cmx],
         ))
     }
 }
 
 impl SymmetricKey {
-    /// Derives the outgoing-note cipher key for an ML-KEM output.
+    /// Derives the outgoing-coin cipher key for an ML-KEM output.
     pub fn outgoing_kem(
         ovk: &OutgoingViewingKey,
         cv: &[u8; 32],
@@ -201,7 +201,7 @@ pub const SYMMETRIC_KEY_LEN: usize = SHORT_OUTPUT_LEN;
 pub struct EphemeralSecretKey(SecretScalar);
 
 impl EphemeralSecretKey {
-    /// Wraps a scalar, normally derived from the note's random seed.
+    /// Wraps a scalar, normally derived from the coin's random seed.
     pub fn from_scalar(scalar: pallas::Scalar) -> Self {
         Self(SecretScalar::new(scalar))
     }
@@ -271,10 +271,10 @@ impl EphemeralPublicKey {
 pub struct SharedSecret(pallas::Point);
 
 impl SharedSecret {
-    /// Derives the symmetric note encryption key.
+    /// Derives the symmetric coin encryption key.
     pub fn kdf(&self, epk: &EphemeralPublicKey) -> SymmetricKey {
         SymmetricKey(blake2b_short(
-            NOTE_KDF,
+            COIN_KDF,
             &[&point_to_bytes(&self.0), &epk.to_bytes()],
         ))
     }
@@ -330,7 +330,7 @@ impl SymmetricKey {
     ///
     /// The AEAD reserves the first `ChaCha20` block for the Poly1305 key
     /// and encrypts the plaintext from block one, so this seeks to byte 64
-    /// of the keystream before `XOR`ing. The caller must confirm the note
+    /// of the keystream before `XOR`ing. The caller must confirm the coin
     /// against its commitment, since nothing here is authenticated.
     #[must_use]
     pub fn decrypt_lead(&self, lead: &[u8]) -> Vec<u8> {

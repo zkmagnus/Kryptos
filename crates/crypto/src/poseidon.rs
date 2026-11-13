@@ -22,8 +22,8 @@ pub const MERKLE_INPUTS: usize = 2;
 pub const IVK_INPUTS: usize = 3;
 /// Input count of the nullifier hash.
 pub const NULLIFIER_INPUTS: usize = 4;
-/// Input count of the note commitment hash.
-pub const NOTE_COMMIT_INPUTS: usize = 8;
+/// Input count of the coin commitment hash.
+pub const COIN_COMMIT_INPUTS: usize = 8;
 
 /// Poseidon over `L` base field elements.
 pub fn hash<const L: usize>(inputs: [pallas::Base; L]) -> pallas::Base {
@@ -41,7 +41,7 @@ pub fn ivk(ak_x: &pallas::Base, nk: &pallas::Base, rivk: &pallas::Base) -> palla
     hash([*ak_x, *nk, *rivk])
 }
 
-/// The nullifier of a note.
+/// The nullifier of a coin.
 pub fn nullifier(
     nk: &pallas::Base,
     rho: &pallas::Base,
@@ -51,8 +51,8 @@ pub fn nullifier(
     hash([*nk, *rho, *psi, *cm])
 }
 
-/// The commitment to a note.
-pub fn note_commitment(
+/// The commitment to a coin.
+pub fn coin_commitment(
     g_d: &pallas::Point,
     pk_d: &pallas::Point,
     value: u64,
@@ -102,7 +102,7 @@ mod tests {
             MERKLE_INPUTS,
             IVK_INPUTS,
             NULLIFIER_INPUTS,
-            NOTE_COMMIT_INPUTS,
+            COIN_COMMIT_INPUTS,
         ];
         lengths.sort_unstable();
         lengths.windows(2).for_each(|w| assert_ne!(w[0], w[1]));
@@ -135,7 +135,7 @@ mod tests {
     }
 
     #[test]
-    fn note_commitment_depends_on_every_input() {
+    fn coin_commitment_depends_on_every_input() {
         let mut rng = ChaCha20Rng::seed_from_u64(2);
         let (g, p) = (
             pallas::Point::random(&mut rng),
@@ -146,30 +146,30 @@ mod tests {
             pallas::Base::random(&mut rng),
             pallas::Base::random(&mut rng),
         );
-        let base = note_commitment(&g, &p, 7, &rho, &psi, &rcm);
-        assert_eq!(base, note_commitment(&g, &p, 7, &rho, &psi, &rcm));
+        let base = coin_commitment(&g, &p, 7, &rho, &psi, &rcm);
+        assert_eq!(base, coin_commitment(&g, &p, 7, &rho, &psi, &rcm));
         assert_ne!(
             base,
-            note_commitment(&-g, &p, 7, &rho, &psi, &rcm),
+            coin_commitment(&-g, &p, 7, &rho, &psi, &rcm),
             "g_d sign"
         );
         assert_ne!(
             base,
-            note_commitment(&g, &-p, 7, &rho, &psi, &rcm),
+            coin_commitment(&g, &-p, 7, &rho, &psi, &rcm),
             "pk_d sign"
         );
         assert_ne!(
             base,
-            note_commitment(&p, &g, 7, &rho, &psi, &rcm),
+            coin_commitment(&p, &g, 7, &rho, &psi, &rcm),
             "points swapped"
         );
-        assert_ne!(base, note_commitment(&g, &p, 8, &rho, &psi, &rcm), "value");
+        assert_ne!(base, coin_commitment(&g, &p, 8, &rho, &psi, &rcm), "value");
         assert_ne!(
             base,
-            note_commitment(&g, &p, 7, &psi, &rho, &rcm),
+            coin_commitment(&g, &p, 7, &psi, &rho, &rcm),
             "rho/psi swapped"
         );
-        assert_ne!(base, note_commitment(&g, &p, 7, &rho, &psi, &rho), "rcm");
+        assert_ne!(base, coin_commitment(&g, &p, 7, &rho, &psi, &rho), "rcm");
     }
 
     #[test]

@@ -3,10 +3,10 @@
 //!
 //! - [`amount`]: bounded monetary values and signed sums.
 //! - [`address`]: diversified payment addresses and their encodings.
-//! - [`note`]: notes, their commitments and their nullifiers.
+//! - [`coin`]: coins, their commitments and their nullifiers.
 //! - [`nullifier`]: the nullifier newtype.
 //! - [`memo`]: the fixed-size encrypted memo.
-//! - [`note_encryption`]: note plaintext layout, encryption and trial decryption.
+//! - [`encryption`]: coin plaintext layout, encryption and trial decryption.
 //! - [`bytes`]: reader and writer helpers for canonical encodings.
 //! - [`consensus`]: action classes, state accounting and size limits.
 //! - [`action`]: one spend plus one output, the unit of a transaction.
@@ -26,17 +26,17 @@
 
 pub mod action;
 pub mod address;
+pub mod amount;
 pub mod block;
 pub mod builder;
 pub mod bytes;
 pub mod coin;
 pub mod compact;
 pub mod consensus;
+pub mod encryption;
 mod error;
 pub mod fee;
 pub mod memo;
-pub mod note;
-pub mod note_encryption;
 pub mod nullifier;
 pub mod transaction;
 pub mod tree_order;

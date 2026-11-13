@@ -1,6 +1,6 @@
 [package]
 name = "wallet"
-description = "Scanning, note management and transaction building"
+description = "Scanning, coin management and transaction building"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

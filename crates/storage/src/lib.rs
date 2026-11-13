@@ -1,4 +1,4 @@
-//! Persistent chain state: the note commitment tree frontier, the
+//! Persistent chain state: the coin commitment tree frontier, the
 //! nullifier set and the block store, all in one `redb` database so a
 //! block is applied or reverted atomically.
 //!

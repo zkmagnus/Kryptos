@@ -36,8 +36,8 @@ pub const PRF_EXPAND: Domain = Domain(b"ExpandSeed______");
 /// Derivation of the outgoing viewing key from the full viewing key.
 pub const OVK: Domain = Domain(b"OvkDerive_______");
 
-/// Key derivation for note encryption from the shared secret.
-pub const NOTE_KDF: Domain = Domain(b"NoteEncKDF______");
+/// Key derivation for coin encryption from the shared secret.
+pub const COIN_KDF: Domain = Domain(b"CoinEncKDF______");
 
 /// Derivation of the outgoing cipher key from the outgoing viewing key.
 pub const OCK: Domain = Domain(b"DeriveOck_______");
@@ -131,7 +131,7 @@ mod tests {
 
     #[test]
     fn domains_are_sixteen_bytes() {
-        for domain in [PRF_EXPAND, OVK, NOTE_KDF, OCK] {
+        for domain in [PRF_EXPAND, OVK, COIN_KDF, OCK] {
             assert_eq!(domain.as_bytes().len(), PERSONALIZATION_LEN);
         }
     }

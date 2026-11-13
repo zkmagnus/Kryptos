@@ -9,12 +9,12 @@
 /// The current circuit backend, exposed behind the SystemCall interface.
 pub mod halo2 {
     pub use circuit::action::{
-        ActionCircuit, ActionWitness, NoteWitness, PublicInputs, SpendWitness, K,
+        ActionCircuit, ActionWitness, CoinWitness, PublicInputs, SpendWitness, K,
     };
     pub use circuit::{Error, Fp};
 }
 
-pub use halo2::{ActionWitness, Error, Fp, NoteWitness, PublicInputs, SpendWitness};
+pub use halo2::{ActionWitness, Error, Fp, CoinWitness, PublicInputs, SpendWitness};
 
 /// Version of the SystemCall circuit adapter API, not the consensus version.
 pub const API_VERSION: u16 = 1;

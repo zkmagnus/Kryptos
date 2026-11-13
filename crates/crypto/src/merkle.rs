@@ -1,4 +1,4 @@
-//! The note commitment tree: a depth-48 Merkle tree over Poseidon.
+//! The coin commitment tree: a depth-48 Merkle tree over Poseidon.
 //!
 //! This module holds the primitives shared by the circuit, the chain and
 //! wallets: authentication paths, root computation and empty subtree roots.

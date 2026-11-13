@@ -1,4 +1,4 @@
-//! The 64-bit range check on note values, over the 10-bit lookup table.
+//! The 64-bit range check on coin values, over the 10-bit lookup table.
 //!
 //! A value is decomposed into six 10-bit words by the running-sum gadget,
 //! leaving a remainder `z_6 = value >> 60`, which is then checked to be
@@ -12,7 +12,7 @@ use super::ecc::{Lookup, LOOKUP_BITS};
 use super::witness::Cell;
 use crate::Fp;
 
-/// Bits every note value must fit in.
+/// Bits every coin value must fit in.
 pub const VALUE_BITS: usize = 64;
 /// Full lookup words in a value.
 const FULL_WORDS: usize = VALUE_BITS / LOOKUP_BITS;

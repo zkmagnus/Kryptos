@@ -1,8 +1,8 @@
-//! Compact blocks: the minimum a light client needs to find its notes and
+//! Compact blocks: the minimum a light client needs to find its coins and
 //! maintain the commitment tree without downloading full transactions.
 //!
-//! Per action it carries the nullifier, the note commitment, the ephemeral
-//! key and the leading [`COMPACT_NOTE_LEAD`] bytes of the note ciphertext.
+//! Per action it carries the nullifier, the coin commitment, the ephemeral
+//! key and the leading [`COMPACT_COIN_LEAD`] bytes of the coin ciphertext.
 //! A light client trial-decrypts the lead against its incoming viewing key
 //! and confirms a hit against the commitment; every commitment lets it
 //! append to its witness tree, and every nullifier lets it detect spends.
@@ -12,8 +12,8 @@ use crypto::encryption::{KemCiphertext, KEM_CIPHERTEXT_LEN};
 
 use crate::block::{Block, BlockHash};
 use crate::bytes::{Encodable, Reader, Writer};
-use crate::note::ExtractedNoteCommitment;
-use crate::note_encryption::COMPACT_NOTE_LEAD;
+use crate::coin::ExtractedCoinCommitment;
+use crate::encryption::COMPACT_COIN_LEAD;
 use crate::nullifier::Nullifier;
 use crate::tree_order::tree_transactions;
 use crate::{Error, Result};
@@ -23,12 +23,12 @@ use crate::{Error, Result};
 pub struct CompactAction {
     /// The nullifier the action reveals.
     pub nullifier: Nullifier,
-    /// The new note's commitment.
-    pub cmx: ExtractedNoteCommitment,
-    /// ML-KEM ciphertext used to derive this note's encryption key.
+    /// The new coin's commitment.
+    pub cmx: ExtractedCoinCommitment,
+    /// ML-KEM ciphertext used to derive this coin's encryption key.
     pub kem_ciphertext: KemCiphertext,
-    /// The leading bytes of the note ciphertext.
-    pub enc_lead: [u8; COMPACT_NOTE_LEAD],
+    /// The leading bytes of the coin ciphertext.
+    pub enc_lead: [u8; COMPACT_COIN_LEAD],
 }
 
 impl Encodable for CompactAction {
@@ -41,7 +41,7 @@ impl Encodable for CompactAction {
 
     fn read(r: &mut Reader<'_>) -> Result<Self> {
         let nullifier = Nullifier::from_bytes(&r.take_array()?)?;
-        let cmx = ExtractedNoteCommitment::from_bytes(&r.take_array()?)?;
+        let cmx = ExtractedCoinCommitment::from_bytes(&r.take_array()?)?;
         let kem_ciphertext = KemCiphertext::from_bytes(r.take(KEM_CIPHERTEXT_LEN)?)?;
         let enc_lead = r.take_array()?;
         Ok(Self {
@@ -72,13 +72,13 @@ impl CompactBlock {
         for tx in tree {
             for action in tx.actions() {
                 let body = action.body();
-                let mut enc_lead = [0u8; COMPACT_NOTE_LEAD];
+                let mut enc_lead = [0u8; COMPACT_COIN_LEAD];
                 enc_lead
-                    .copy_from_slice(&body.encrypted_note().enc_ciphertext()[..COMPACT_NOTE_LEAD]);
+                    .copy_from_slice(&body.encrypted_coin().enc_ciphertext()[..COMPACT_COIN_LEAD]);
                 actions.push(CompactAction {
                     nullifier: *body.nullifier(),
                     cmx: *body.cmx(),
-                    kem_ciphertext: body.encrypted_note().kem_ciphertext().clone(),
+                    kem_ciphertext: body.encrypted_coin().kem_ciphertext().clone(),
                     enc_lead,
                 });
             }
@@ -134,9 +134,9 @@ mod tests {
     fn a_compact_block_round_trips_through_bytes() {
         let action = CompactAction {
             nullifier: Nullifier::from_base(&crypto::pallas::Base::from(7u64)),
-            cmx: ExtractedNoteCommitment::from_bytes(&[0; 32]).unwrap(),
+            cmx: ExtractedCoinCommitment::from_bytes(&[0; 32]).unwrap(),
             kem_ciphertext: KemCiphertext::from_bytes(&[0u8; KEM_CIPHERTEXT_LEN]).unwrap(),
-            enc_lead: [9u8; COMPACT_NOTE_LEAD],
+            enc_lead: [9u8; COMPACT_COIN_LEAD],
         };
         let block = CompactBlock {
             height: 5,

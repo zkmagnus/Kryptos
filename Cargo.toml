@@ -56,7 +56,6 @@ ml-kem = { version = "0.2.3", features = ["deterministic", "zeroize"] }
 
 # errors and utilities
 thiserror = "2"
-base64 = "0.22"
 
 # storage
 redb = "4"

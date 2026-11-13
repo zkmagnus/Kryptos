@@ -10,14 +10,14 @@ use crypto::signature::{RandomizedVerificationKey, SpendAuthSignature, SIGNATURE
 use systemcall_circuit::PublicInputs;
 
 use crate::bytes::{Encodable, Reader, Writer};
-use crate::note::ExtractedNoteCommitment;
-use crate::note_encryption::{EncryptedNote, ENCRYPTED_NOTE_LEN};
+use crate::coin::ExtractedCoinCommitment;
+use crate::encryption::{EncryptedCoin, ENCRYPTED_COIN_LEN};
 use crate::nullifier::Nullifier;
 use crate::transaction::Anchor;
 use crate::Result;
 
 /// Byte length of an encoded [`ActionBody`].
-pub const ACTION_BODY_LEN: usize = 4 * ENCODED_LEN + ENCRYPTED_NOTE_LEN;
+pub const ACTION_BODY_LEN: usize = 4 * ENCODED_LEN + ENCRYPTED_COIN_LEN;
 /// Byte length of an encoded [`Action`].
 pub const ACTION_LEN: usize = ACTION_BODY_LEN + SIGNATURE_LEN;
 
@@ -26,9 +26,9 @@ pub const ACTION_LEN: usize = ACTION_BODY_LEN + SIGNATURE_LEN;
 pub struct ActionBody {
     nullifier: Nullifier,
     rk: RandomizedVerificationKey,
-    cmx: ExtractedNoteCommitment,
+    cmx: ExtractedCoinCommitment,
     cv_net: ValueCommitment,
-    encrypted_note: EncryptedNote,
+    encrypted_coin: EncryptedCoin,
 }
 
 impl ActionBody {
@@ -36,20 +36,20 @@ impl ActionBody {
     pub fn new(
         nullifier: Nullifier,
         rk: RandomizedVerificationKey,
-        cmx: ExtractedNoteCommitment,
+        cmx: ExtractedCoinCommitment,
         cv_net: ValueCommitment,
-        encrypted_note: EncryptedNote,
+        encrypted_coin: EncryptedCoin,
     ) -> Self {
         Self {
             nullifier,
             rk,
             cmx,
             cv_net,
-            encrypted_note,
+            encrypted_coin,
         }
     }
 
-    /// Nullifier of the spent note.
+    /// Nullifier of the spent coin.
     pub fn nullifier(&self) -> &Nullifier {
         &self.nullifier
     }
@@ -59,8 +59,8 @@ impl ActionBody {
         &self.rk
     }
 
-    /// Commitment of the created note.
-    pub fn cmx(&self) -> &ExtractedNoteCommitment {
+    /// Commitment of the created coin.
+    pub fn cmx(&self) -> &ExtractedCoinCommitment {
         &self.cmx
     }
 
@@ -69,9 +69,9 @@ impl ActionBody {
         &self.cv_net
     }
 
-    /// The created note, encrypted.
-    pub fn encrypted_note(&self) -> &EncryptedNote {
-        &self.encrypted_note
+    /// The created coin, encrypted.
+    pub fn encrypted_coin(&self) -> &EncryptedCoin {
+        &self.encrypted_coin
     }
 
     /// Attaches a spend authorization signature.
@@ -110,16 +110,16 @@ impl Encodable for ActionBody {
         w.put(&self.rk.to_bytes());
         self.cmx.write(w);
         w.put(&self.cv_net.to_bytes());
-        self.encrypted_note.write(w);
+        self.encrypted_coin.write(w);
     }
 
     fn read(r: &mut Reader<'_>) -> Result<Self> {
         Ok(Self {
             nullifier: Nullifier::read(r)?,
             rk: RandomizedVerificationKey::from_bytes(&r.take_array()?)?,
-            cmx: ExtractedNoteCommitment::read(r)?,
+            cmx: ExtractedCoinCommitment::read(r)?,
             cv_net: ValueCommitment::from_bytes(&r.take_array()?)?,
-            encrypted_note: EncryptedNote::read(r)?,
+            encrypted_coin: EncryptedCoin::read(r)?,
         })
     }
 }
@@ -166,25 +166,25 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::address::RhombusAddress as Address;
-    use crate::coin::Rhombus as Amount;
+    use crate::amount::Rhombus as Amount;
+    use crate::coin::{Coin, RandomSeed, Rho};
+    use crate::encryption::encrypt_coin;
     use crate::memo::Memo;
-    use crate::note::{Note, RandomSeed, Rho};
-    use crate::note_encryption::encrypt_note;
 
     /// A syntactically valid action whose signature is over `message`.
     pub(crate) fn sample_action(rng: &mut ChaCha20Rng, message: &[u8]) -> Action {
         let sk = SpendingKey::random(rng);
         let fvk = FullViewingKey::derive(&sk).unwrap();
         let address = Address::derive(&fvk, crypto::keys::Diversifier::random(rng)).unwrap();
-        let note = Note::new(
+        let coin = Coin::new(
             address,
             Amount::from_raw(5).unwrap(),
             Rho::random(rng),
             RandomSeed::random(rng),
         );
-        let nullifier = note.nullifier(fvk.nk()).unwrap();
+        let nullifier = coin.nullifier(fvk.nk()).unwrap();
         let cv = ValueCommitment::commit(0, &ValueCommitTrapdoor::random(rng));
-        let encrypted = encrypt_note(&note, &Memo::empty(), None, &cv, rng).unwrap();
+        let encrypted = encrypt_coin(&coin, &Memo::empty(), None, &cv, rng).unwrap();
         let rsk = RandomizedSigningKey::new(
             &SpendAuthorizingKey::derive(&sk).unwrap(),
             &SpendAuthRandomizer::random(rng),
@@ -193,7 +193,7 @@ pub(crate) mod tests {
         let body = ActionBody::new(
             nullifier,
             rsk.verification_key(),
-            note.cmx().unwrap(),
+            coin.cmx().unwrap(),
             cv,
             encrypted,
         );

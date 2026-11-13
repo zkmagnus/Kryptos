@@ -4,7 +4,7 @@
 //! cheapest first: header shape, timestamps, target, proof of work,
 //! transaction root, per-transaction structure and anchors, nullifier
 //! freshness, then one batch of signatures and one batch of proofs, and
-//! finally the commitment root after appending every new note.
+//! finally the commitment root after appending every new coin.
 //!
 //! [`Validator::check_authorization`] is the stateless subset: transaction
 //! count, structure, balances, signatures and proofs. Side-chain blocks

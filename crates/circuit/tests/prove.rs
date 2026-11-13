@@ -9,7 +9,7 @@
 
 use std::time::Instant;
 
-use circuit::action::{ActionWitness, NoteWitness, PublicInputs, SpendWitness};
+use circuit::action::{ActionWitness, CoinWitness, PublicInputs, SpendWitness};
 use circuit::proof::{proof_len, Proof, ProofBatch, ProvingKey};
 use circuit::{Error, Fp};
 use crypto::keys::{Diversifier, FullViewingKey, SpendingKey};
@@ -24,7 +24,7 @@ use rand_chacha::ChaCha20Rng;
 fn action(rng: &mut ChaCha20Rng, value: u64) -> (ActionWitness, PublicInputs) {
     let fvk = FullViewingKey::derive(&SpendingKey::random(rng)).unwrap();
     let d = Diversifier::random(rng);
-    let note = NoteWitness {
+    let coin = CoinWitness {
         g_d: d.base().unwrap(),
         pk_d: *fvk
             .incoming_viewing_key()
@@ -38,16 +38,16 @@ fn action(rng: &mut ChaCha20Rng, value: u64) -> (ActionWitness, PublicInputs) {
         rcm: Fp::random(&mut *rng),
     };
     let mut tree = MerkleTree::new();
-    let position = tree.append(note.commitment()).unwrap();
+    let position = tree.append(coin.commitment()).unwrap();
     let spend = SpendWitness {
-        note,
+        coin,
         path: tree.path(position).unwrap(),
         ak: fvk.ak().to_point().unwrap(),
         nk: fvk.nk().expose(),
         rivk: fvk.rivk().expose(),
         alpha: pallas::Scalar::random(&mut *rng),
     };
-    let mut output = NoteWitness {
+    let mut output = CoinWitness {
         g_d: pallas::Point::random(&mut *rng),
         pk_d: pallas::Point::random(&mut *rng),
         value: value / 2,

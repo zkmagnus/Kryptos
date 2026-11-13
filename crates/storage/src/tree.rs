@@ -1,4 +1,4 @@
-//! The note commitment tree as a frontier: only the rightmost path is
+//! The coin commitment tree as a frontier: only the rightmost path is
 //! kept, which is all a node needs to append and compute roots. Wallets
 //! that need witnesses keep their own structure.
 
@@ -6,7 +6,7 @@ use crypto::merkle::{Node, MERKLE_DEPTH};
 use incrementalmerkletree::frontier::Frontier;
 use incrementalmerkletree::Position;
 use protocol::bytes::{Encodable, Reader, Writer};
-use protocol::note::ExtractedNoteCommitment;
+use protocol::coin::ExtractedCoinCommitment;
 use protocol::transaction::Anchor;
 
 use crate::{Error, Result};
@@ -15,7 +15,7 @@ use crate::{Error, Result};
 const DEPTH: u8 = 48;
 const _: () = assert!(DEPTH as usize == MERKLE_DEPTH);
 
-/// The frontier of the note commitment tree.
+/// The frontier of the coin commitment tree.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitmentTree {
     frontier: Frontier<Node, DEPTH>,
@@ -39,7 +39,7 @@ impl CommitmentTree {
     ///
     /// # Errors
     /// Returns [`Error::TreeFull`] once `2^MERKLE_DEPTH` leaves are stored.
-    pub fn append(&mut self, cmx: &ExtractedNoteCommitment) -> Result<u64> {
+    pub fn append(&mut self, cmx: &ExtractedCoinCommitment) -> Result<u64> {
         let position = self.size();
         if self.frontier.append(Node::new(*cmx.inner())) {
             Ok(position)
@@ -119,8 +119,8 @@ mod tests {
 
     use super::*;
 
-    fn cmx(v: u64) -> ExtractedNoteCommitment {
-        ExtractedNoteCommitment::from_bytes(&crypto::encoding::base_to_bytes(&pallas::Base::from(
+    fn cmx(v: u64) -> ExtractedCoinCommitment {
+        ExtractedCoinCommitment::from_bytes(&crypto::encoding::base_to_bytes(&pallas::Base::from(
             v,
         )))
         .unwrap()
@@ -142,7 +142,7 @@ mod tests {
         let mut naive = MerkleTree::new();
         for i in 0..9u64 {
             let leaf = pallas::Base::random(&mut rng);
-            let c = ExtractedNoteCommitment::from_bytes(&crypto::encoding::base_to_bytes(&leaf))
+            let c = ExtractedCoinCommitment::from_bytes(&crypto::encoding::base_to_bytes(&leaf))
                 .unwrap();
             assert_eq!(frontier.append(&c).unwrap(), i);
             naive.append(leaf).unwrap();

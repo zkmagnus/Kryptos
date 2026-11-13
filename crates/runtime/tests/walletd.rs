@@ -108,7 +108,7 @@ async fn the_wallet_daemon_serves_an_exchange() {
     let t = token.expose();
     let prefix = Network::Test.address_prefix();
 
-    // It syncs and sees the coinbase notes from blocks 1 to 3.
+    // It syncs and sees the coinbase coins from blocks 1 to 3.
     let three_rewards = 3u64;
     wait_for(Duration::from_secs(240), async || {
         let info = call(addr, t, "getwalletinfo", json!([])).await;
@@ -184,7 +184,7 @@ async fn the_wallet_daemon_serves_an_exchange() {
     assert!(op["confirmations"].as_u64().unwrap() >= 1);
 
     // The wallet sees the deposit to alice with her label, the change,
-    // and the spent coinbase note, all under the one txid.
+    // and the spent coinbase coin, all under the one txid.
     wait_for(Duration::from_secs(30), async || {
         call(addr, t, "listreceived", json!([1]))
             .await
@@ -208,7 +208,7 @@ async fn the_wallet_daemon_serves_an_exchange() {
     assert_eq!(
         view["received"].as_array().unwrap().len(),
         2,
-        "alice's note and the change"
+        "alice's coin and the change"
     );
     assert_eq!(view["spent"].as_array().unwrap().len(), 1);
     assert_eq!(view["net"], "-1000", "only the 1000 payment is debited");
@@ -220,7 +220,7 @@ async fn the_wallet_daemon_serves_an_exchange() {
     let listed = call(addr, t, "listoperations", json!(["confirmed"])).await;
     assert_eq!(listed.as_array().unwrap().len(), 1);
 
-    // An impossible send fails and frees its notes; a queued one can be
+    // An impossible send fails and frees its coins; a queued one can be
     // cancelled but a confirmed one cannot.
     let broke = call(
         addr,
@@ -261,26 +261,26 @@ async fn the_wallet_daemon_serves_an_exchange() {
         runtime::jsonrpc::INVALID_PARAMS
     );
 
-    // Rescan from genesis finds the same notes again.
-    let before = call(addr, t, "getwalletinfo", json!([])).await["notes"].clone();
+    // Rescan from genesis finds the same coins again.
+    let before = call(addr, t, "getwalletinfo", json!([])).await["coins"].clone();
     let received_before = call(addr, t, "listreceived", json!([])).await;
     call(addr, t, "rescan", json!([0])).await;
     wait_for(Duration::from_secs(60), async || {
         let info = call(addr, t, "getwalletinfo", json!([])).await;
         // Mining continues during the rescan, so the wallet can already
-        // contain additional coinbase notes when it catches up.
-        info["synced"] == true && info["notes"].as_u64() >= before.as_u64()
+        // contain additional coinbase coins when it catches up.
+        info["synced"] == true && info["coins"].as_u64() >= before.as_u64()
     })
     .await;
     let received_after = call(addr, t, "listreceived", json!([])).await;
-    for note in received_before.as_array().unwrap() {
+    for coin in received_before.as_array().unwrap() {
         assert!(
             received_after.as_array().unwrap().iter().any(|rescanned| {
-                rescanned["position"] == note["position"]
-                    && rescanned["txid"] == note["txid"]
-                    && rescanned["amount"] == note["amount"]
+                rescanned["position"] == coin["position"]
+                    && rescanned["txid"] == coin["txid"]
+                    && rescanned["amount"] == coin["amount"]
             }),
-            "rescan lost note {note}"
+            "rescan lost coin {coin}"
         );
     }
 

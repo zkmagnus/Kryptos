@@ -19,9 +19,9 @@ use crypto::encoding::{from_hex, to_hex};
 use p2p::message::PROTOCOL_VERSION;
 use p2p::peer::Direction;
 use protocol::address::RhombusAddress;
+use protocol::amount::RAWCOIN;
 use protocol::block::{Block, BlockHash, BlockHeader, PowSolution};
 use protocol::bytes::Encodable;
-use protocol::coin::RAWCOIN;
 use protocol::consensus::{
     next_height, proof_len, BranchId, ACTION_CLASSES, BLOCK_EMISSION_START, EMISSION_INTERVAL,
     MAX_ACTIONS, MAX_BLOCK_TRANSACTIONS, TAIL_BLOCK_EMISSION,
@@ -960,7 +960,7 @@ async fn blockchain_info(context: &Context) -> core::result::Result<Value, RpcEr
         "max_actions": MAX_ACTIONS,
         "proof_lengths": proof_lengths,
         "max_block_transactions": MAX_BLOCK_TRANSACTIONS,
-        "coin": RAWCOIN.to_string(),
+        "amount": RAWCOIN.to_string(),
         "emission": {
             "initial": BLOCK_EMISSION_START.to_string(),
             "tail": TAIL_BLOCK_EMISSION.to_string(),

@@ -1,4 +1,4 @@
-//! The fixed-size memo carried inside every note ciphertext.
+//! The fixed-size memo carried inside every coin ciphertext.
 //!
 //! Memos are always present and always the same length, so their existence
 //! and size reveal nothing. An unused memo is all zeros.

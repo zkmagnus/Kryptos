@@ -2,7 +2,7 @@
 
 pub mod ecc;
 pub mod merkle;
-pub mod note;
+pub mod coin;
 pub mod poseidon;
 pub mod range;
 pub mod witness;

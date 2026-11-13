@@ -2,17 +2,13 @@
 //!
 //! An address contains a diversifier, a diversified Pallas transmission key,
 //! and a shared ML-KEM encapsulation key. Raw encoding is `d || pk_d || ek`.
-//! Text encoding is Base58Check of
-//! the raw address and a network-bound checksum, without a textual prefix.
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
+//! Text encoding is lowercase hexadecimal of the raw address and a
+//! network-bound checksum.
 use crypto::diversifier::DiversifierIndex;
 use crypto::encoding::{Encoded, ENCODED_LEN};
 use crypto::encryption::{TransmissionKey, KEM_ENCAPSULATION_KEY_LEN};
 use crypto::hash::{blake2b_short, ADDRESS_CHECKSUM};
-use crypto::keys::{
-    DiversifiedTransmissionKey, Diversifier, FullViewingKey, DIVERSIFIER_LEN,
-};
+use crypto::keys::{DiversifiedTransmissionKey, Diversifier, FullViewingKey, DIVERSIFIER_LEN};
 use crypto::pallas;
 
 use crate::bytes::{Encodable, Reader, Writer};
@@ -92,7 +88,11 @@ impl RhombusAddress {
         pk_d: DiversifiedTransmissionKey,
         ek: TransmissionKey,
     ) -> Self {
-        Self { diversifier, pk_d, ek }
+        Self {
+            diversifier,
+            pk_d,
+            ek,
+        }
     }
 
     /// The diversifier.
@@ -146,64 +146,34 @@ impl RhombusAddress {
         Ok(Self::from_parts(diversifier, pk_d, ek))
     }
 
-    /// Base58Check of the raw address and network-bound checksum, without HRP.
+    /// Lowercase hexadecimal encoding of the raw address and network-bound checksum.
     pub fn encode(&self, prefix: AddressPrefix) -> String {
         const CHECKSUM_LEN: usize = 4;
         let raw = self.to_bytes();
-        let checksum = blake2b_short(ADDRESS_CHECKSUM, &[&[prefix.tag() as u8], &raw]);
+        let checksum = blake2b_short(ADDRESS_CHECKSUM, &[&[prefix.tag()], &raw]);
         let mut payload = Vec::with_capacity(ADDRESS_LEN + CHECKSUM_LEN);
         payload.extend_from_slice(&raw);
         payload.extend_from_slice(&checksum[..CHECKSUM_LEN]);
-        base58_encode(&payload)
+        hex_encode(&payload)
     }
 
-    /// Parses the unprefixed, network-bound Base58Check form. The previous
-    /// network-bound tagged Base64URL form remains accepted for migration.
+    /// Parses the lowercase, network-bound hexadecimal address form.
     ///
     /// # Errors
-    /// Fails on a wrong network, checksum, encoding, invalid diversifier, or key.
+    /// Fails on wrong length, invalid hex, wrong network, checksum, diversifier, or key.
     pub fn decode(text: &str, prefix: AddressPrefix) -> Result<Self> {
         const CHECKSUM_LEN: usize = 4;
         const PAYLOAD_LEN: usize = ADDRESS_LEN + CHECKSUM_LEN;
-        // A 47-byte payload needs at most 65 Base58 characters. Check
-        // before allocating a decode buffer proportional to user input.
-        if text.len() > ADDRESS_LEN.saturating_mul(2) {
+
+        if text.len() != PAYLOAD_LEN * 2 {
             return Err(Error::InvalidAddress("wrong length".into()));
         }
 
-        // Prefer a valid Base58Check interpretation. Some canonical
-        // Base58 strings are 64 characters and also look like the old
-        // `d`/`t` + Base64URL format, so legacy detection must not take
-        // precedence over a valid current address.
-        if let Ok(payload) = base58_decode(text) {
-            if base58_encode(&payload) == text && payload.len() == PAYLOAD_LEN {
-                if let Ok(address) = Self::decode_check_payload(&payload, prefix) {
-                    return Ok(address);
-                }
-            }
-        }
-
-        // Previous releases emitted a leading `d`/`t` and then 63
-        // Base64URL characters. Keep accepting them if they were not a
-        // valid Base58Check address; encoding emits only Base58Check.
-        let legacy_encoded = text
-            .strip_prefix(prefix.tag() as char)
-            .filter(|s| s.len() == 63);
-        if let Some(encoded) = legacy_encoded {
-            let payload = URL_SAFE_NO_PAD
-                .decode(encoded)
-                .map_err(|_| Error::InvalidAddress("invalid legacy address encoding".into()))?;
-            if URL_SAFE_NO_PAD.encode(&payload) != encoded {
-                return Err(Error::InvalidAddress(
-                    "non-canonical address encoding".into(),
-                ));
-            }
-            return Self::decode_check_payload(&payload, prefix);
-        }
-
-        let payload = base58_decode(text)?;
-        if base58_encode(&payload) != text {
-            return Err(Error::InvalidAddress("non-canonical Base58".into()));
+        let payload = hex_decode(text)?;
+        if hex_encode(&payload) != text {
+            return Err(Error::InvalidAddress(
+                "non-canonical hexadecimal encoding".into(),
+            ));
         }
         Self::decode_check_payload(&payload, prefix)
     }
@@ -222,64 +192,39 @@ impl RhombusAddress {
     }
 }
 
-const BASE58: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-
-fn base58_encode(bytes: &[u8]) -> String {
-    let zeros = bytes.iter().take_while(|byte| **byte == 0).count();
-    let mut input = bytes.to_vec();
-    let mut start = zeros;
-    let mut encoded = Vec::with_capacity(bytes.len().saturating_mul(138) / 100 + 1);
-    while start < input.len() {
-        let mut remainder = 0u32;
-        for byte in &mut input[start..] {
-            let value = (remainder << 8) | u32::from(*byte);
-            *byte = u8::try_from(value / 58).unwrap_or(0);
-            remainder = value % 58;
-        }
-        encoded.push(BASE58[usize::try_from(remainder).unwrap_or(0)]);
-        while start < input.len() && input[start] == 0 {
-            start += 1;
-        }
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
-    encoded.extend(core::iter::repeat_n(b'1', zeros));
-    encoded.reverse();
-    String::from_utf8(encoded).unwrap_or_default()
+    out
 }
 
-fn base58_decode(text: &str) -> Result<Vec<u8>> {
-    let input = text.as_bytes();
-    let zeros = input.iter().take_while(|byte| **byte == b'1').count();
-    let mut decoded = vec![0u8; input.len().saturating_mul(733) / 1000 + 1];
-    let mut length = 0usize;
-    for &character in &input[zeros..] {
-        let value = BASE58
-            .iter()
-            .position(|candidate| *candidate == character)
-            .ok_or_else(|| Error::InvalidAddress("invalid Base58 character".into()))?;
-        let mut carry = u32::try_from(value).unwrap_or(0);
-        let mut used = 0usize;
-        for byte in decoded.iter_mut().rev() {
-            if carry == 0 && used >= length {
-                break;
-            }
-            carry += 58 * u32::from(*byte);
-            *byte = u8::try_from(carry & 0xff).unwrap_or(0);
-            carry >>= 8;
-            used += 1;
-        }
-        if carry != 0 {
-            return Err(Error::InvalidAddress("Base58 value out of range".into()));
-        }
-        length = used;
+fn hex_decode(text: &str) -> Result<Vec<u8>> {
+    if text.len() % 2 != 0 {
+        return Err(Error::InvalidAddress("invalid hexadecimal length".into()));
     }
-    let first = decoded.len().saturating_sub(length);
-    let significant = decoded[first..]
-        .iter()
-        .position(|byte| *byte != 0)
-        .map_or(decoded.len(), |offset| first + offset);
-    let mut bytes = vec![0; zeros];
-    bytes.extend_from_slice(&decoded[significant..]);
-    Ok(bytes)
+
+    let mut out = Vec::with_capacity(text.len() / 2);
+    for pair in text.as_bytes().chunks_exact(2) {
+        let high = hex_value(pair[0])
+            .ok_or_else(|| Error::InvalidAddress("invalid hexadecimal character".into()))?;
+        let low = hex_value(pair[1])
+            .ok_or_else(|| Error::InvalidAddress("invalid hexadecimal character".into()))?;
+        out.push((high << 4) | low);
+    }
+    Ok(out)
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 impl Encodable for RhombusAddress {
@@ -335,26 +280,28 @@ mod tests {
     }
 
     #[test]
-    fn text_encoding_roundtrips_as_unprefixed_network_bound_base58() {
+    fn text_encoding_roundtrips_as_network_bound_hex() {
         let addr = address(2);
         let main = addr.encode(AddressPrefix::Main);
         let test = addr.encode(AddressPrefix::Test);
-        assert!(!main.contains('-') && !main.contains('_'));
-        assert!(main.len() < ADDRESS_LEN * 2 + 1);
+        assert_eq!(main.len(), (ADDRESS_LEN + 4) * 2);
+        assert!(main
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         assert_ne!(main, test);
         assert_eq!(RhombusAddress::decode(&main, AddressPrefix::Main), Ok(addr));
         assert_eq!(RhombusAddress::decode(&test, AddressPrefix::Test), Ok(addr));
     }
 
     #[test]
-    fn base58_addresses_reject_the_other_network() {
+    fn hex_addresses_reject_the_other_network() {
         let addr = address(2);
         let main = addr.encode(AddressPrefix::Main);
         assert!(RhombusAddress::decode(&main, AddressPrefix::Test).is_err());
     }
 
     #[test]
-    fn text_encoding_rejects_invalid_base58() {
+    fn text_encoding_rejects_invalid_hex() {
         let mut text = address(3).encode(AddressPrefix::Main);
         let last = text.len().saturating_sub(1);
         text.replace_range(last.., "!");
@@ -362,33 +309,10 @@ mod tests {
     }
 
     #[test]
-    fn a_base58_address_that_looks_like_legacy_base64_stays_base58() {
-        let mut rng = ChaCha20Rng::seed_from_u64(31);
-        let fvk = FullViewingKey::derive(&SpendingKey::random(&mut rng)).unwrap();
-        for index in 0..10_000 {
-            let address = RhombusAddress::from_index(&fvk, DiversifierIndex::from(index)).unwrap();
-            let text = address.encode(AddressPrefix::Main);
-            // A 64-character Base58 string beginning with `d` enters the old
-            // heuristic. The final character also makes the 63-character
-            // suffix a canonical unpadded Base64URL candidate.
-            if text.len() == 64
-                && text.starts_with('d')
-                && "AQgw".contains(text.chars().last().unwrap())
-            {
-                assert_eq!(
-                    RhombusAddress::decode(&text, AddressPrefix::Main),
-                    Ok(address)
-                );
-                return;
-            }
-        }
-        panic!("did not find a deterministic Base58/legacy-shaped address");
-    }
-
-    #[test]
-    fn address_decoder_rejects_oversized_text_before_base58_decode() {
-        let text = "1".repeat(66);
-        assert!(RhombusAddress::decode(&text, AddressPrefix::Main).is_err());
+    fn decoder_rejects_uppercase_noncanonical_hex_addresses() {
+        let address = address(32);
+        let uppercase = address.encode(AddressPrefix::Main).to_uppercase();
+        assert!(RhombusAddress::decode(&uppercase, AddressPrefix::Main).is_err());
     }
 
     #[test]
@@ -409,33 +333,10 @@ mod tests {
     }
 
     #[test]
-    fn decoder_keeps_accepting_network_bound_legacy_base64_addresses() {
-        for seed in 0..100 {
-            let address = address(seed);
-            let raw = address.to_bytes();
-            let checksum = blake2b_short(ADDRESS_CHECKSUM, &[b"d", &raw]);
-            let mut payload = raw.to_vec();
-            payload.extend_from_slice(&checksum[..4]);
-            let encoded = URL_SAFE_NO_PAD.encode(payload);
-            // Force Base58 parsing to reject this spelling so the test
-            // exercises the retained migration path.
-            if encoded.contains('-') || encoded.contains('_') {
-                let legacy = format!("d{encoded}");
-                assert_eq!(
-                    RhombusAddress::decode(&legacy, AddressPrefix::Main),
-                    Ok(address)
-                );
-                return;
-            }
-        }
-        panic!("did not find a legacy Base64URL address with non-Base58 characters");
-    }
-
-    #[test]
-    fn base58_roundtrips_leading_zero_bytes() {
+    fn hex_roundtrips_leading_zero_bytes() {
         for bytes in [&[][..], &[0][..], &[0, 0, 1][..], &[0, 0, 0, 255][..]] {
-            let encoded = base58_encode(bytes);
-            assert_eq!(base58_decode(&encoded).unwrap(), bytes);
+            let encoded = hex_encode(bytes);
+            assert_eq!(hex_decode(&encoded).unwrap(), bytes);
         }
     }
 

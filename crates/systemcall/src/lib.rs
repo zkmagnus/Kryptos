@@ -6,8 +6,8 @@
 //! rules.
 
 use crypto::signature::BatchVerifier;
+use protocol::coin::ExtractedCoinCommitment;
 use protocol::consensus::BranchId;
-use protocol::note::ExtractedNoteCommitment;
 use protocol::nullifier::Nullifier;
 use protocol::transaction::Transaction;
 use protocol::{Error, Result};
@@ -27,9 +27,9 @@ pub struct SystemCall<'a> {
 pub struct TransferEffects {
     /// Nullifiers in action order, to be checked for freshness by the kernel.
     pub nullifiers: Vec<Nullifier>,
-    /// Note commitments in action order, to be appended only after the full
+    /// Coin commitments in action order, to be appended only after the full
     /// transaction or block has passed validation.
-    pub commitments: Vec<ExtractedNoteCommitment>,
+    pub commitments: Vec<ExtractedCoinCommitment>,
 }
 
 impl<'a> SystemCall<'a> {
@@ -152,7 +152,7 @@ mod tests {
     use protocol::coin::Rhombus;
     use protocol::consensus::BranchId;
     use protocol::memo::Memo;
-    use protocol::note::{Note, RandomSeed, Rho};
+    use protocol::coin::{Coin, RandomSeed, Rho};
     use protocol::transaction::{Anchor, Transaction};
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
@@ -165,16 +165,16 @@ mod tests {
         let sk = SpendingKey::random(&mut rng);
         let fvk = FullViewingKey::derive(&sk).unwrap();
         let address = RhombusAddress::derive(&fvk, Diversifier::random(&mut rng)).unwrap();
-        let note = Note::new(
+        let coin = Coin::new(
             address,
             Rhombus::from_raw(100_000).unwrap(),
             Rho::random(&mut rng),
             RandomSeed::random(&mut rng),
         );
         let mut tree = MerkleTree::new();
-        let position = tree.append(*note.cmx().unwrap().inner()).unwrap();
+        let position = tree.append(*coin.cmx().unwrap().inner()).unwrap();
         let anchor = Anchor::from_base(tree.root());
-        let spend = SpendInfo::new(sk, note, tree.path(position).unwrap());
+        let spend = SpendInfo::new(sk, coin, tree.path(position).unwrap());
         let output = Rhombus::from_raw(100_000).unwrap();
         let mut builder = Builder::new(anchor);
         builder

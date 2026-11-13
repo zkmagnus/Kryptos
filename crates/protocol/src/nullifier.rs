@@ -1,7 +1,7 @@
 //! The nullifier newtype.
 //!
-//! A nullifier is revealed when a note is spent. It is unlinkable to the
-//! note commitment without the nullifier key, and the chain rejects any
+//! A nullifier is revealed when a coin is spent. It is unlinkable to the
+//! coin commitment without the nullifier key, and the chain rejects any
 //! nullifier that has already appeared.
 
 use crypto::encoding::{base_from_bytes, base_to_bytes, Encoded};
@@ -10,7 +10,7 @@ use crypto::pallas;
 use crate::bytes::{Encodable, Reader, Writer};
 use crate::Result;
 
-/// A spent-note marker.
+/// A spent-coin marker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Nullifier(Encoded);
 

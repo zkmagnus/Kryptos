@@ -1,23 +1,23 @@
-//! Trial decryption of one block into owned notes.
+//! Trial decryption of one block into owned coins.
 
+use protocol::amount::Amount;
 use protocol::block::Block;
 use protocol::bytes::{Encodable, Reader, Writer};
-use protocol::coin::Rhombus;
+use protocol::coin::{Coin, RandomSeed, Rho};
 use protocol::compact::CompactBlock;
+use protocol::encryption::{decrypt_coin_with_ivk, detect_coin_with_ivk};
 use protocol::memo::Memo;
-use protocol::note::{Note, RandomSeed, Rho};
-use protocol::note_encryption::{decrypt_note_with_ivk, detect_note_with_ivk};
 use protocol::nullifier::Nullifier;
 use protocol::transaction::{Transaction, TxId};
 
 use crate::keys::WalletKeys;
 use crate::Result;
 
-/// A note the wallet owns.
+/// A coin the wallet owns.
 #[derive(Clone, Debug)]
-pub struct OwnedNote {
-    /// The note.
-    pub note: Note,
+pub struct OwnedCoin {
+    /// The coin.
+    pub coin: Coin,
     /// Its memo.
     pub memo: Memo,
     /// Its position in the commitment tree.
@@ -34,9 +34,9 @@ pub struct OwnedNote {
     pub spent_by: Option<TxId>,
 }
 
-impl Encodable for OwnedNote {
+impl Encodable for OwnedCoin {
     fn write(&self, w: &mut Writer) {
-        self.note.write(w);
+        self.coin.write(w);
         self.memo.write(w);
         w.put_u64_le(self.position);
         self.nullifier.write(w);
@@ -54,7 +54,7 @@ impl Encodable for OwnedNote {
     }
 
     fn read(r: &mut Reader<'_>) -> protocol::Result<Self> {
-        let note = Note::read(r)?;
+        let coin = Coin::read(r)?;
         let memo = Memo::read(r)?;
         let position = r.take_u64_le()?;
         let nullifier = Nullifier::read(r)?;
@@ -67,7 +67,7 @@ impl Encodable for OwnedNote {
         let txid = read_txid(r)?;
         let spent_by = read_txid(r)?;
         Ok(Self {
-            note,
+            coin,
             memo,
             position,
             nullifier,
@@ -104,33 +104,35 @@ fn read_txid(r: &mut Reader<'_>) -> protocol::Result<Option<TxId>> {
 pub struct BlockScan {
     /// Every commitment in the block, in transaction order.
     pub leaves: Vec<crypto::pallas::Base>,
-    /// Notes the wallet owns, with positions relative to `first_position`.
-    pub found: Vec<OwnedNote>,
+    /// Coins the wallet owns, with positions relative to `first_position`.
+    pub found: Vec<OwnedCoin>,
     /// Every nullifier the block spent, with the spending transaction
     /// when the scan knew it.
     pub spent: Vec<(Nullifier, Option<TxId>)>,
 }
 
 /// The work a successful decryption does after the cipher check, so it
-/// can be repeated on a stand-in note when the check fails.
+/// can be repeated on a stand-in coin when the check fails.
 ///
-/// Trial decryption stops at the authentication tag for a note that is
+/// Trial decryption stops at the authentication tag for a coin that is
 /// not ours; for ours it goes on to derive the transmission key, the
 /// diversified base, the ephemeral key, the commitment and the
-/// nullifier. Doing the same on a stand-in note for every other action
+/// nullifier. Doing the same on a stand-in coin for every other action
 /// makes the cost per action the same either way, so timing does not
 /// tell which actions were ours. It equalizes work, not branches: a
-/// found note still costs a vector push.
+/// found coin still costs a vector push.
 struct StandIn {
-    note: Note,
+    coin: Coin,
 }
 
 impl StandIn {
     fn new(keys: &WalletKeys) -> Result<Self> {
+        let address = keys.default_address()?;
         Ok(Self {
-            note: Note::new(
-                keys.default_address()?,
-                Rhombus::ZERO,
+            coin: Coin::new(
+                *address.diversifier(),
+                *address.pk_d(),
+                Amount::ZERO,
                 Rho::from_nullifier(&Nullifier::from_bytes(&[0; 32])?)?,
                 RandomSeed::from_bytes([0; 32]),
             ),
@@ -139,20 +141,20 @@ impl StandIn {
 
     /// Performs the success path's work and discards it.
     fn work(&self, keys: &WalletKeys) -> Result<()> {
-        let diversifier = self.note.recipient().diversifier();
+        let diversifier = self.coin.diversifier();
         let _pk_d = keys.incoming_viewing_key().transmission_key(diversifier)?;
         let g_d = diversifier.base()?;
-        let _epk = self.note.esk().public_key(&g_d);
-        let _cmx = self.note.cmx()?;
-        let _nf = self.note.nullifier(keys.nullifier_key())?;
+        let _epk = self.coin.esk().public_key(&g_d);
+        let _cmx = self.coin.cmx()?;
+        let _nf = self.coin.nullifier(keys.nullifier_key())?;
         Ok(())
     }
 
     /// The compact detection success path's work, for a non-match.
     fn detect(&self, keys: &WalletKeys) -> Result<()> {
-        let diversifier = self.note.recipient().diversifier();
+        let diversifier = self.coin.diversifier();
         let _pk_d = keys.incoming_viewing_key().transmission_key(diversifier)?;
-        let _cmx = self.note.cmx()?;
+        let _cmx = self.coin.cmx()?;
         Ok(())
     }
 }
@@ -165,7 +167,7 @@ impl StandIn {
 /// `StandIn` helper.
 ///
 /// # Errors
-/// Fails if a decrypted note cannot derive its nullifier.
+/// Fails if a decrypted coin cannot derive its nullifier.
 pub fn scan_block(
     keys: &WalletKeys,
     block: &Block,
@@ -190,24 +192,23 @@ pub fn scan_block(
                 first_position.saturating_add(u64::try_from(scan.leaves.len()).unwrap_or(u64::MAX));
             scan.leaves.push(*body.cmx().inner());
             let rho = Rho::from_nullifier(body.nullifier())?;
-            let decrypted = decrypt_note_with_ivk(
+            let decrypted = decrypt_coin_with_ivk(
                 keys.incoming_viewing_key(),
                 keys.receiver_key(),
-                keys.transmission_key(),
-                body.encrypted_note(),
+                body.encrypted_coin(),
                 rho,
                 body.cmx(),
             );
-            let Ok((note, memo)) = decrypted else {
+            let Ok((coin, memo)) = decrypted else {
                 stand_in.work(keys)?;
                 continue;
             };
-            let nullifier = note.nullifier(keys.nullifier_key())?;
-            if note.value().raw() == 0 {
+            let nullifier = coin.nullifier(keys.nullifier_key())?;
+            if coin.value().raw() == 0 {
                 continue;
             }
-            scan.found.push(OwnedNote {
-                note,
+            scan.found.push(OwnedCoin {
+                coin,
                 memo,
                 position,
                 nullifier,
@@ -221,14 +222,14 @@ pub fn scan_block(
     Ok(scan)
 }
 
-/// Detects owned notes in one compact block. Produces the same leaves as
-/// [`scan_block`] and the same owned notes, except that their memos are
+/// Detects owned coins in one compact block. Produces the same leaves as
+/// [`scan_block`] and the same owned coins, except that their memos are
 /// empty, since a compact block omits them. Its spent nullifiers are those
 /// of its block-order actions. It includes the coinbase, which differs only
-/// in dummy spends that never match a wallet note.
+/// in dummy spends that never match a wallet coin.
 ///
 /// # Errors
-/// Fails if a detected note cannot derive its nullifier.
+/// Fails if a detected coin cannot derive its nullifier.
 pub fn scan_compact_block(
     keys: &WalletKeys,
     block: &CompactBlock,
@@ -242,25 +243,24 @@ pub fn scan_compact_block(
         scan.leaves.push(*action.cmx.inner());
         scan.spent.push((action.nullifier, None));
         let rho = Rho::from_nullifier(&action.nullifier)?;
-        let detected = detect_note_with_ivk(
+        let detected = detect_coin_with_ivk(
             keys.incoming_viewing_key(),
             keys.receiver_key(),
-            keys.transmission_key(),
             &action.kem_ciphertext,
             &action.enc_lead,
             rho,
             &action.cmx,
         );
-        let Ok(note) = detected else {
+        let Ok(coin) = detected else {
             stand_in.detect(keys)?;
             continue;
         };
-        let nullifier = note.nullifier(keys.nullifier_key())?;
-        if note.value().raw() == 0 {
+        let nullifier = coin.nullifier(keys.nullifier_key())?;
+        if coin.value().raw() == 0 {
             continue;
         }
-        scan.found.push(OwnedNote {
-            note,
+        scan.found.push(OwnedCoin {
+            coin,
             memo: Memo::empty(),
             position,
             nullifier,
@@ -288,6 +288,6 @@ mod tests {
                 .unwrap();
         let stand_in = StandIn::new(&keys).unwrap();
         stand_in.work(&keys).unwrap();
-        assert_eq!(stand_in.note.value().raw(), 0);
+        assert_eq!(stand_in.coin.value().raw(), 0);
     }
 }

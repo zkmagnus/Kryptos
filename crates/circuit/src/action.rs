@@ -7,7 +7,7 @@
 use crypto::commitment::{ValueCommitTrapdoor, ValueCommitment};
 use crypto::curve::Generator;
 use crypto::merkle::{MerklePath, MERKLE_DEPTH};
-use crypto::poseidon::{affine_coords, note_commitment};
+use crypto::poseidon::{affine_coords, coin_commitment};
 use group::Group;
 use halo2_proofs::circuit::{Layouter, SimpleFloorPlanner, Value};
 use halo2_proofs::plonk::{Advice, Circuit, Column, ConstraintSystem, Error, Fixed, Instance};
@@ -17,8 +17,8 @@ use crate::gadgets::ecc::{
     any_coords, coords, EccGadgetConfig, FullBase, ECC_ADVICES, ECC_LAGRANGE,
 };
 use crate::gadgets::merkle::{position_bits, MerkleConfig};
-use crate::gadgets::note::{
-    net_witness, CommittedNote, NoteGadgetConfig, NoteValues, NOTE_ADVICES,
+use crate::gadgets::coin::{
+    net_witness, CommittedCoin, CoinGadgetConfig, CoinValues, COIN_ADVICES,
 };
 use crate::gadgets::poseidon::{self, WIDTH};
 use crate::gadgets::range::check_value;
@@ -35,7 +35,7 @@ pub mod rows {
     pub const RK_X: usize = 2;
     /// `rk.y`.
     pub const RK_Y: usize = 3;
-    /// The new note commitment.
+    /// The new coin commitment.
     pub const CMX: usize = 4;
     /// `cv_net.x`.
     pub const CV_X: usize = 5;
@@ -54,9 +54,9 @@ pub mod rows {
 /// `log2` of the number of rows the circuit needs.
 pub const K: u32 = 12;
 
-/// The plaintext of a note as the circuit sees it.
+/// The plaintext of a coin as the circuit sees it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct NoteWitness {
+pub struct CoinWitness {
     /// Diversified base of the recipient.
     pub g_d: pallas::Point,
     /// Transmission key of the recipient.
@@ -71,28 +71,28 @@ pub struct NoteWitness {
     pub rcm: Fp,
 }
 
-impl NoteWitness {
+impl CoinWitness {
     /// The commitment, computed outside the circuit.
     pub fn commitment(&self) -> Fp {
-        note_commitment(
+        coin_commitment(
             &self.g_d, &self.pk_d, self.value, &self.rho, &self.psi, &self.rcm,
         )
     }
 
-    fn values(note: &Value<Self>) -> NoteValues {
-        NoteValues {
-            value: note.map(|n| n.value),
-            psi: note.map(|n| n.psi),
-            rcm: note.map(|n| n.rcm),
+    fn values(coin: &Value<Self>) -> CoinValues {
+        CoinValues {
+            value: coin.map(|n| n.value),
+            psi: coin.map(|n| n.psi),
+            rcm: coin.map(|n| n.rcm),
         }
     }
 }
 
-/// Everything the prover knows about the spent note and its owner.
+/// Everything the prover knows about the spent coin and its owner.
 #[derive(Clone, Debug)]
 pub struct SpendWitness {
-    /// The spent note.
-    pub note: NoteWitness,
+    /// The spent coin.
+    pub coin: CoinWitness,
     /// Its path to the anchor. Ignored by the circuit when the value is 0.
     pub path: MerklePath,
     /// The spend validating key `ak`.
@@ -110,9 +110,9 @@ impl SpendWitness {
     pub fn nullifier(&self) -> Fp {
         crypto::poseidon::nullifier(
             &self.nk,
-            &self.note.rho,
-            &self.note.psi,
-            &self.note.commitment(),
+            &self.coin.rho,
+            &self.coin.psi,
+            &self.coin.commitment(),
         )
     }
 
@@ -128,8 +128,8 @@ impl SpendWitness {
 pub struct ActionWitness {
     /// The spend side.
     pub spend: SpendWitness,
-    /// The created note.
-    pub output: NoteWitness,
+    /// The created coin.
+    pub output: CoinWitness,
     /// The value commitment trapdoor.
     pub rcv: pallas::Scalar,
     /// Absolute net value of the whole transaction, shared by each action
@@ -148,7 +148,7 @@ impl ActionWitness {
     /// Returns an error if the net value does not fit `i64`, which cannot
     /// happen for values below the supply cap.
     pub fn cv_net(&self) -> Result<pallas::Point, crypto::Error> {
-        let net = i128::from(self.spend.note.value)
+        let net = i128::from(self.spend.coin.value)
             .checked_sub(i128::from(self.output.value))
             .and_then(|net| i64::try_from(net).ok())
             .ok_or(crypto::Error::Internal("net value overflow"))?;
@@ -180,11 +180,11 @@ impl ActionWitness {
 pub struct PublicInputs {
     /// The tree root.
     pub anchor: Fp,
-    /// The nullifier of the spent note.
+    /// The nullifier of the spent coin.
     pub nf_old: Fp,
     /// The randomized verification key.
     pub rk: pallas::Point,
-    /// The commitment of the created note.
+    /// The commitment of the created coin.
     pub cmx_new: Fp,
     /// The net value commitment.
     pub cv_net: pallas::Point,
@@ -239,7 +239,7 @@ impl PublicInputs {
 #[derive(Clone, Debug)]
 pub struct ActionConfig {
     instance: Column<Instance>,
-    note: NoteGadgetConfig,
+    coin: CoinGadgetConfig,
     merkle: MerkleConfig,
     ecc: EccGadgetConfig,
 }
@@ -262,11 +262,11 @@ impl ActionCircuit {
         self.witness.as_ref().map(|w| w.spend.clone())
     }
 
-    fn old_note(&self) -> Value<NoteWitness> {
-        self.witness.as_ref().map(|w| w.spend.note)
+    fn old_coin(&self) -> Value<CoinWitness> {
+        self.witness.as_ref().map(|w| w.spend.coin)
     }
 
-    fn new_note(&self) -> Value<NoteWitness> {
+    fn new_coin(&self) -> Value<CoinWitness> {
         self.witness.as_ref().map(|w| w.output)
     }
 }
@@ -292,9 +292,9 @@ impl Circuit<Fp> for ActionCircuit {
         }
         let poseidon = poseidon::configure(meta, state, partial_sbox, rc_a, rc_b);
 
-        let note_advices: [Column<Advice>; NOTE_ADVICES] =
+        let coin_advices: [Column<Advice>; COIN_ADVICES] =
             core::array::from_fn(|_| meta.advice_column());
-        let note = NoteGadgetConfig::configure(meta, note_advices, poseidon.clone());
+        let coin = CoinGadgetConfig::configure(meta, coin_advices, poseidon.clone());
 
         let swap_advices: [Column<Advice>; 5] = core::array::from_fn(|_| meta.advice_column());
         let merkle = MerkleConfig::configure(meta, poseidon.clone(), swap_advices);
@@ -306,7 +306,7 @@ impl Circuit<Fp> for ActionCircuit {
 
         ActionConfig {
             instance,
-            note,
+            coin,
             merkle,
             ecc,
         }
@@ -318,38 +318,38 @@ impl Circuit<Fp> for ActionCircuit {
         mut layouter: impl Layouter<Fp>,
     ) -> Result<(), Error> {
         config.ecc.load_table(&mut layouter)?;
-        let old_note = self.spend_side(&config, &mut layouter)?;
-        let new_note = self.output_side(&config, &mut layouter, old_note.nf_old.clone())?;
+        let old_coin = self.spend_side(&config, &mut layouter)?;
+        let new_coin = self.output_side(&config, &mut layouter, old_coin.nf_old.clone())?;
         // 8. both values are 64-bit
         check_value(
             config.ecc.lookup(),
             layouter.namespace(|| "v_old range"),
-            &old_note.note.value,
+            &old_coin.coin.value,
         )?;
         check_value(
             config.ecc.lookup(),
             layouter.namespace(|| "v_new range"),
-            &new_note.value,
+            &new_coin.value,
         )?;
-        self.value_commitment(&config, &mut layouter, &old_note.note, &new_note)
+        self.value_commitment(&config, &mut layouter, &old_coin.coin, &new_coin)
     }
 }
 
 /// Cells produced by the spend side that later steps need.
 struct SpendCells {
-    note: CommittedNote,
+    coin: CommittedCoin,
     nf_old: Cell,
 }
 
 impl ActionCircuit {
-    /// Constraints 1 to 5 and the non-identity checks of the old note.
+    /// Constraints 1 to 5 and the non-identity checks of the old coin.
     fn spend_side(
         &self,
         config: &ActionConfig,
         layouter: &mut impl Layouter<Fp>,
     ) -> Result<SpendCells, Error> {
         let spend = self.spend();
-        let old = self.old_note();
+        let old = self.old_coin();
 
         let g_d_old = config
             .ecc
@@ -361,22 +361,22 @@ impl ActionCircuit {
             .ecc
             .witness_non_identity(layouter.namespace(|| "ak"), spend.as_ref().map(|s| s.ak))?;
 
-        // 1. old note commitment
-        let rho_old = config.note.load(
+        // 1. old coin commitment
+        let rho_old = config.coin.load(
             layouter.namespace(|| "rho_old"),
             "rho_old",
             old.map(|n| n.rho),
         )?;
-        let note = config.note.commit(
-            layouter.namespace(|| "old note"),
+        let coin = config.coin.commit(
+            layouter.namespace(|| "old coin"),
             &coords(&g_d_old).into(),
             &coords(&pk_d_old).into(),
             rho_old,
-            NoteWitness::values(&old),
+            CoinWitness::values(&old),
         )?;
 
         // 2. membership or dummy
-        let anchor = config.note.load_instance(
+        let anchor = config.coin.load_instance(
             layouter.namespace(|| "anchor"),
             config.instance,
             rows::ANCHOR,
@@ -396,38 +396,38 @@ impl ActionCircuit {
         });
         let root = config.merkle.root(
             layouter.namespace(|| "merkle root"),
-            note.cm.clone(),
+            coin.cm.clone(),
             &bits,
             &siblings,
         )?;
-        config.note.enforce_membership_or_dummy(
+        config.coin.enforce_membership_or_dummy(
             layouter.namespace(|| "membership"),
             &root,
             &anchor,
-            &note.value,
+            &coin.value,
         )?;
 
         // 3. nullifier
-        let nk = config.note.load(
+        let nk = config.coin.load(
             layouter.namespace(|| "nk"),
             "nk",
             spend.as_ref().map(|s| s.nk),
         )?;
         let nf_old =
             config
-                .note
-                .nullifier(layouter.namespace(|| "nullifier"), nk.clone(), &note)?;
+                .coin
+                .nullifier(layouter.namespace(|| "nullifier"), nk.clone(), &coin)?;
         layouter.constrain_instance(nf_old.cell(), config.instance, rows::NULLIFIER)?;
 
         // 4. spend authority: pk_d_old = [ivk] g_d_old
-        let rivk = config.note.load(
+        let rivk = config.coin.load(
             layouter.namespace(|| "rivk"),
             "rivk",
             spend.as_ref().map(|s| s.rivk),
         )?;
         let (ak_x, _) = coords(&ak);
         let ivk = config
-            .note
+            .coin
             .ivk(layouter.namespace(|| "ivk"), ak_x, nk, rivk)?;
         let pk_d_derived =
             config
@@ -444,32 +444,32 @@ impl ActionCircuit {
         let rk = alpha_g.add(layouter.namespace(|| "rk"), &ak)?;
         constrain_point(config, layouter, &rk, rows::RK_X, rows::RK_Y)?;
 
-        Ok(SpendCells { note, nf_old })
+        Ok(SpendCells { coin, nf_old })
     }
 
-    /// Constraints 6, 7 and the non-identity checks of the new note.
+    /// Constraints 6, 7 and the non-identity checks of the new coin.
     fn output_side(
         &self,
         config: &ActionConfig,
         layouter: &mut impl Layouter<Fp>,
         nf_old: Cell,
-    ) -> Result<CommittedNote, Error> {
-        let new = self.new_note();
+    ) -> Result<CommittedCoin, Error> {
+        let new = self.new_coin();
         let g_d_new = config
             .ecc
             .witness_non_identity(layouter.namespace(|| "g_d_new"), new.map(|n| n.g_d))?;
         let pk_d_new = config
             .ecc
             .witness_non_identity(layouter.namespace(|| "pk_d_new"), new.map(|n| n.pk_d))?;
-        let note = config.note.commit(
-            layouter.namespace(|| "new note"),
+        let coin = config.coin.commit(
+            layouter.namespace(|| "new coin"),
             &coords(&g_d_new).into(),
             &coords(&pk_d_new).into(),
             nf_old,
-            NoteWitness::values(&new),
+            CoinWitness::values(&new),
         )?;
-        layouter.constrain_instance(note.cm.cell(), config.instance, rows::CMX)?;
-        Ok(note)
+        layouter.constrain_instance(coin.cm.cell(), config.instance, rows::CMX)?;
+        Ok(coin)
     }
 
     /// Constraint 9: `cv_net = [v_old - v_new] V + [rcv] R`.
@@ -477,17 +477,17 @@ impl ActionCircuit {
         &self,
         config: &ActionConfig,
         layouter: &mut impl Layouter<Fp>,
-        old_note: &CommittedNote,
-        new_note: &CommittedNote,
+        old_coin: &CommittedCoin,
+        new_coin: &CommittedCoin,
     ) -> Result<(), Error> {
         let net = self
             .witness
             .as_ref()
-            .map(|w| net_witness(w.spend.note.value, w.output.value));
-        let (magnitude, sign) = config.note.net_value(
+            .map(|w| net_witness(w.spend.coin.value, w.output.value));
+        let (magnitude, sign) = config.coin.net_value(
             layouter.namespace(|| "v_old - v_new"),
-            &old_note.value,
-            &new_note.value,
+            &old_coin.value,
+            &new_coin.value,
             net,
         )?;
         let net_v = config
@@ -511,12 +511,12 @@ impl ActionCircuit {
         // The transaction aggregate is range checked once per action proof
         // instance. All instances receive the same signed value and blinding;
         // the public aggregate point is derived from the action commitments.
-        let transaction_net = config.note.load(
+        let transaction_net = config.coin.load(
             layouter.namespace(|| "transaction net magnitude"),
             "transaction net magnitude",
             self.witness.as_ref().map(|w| Fp::from(w.transaction_net)),
         )?;
-        let transaction_sign = config.note.load_instance(
+        let transaction_sign = config.coin.load_instance(
             layouter.namespace(|| "transaction net sign"),
             config.instance,
             rows::NET_SIGN,
@@ -581,9 +581,9 @@ mod tests {
 
     use super::*;
 
-    /// A random note owned by nobody in particular.
-    fn random_note(rng: &mut ChaCha20Rng, value: u64) -> NoteWitness {
-        NoteWitness {
+    /// A random coin owned by nobody in particular.
+    fn random_coin(rng: &mut ChaCha20Rng, value: u64) -> CoinWitness {
+        CoinWitness {
             g_d: pallas::Point::random(&mut *rng),
             pk_d: pallas::Point::random(&mut *rng),
             value,
@@ -598,7 +598,7 @@ mod tests {
         public: PublicInputs,
     }
 
-    /// A real spend by a real key of a note in a tree with other leaves.
+    /// A real spend by a real key of a coin in a tree with other leaves.
     fn fixture(seed: u64, value: u64) -> Fixture {
         let mut rng = ChaCha20Rng::seed_from_u64(seed);
         let sk = SpendingKey::random(&mut rng);
@@ -607,7 +607,7 @@ mod tests {
         let d = crypto::keys::Diversifier::random(&mut rng);
         let g_d = d.base().unwrap();
         let pk_d = *ivk.transmission_key(&d).unwrap().as_point();
-        let note = NoteWitness {
+        let coin = CoinWitness {
             g_d,
             pk_d,
             value,
@@ -618,18 +618,18 @@ mod tests {
 
         let mut tree = MerkleTree::new();
         tree.append(Fp::random(&mut rng)).unwrap();
-        let position = tree.append(note.commitment()).unwrap();
+        let position = tree.append(coin.commitment()).unwrap();
         tree.append(Fp::random(&mut rng)).unwrap();
 
         let spend = SpendWitness {
-            note,
+            coin,
             path: tree.path(position).unwrap(),
             ak: fvk.ak().to_point().unwrap(),
             nk: fvk.nk().expose(),
             rivk: fvk.rivk().expose(),
             alpha: pallas::Scalar::random(&mut rng),
         };
-        let mut output = random_note(&mut rng, value.min(5));
+        let mut output = random_coin(&mut rng, value.min(5));
         output.rho = spend.nullifier();
         let rcv = pallas::Scalar::random(&mut rng);
         let transaction_net = value - output.value;
@@ -771,7 +771,7 @@ mod tests {
     }
 
     #[test]
-    fn new_note_must_chain_from_the_old_nullifier() {
+    fn new_coin_must_chain_from_the_old_nullifier() {
         let mut f = fixture(12, 1_000);
         f.witness.output.rho += Fp::one();
         let public = PublicInputs {
@@ -803,7 +803,7 @@ mod tests {
     #[test]
     fn value_commitment_binds_the_values() {
         let mut f = fixture(15, 1_000);
-        // Claim a different net value in cv_net than the notes carry.
+        // Claim a different net value in cv_net than the coins carry.
         let forged = ValueCommitment::commit(
             1_000 - 5 + 1,
             &ValueCommitTrapdoor::from_scalar(f.witness.rcv),

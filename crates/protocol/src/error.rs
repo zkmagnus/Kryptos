@@ -12,9 +12,9 @@ pub enum Error {
     /// A byte string does not have the expected layout.
     #[error("malformed encoding: {0}")]
     Malformed(&'static str),
-    /// A note ciphertext decrypted but its contents were inconsistent.
-    #[error("note decryption failed: {0}")]
-    NoteDecryption(&'static str),
+    /// A coin ciphertext decrypted but its contents were inconsistent.
+    #[error("coin decryption failed: {0}")]
+    CoinDecryption(&'static str),
     /// A transaction violates a stateless consensus rule.
     #[error("invalid transaction: {0}")]
     InvalidTransaction(&'static str),

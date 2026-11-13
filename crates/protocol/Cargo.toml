@@ -1,6 +1,6 @@
 [package]
 name = "protocol"
-description = "Notes, nullifiers, addresses, amounts and transaction rules"
+description = "Coins, nullifiers, addresses, amounts and transaction rules"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,7 +15,6 @@ thiserror.workspace = true
 zeroize.workspace = true
 rand_core.workspace = true
 ff.workspace = true
-base64.workspace = true
 
 [dev-dependencies]
 rand.workspace = true

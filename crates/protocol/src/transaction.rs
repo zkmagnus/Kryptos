@@ -40,7 +40,7 @@ pub const DEFAULT_FEE_RATE: u64 = 1;
 /// Fixed transaction header length, excluding actions, proof, and signature.
 const TRANSACTION_HEADER_LEN: usize = 37;
 
-/// The root of the note commitment tree a transaction spends against.
+/// The root of the coin commitment tree a transaction spends against.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Anchor(pallas::Base);
 
@@ -108,7 +108,7 @@ pub struct Transaction {
     opcode: u8,
     entrypoint: u16,
     anchor: Anchor,
-    fee: crate::coin::Rhombus,
+    fee: crate::amount::Amount,
     fee_opening: Option<crate::fee::FeeOpening>,
     actions: Vec<Action>,
     proof: Proof,
@@ -136,19 +136,19 @@ impl Transaction {
     }
 
     /// Default wallet fee for this action class: one raw unit per encoded byte.
-    pub fn default_fee_for_actions(actions: usize) -> Result<crate::coin::Rhombus> {
+    pub fn default_fee_for_actions(actions: usize) -> Result<crate::amount::Amount> {
         let bytes = u64::try_from(Self::encoded_len_for_actions(actions)?)
             .map_err(|_| crate::Error::AmountOutOfRange)?;
         let raw = bytes
             .checked_mul(DEFAULT_FEE_RATE)
             .ok_or(crate::Error::AmountOutOfRange)?;
-        crate::coin::Rhombus::from_raw(raw)
+        crate::amount::Amount::from_raw(raw)
     }
 
     /// Assembles a transaction using the current V2 proof envelope.
     pub fn new(
         anchor: Anchor,
-        fee: crate::coin::Rhombus,
+        fee: crate::amount::Amount,
         actions: Vec<Action>,
         proof: PrivateTransactionProofV2,
         binding_signature: BindingSignature,
@@ -172,7 +172,7 @@ impl Transaction {
     ) -> Result<Self> {
         Self::new_with_entrypoint(
             anchor,
-            crate::coin::Rhombus::ZERO,
+            crate::amount::Amount::ZERO,
             actions,
             proof,
             binding_signature,
@@ -182,7 +182,7 @@ impl Transaction {
 
     fn new_with_entrypoint(
         anchor: Anchor,
-        fee: crate::coin::Rhombus,
+        fee: crate::amount::Amount,
         actions: Vec<Action>,
         proof: PrivateTransactionProofV2,
         binding_signature: BindingSignature,
@@ -231,7 +231,7 @@ impl Transaction {
 
     /// The fee amount attached from relay metadata. It is zero for a
     /// transaction decoded from a block, which contains no fee opening.
-    pub fn fee(&self) -> crate::coin::Rhombus {
+    pub fn fee(&self) -> crate::amount::Amount {
         self.fee
     }
 
@@ -413,7 +413,7 @@ impl Encodable for Transaction {
         let anchor = Anchor::read(r)?;
         let count = usize::from(r.take_u8()?);
         // A block or standalone transaction contains no fee opening.
-        let fee = crate::coin::Rhombus::ZERO;
+        let fee = crate::amount::Amount::ZERO;
         let bodies = (0..count)
             .map(|_| ActionBody::read(r))
             .collect::<Result<Vec<_>>>()?;
@@ -474,7 +474,7 @@ pub(crate) mod tests {
         let actions = (0..count).map(|_| sample_action(&mut rng, b"x")).collect();
         Transaction::new(
             sample_anchor(),
-            crate::coin::Rhombus::ZERO,
+            crate::amount::Amount::ZERO,
             actions,
             PrivateTransactionProofV2::new(&dummy_proof(count)).unwrap(),
             BindingSignature::from_bytes([9; 64]),

@@ -5,7 +5,7 @@
 //! | table | key | value |
 //! |---|---|---|
 //! | `meta` | name | spending key, fingerprint, genesis |
-//! | `notes` | tree position | owned note |
+//! | `coins` | tree position | owned coin |
 //! | `heights` | height | block hash, tree size before the block |
 //! | `shards`, `cap`, `checkpoints` | see [`crate::tree`] | the witness tree |
 //!
@@ -36,7 +36,7 @@ use redb::{
 
 use crate::keys::WalletKeys;
 use crate::operations::{Operation, OperationStatus};
-use crate::scan::{scan_block, scan_compact_block, BlockScan, OwnedNote};
+use crate::scan::{scan_block, scan_compact_block, BlockScan, OwnedCoin};
 use crate::spend::Payment;
 use crate::tree::{
     anchor_of, retention, to_merkle_path, witness_tree, WitnessTree, CAP, CHECKPOINTS, SHARDS,
@@ -44,7 +44,7 @@ use crate::tree::{
 use crate::{Error, Result};
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
-const NOTES: TableDefinition<u64, &[u8]> = TableDefinition::new("notes");
+const COINS: TableDefinition<u64, &[u8]> = TableDefinition::new("coins");
 const HEIGHTS: TableDefinition<u32, &[u8]> = TableDefinition::new("heights");
 /// Diversifier index to the sealed label of an address handed out.
 const ADDRESSES: TableDefinition<u64, &[u8]> = TableDefinition::new("addresses");
@@ -60,7 +60,7 @@ const NEXT_ADDRESS: &str = "next_address";
 const NEXT_OPERATION: &str = "next_operation";
 
 const TAG_SPENDING_KEY: u8 = 0;
-const TAG_NOTE: u8 = 1;
+const TAG_COIN: u8 = 1;
 const TAG_LABEL: u8 = 2;
 const TAG_OPERATION: u8 = 3;
 
@@ -93,9 +93,9 @@ impl core::fmt::Debug for Wallet {
 /// What one scanned block changed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScanReport {
-    /// Notes found for the wallet.
+    /// Coins found for the wallet.
     pub found: usize,
-    /// Wallet notes the block spent.
+    /// Wallet coins the block spent.
     pub spent: usize,
 }
 
@@ -143,7 +143,7 @@ where
 
 impl Wallet {
     /// Exports a complete, versioned JSON backup of wallet state. Secret keys
-    /// and owned notes are included in plaintext, so the caller must protect
+    /// and owned coins are included in plaintext, so the caller must protect
     /// the resulting file like the live wallet.
     ///
     /// # Errors
@@ -176,7 +176,7 @@ impl Wallet {
                     .collect::<Result<Vec<_>>>()?
             }};
         }
-        let notes = rows!(NOTES);
+        let coins = rows!(COINS);
         let heights = rows!(HEIGHTS);
         let shards = rows!(SHARDS);
         let cap = rows!(CAP);
@@ -190,7 +190,7 @@ impl Wallet {
             "plaintext_secrets": true,
             "tables": {
                 "meta": meta_rows,
-                "notes": notes,
+                "coins": coins,
                 "heights": heights,
                 "shards": shards,
                 "cap": cap,
@@ -264,7 +264,7 @@ impl Wallet {
         let tx = db.begin_write()?;
         {
             let mut meta = tx.open_table(META)?;
-            tx.open_table(NOTES)?;
+            tx.open_table(COINS)?;
             tx.open_table(HEIGHTS)?;
             tx.open_table(SHARDS)?;
             tx.open_table(CAP)?;
@@ -335,7 +335,7 @@ impl Wallet {
 
     /// Scans the next full block: appends its commitments to the witness
     /// tree, marking the ones it owns, takes a checkpoint at the block's
-    /// height, records owned notes with their memos and marks notes it
+    /// height, records owned coins with their memos and marks coins it
     /// spent. All or nothing.
     ///
     /// Commitments enter in the block's transaction order.
@@ -352,7 +352,7 @@ impl Wallet {
     }
 
     /// Scans the next block from its compact form, as a light client does.
-    /// It maintains the same witness tree and finds the same notes, but
+    /// It maintains the same witness tree and finds the same coins, but
     /// their memos are not recovered.
     ///
     /// # Errors
@@ -364,7 +364,7 @@ impl Wallet {
     }
 
     /// Applies one scanned block in a single write transaction: appends
-    /// leaves, checkpoints, records found notes and marks spends. Shared
+    /// leaves, checkpoints, records found coins and marks spends. Shared
     /// by the full and compact scanners.
     fn apply(
         &self,
@@ -395,19 +395,19 @@ impl Wallet {
             if !tree.checkpoint(height)? {
                 return Err(Error::Corrupt("checkpoint out of order"));
             }
-            let mut notes = tx.open_table(NOTES)?;
-            for note in &scan.found {
-                notes.insert(note.position, self.seal_note(note)?.as_slice())?;
+            let mut coins = tx.open_table(COINS)?;
+            for coin in &scan.found {
+                coins.insert(coin.position, self.seal_coin(coin)?.as_slice())?;
             }
-            for mut note in self.decrypt_all(&notes)? {
-                let spent = scan.spent.iter().find(|(nf, _)| *nf == note.nullifier);
-                if let (None, Some((_, by))) = (note.spent_at, spent) {
-                    note.spent_at = Some(height);
-                    note.spent_by = *by;
-                    notes.insert(note.position, self.seal_note(&note)?.as_slice())?;
+            for mut coin in self.decrypt_all(&coins)? {
+                let spent = scan.spent.iter().find(|(nf, _)| *nf == coin.nullifier);
+                if let (None, Some((_, by))) = (coin.spent_at, spent) {
+                    coin.spent_at = Some(height);
+                    coin.spent_by = *by;
+                    coins.insert(coin.position, self.seal_coin(&coin)?.as_slice())?;
                     // The mark is removed as of this checkpoint, so a
                     // rollback below it restores the witness.
-                    tree.remove_mark(Position::from(note.position), Some(&height))?;
+                    tree.remove_mark(Position::from(coin.position), Some(&height))?;
                     report.spent = report.spent.saturating_add(1);
                 }
             }
@@ -418,7 +418,7 @@ impl Wallet {
         Ok(report)
     }
 
-    /// Forgets every block above `height`: tree leaves, notes created
+    /// Forgets every block above `height`: tree leaves, coins created
     /// after it, and spends recorded after it. Reopens removed confirmations
     /// and reserves their inputs in the same database transaction.
     ///
@@ -437,15 +437,15 @@ impl Wallet {
             }
             let mut heights = tx.open_table(HEIGHTS)?;
             heights.retain(|h, _| h <= height)?;
-            let mut notes = tx.open_table(NOTES)?;
-            let owned = self.decrypt_all(&notes)?;
-            for mut note in owned {
-                if note.height > height {
-                    notes.remove(note.position)?;
-                } else if note.spent_at.is_some_and(|h| h > height) {
-                    note.spent_at = None;
-                    note.spent_by = None;
-                    notes.insert(note.position, self.seal_note(&note)?.as_slice())?;
+            let mut coins = tx.open_table(COINS)?;
+            let owned = self.decrypt_all(&coins)?;
+            for mut coin in owned {
+                if coin.height > height {
+                    coins.remove(coin.position)?;
+                } else if coin.spent_at.is_some_and(|h| h > height) {
+                    coin.spent_at = None;
+                    coin.spent_by = None;
+                    coins.insert(coin.position, self.seal_coin(&coin)?.as_slice())?;
                 }
             }
             let mut operations = tx.open_table(OPERATIONS)?;
@@ -464,43 +464,43 @@ impl Wallet {
         Ok(())
     }
 
-    fn seal_note(&self, note: &OwnedNote) -> Result<Vec<u8>> {
-        self.file_key.seal(TAG_NOTE, note.position, &note.to_vec())
+    fn seal_coin(&self, coin: &OwnedCoin) -> Result<Vec<u8>> {
+        self.file_key.seal(TAG_COIN, coin.position, &coin.to_vec())
     }
 
     fn decrypt_all(
         &self,
-        notes: &impl ReadableTable<u64, &'static [u8]>,
-    ) -> Result<Vec<OwnedNote>> {
-        notes
+        coins: &impl ReadableTable<u64, &'static [u8]>,
+    ) -> Result<Vec<OwnedCoin>> {
+        coins
             .iter()?
             .map(|row| {
                 let (position, value) = row?;
                 let plain = self
                     .file_key
-                    .open(TAG_NOTE, position.value(), value.value())?;
-                Ok(OwnedNote::from_slice(&plain)?)
+                    .open(TAG_COIN, position.value(), value.value())?;
+                Ok(OwnedCoin::from_slice(&plain)?)
             })
             .collect()
     }
 
-    /// Every owned note, spent or not, by position.
+    /// Every owned coin, spent or not, by position.
     ///
     /// # Errors
     /// Fails on a database error or corrupt row.
-    pub fn notes(&self) -> Result<Vec<OwnedNote>> {
+    pub fn coins(&self) -> Result<Vec<OwnedCoin>> {
         let tx = self.db.begin_read()?;
-        let notes = tx.open_table(NOTES)?;
-        self.decrypt_all(&notes)
+        let coins = tx.open_table(COINS)?;
+        self.decrypt_all(&coins)
     }
 
-    /// Notes not yet seen spent on chain.
+    /// Coins not yet seen spent on chain.
     ///
     /// # Errors
-    /// See [`Self::notes`].
-    pub fn unspent(&self) -> Result<Vec<OwnedNote>> {
+    /// See [`Self::coins`].
+    pub fn unspent(&self) -> Result<Vec<OwnedCoin>> {
         Ok(self
-            .notes()?
+            .coins()?
             .into_iter()
             .filter(|n| n.spent_at.is_none())
             .collect())
@@ -509,9 +509,9 @@ impl Wallet {
     /// Unspent value.
     ///
     /// # Errors
-    /// See [`Self::notes`].
+    /// See [`Self::coins`].
     pub fn balance(&self) -> Result<u64> {
-        Ok(self.unspent()?.iter().map(|n| n.note.value().raw()).sum())
+        Ok(self.unspent()?.iter().map(|n| n.coin.value().raw()).sum())
     }
 
     /// The height of the last scanned block, which is the checkpoint
@@ -535,12 +535,12 @@ impl Wallet {
         Ok(anchor_of(&root))
     }
 
-    /// Witnesses for owned note positions, all against the anchor after
+    /// Witnesses for owned coin positions, all against the anchor after
     /// the last scanned block, in the order given.
     ///
     /// # Errors
     /// Returns [`Error::NoWitness`] for a position that is not an unspent
-    /// owned note.
+    /// owned coin.
     pub fn witnesses(&self, positions: &[u64]) -> Result<(Vec<MerklePath>, Anchor)> {
         let tip = self.tip_height()?;
         let tx = self.db.begin_read()?;
@@ -562,7 +562,7 @@ impl Wallet {
         Ok((paths, anchor_of(&root)))
     }
 
-    /// The witness for one note position and the anchor it is valid for.
+    /// The witness for one coin position and the anchor it is valid for.
     ///
     /// # Errors
     /// See [`Self::witnesses`].
@@ -581,7 +581,7 @@ impl Wallet {
     }
 
     /// Hands out the next diversified address under `label` and records
-    /// it, so a received note can be traced back to the label.
+    /// it, so a received coin can be traced back to the label.
     ///
     /// # Errors
     /// Fails on a database error or an exhausted index space.
@@ -758,7 +758,7 @@ impl Wallet {
             .ok_or(Error::NoOperation(id))
     }
 
-    /// Positions of notes set aside by pending operations, which a new
+    /// Positions of coins set aside by pending operations, which a new
     /// send must not touch.
     ///
     /// # Errors
@@ -845,11 +845,11 @@ mod tests {
         (dir, wallet)
     }
 
-    /// The stored note record at `position`.
-    fn raw_note(wallet: &Wallet, position: u64) -> Vec<u8> {
+    /// The stored coin record at `position`.
+    fn raw_coin(wallet: &Wallet, position: u64) -> Vec<u8> {
         let tx = wallet.db.begin_read().unwrap();
-        let notes = tx.open_table(NOTES).unwrap();
-        notes.get(position).unwrap().unwrap().value().to_vec()
+        let coins = tx.open_table(COINS).unwrap();
+        coins.get(position).unwrap().unwrap().value().to_vec()
     }
 
     /// A block at `height` paying `value` to `keys` through a coinbase.
@@ -910,7 +910,7 @@ mod tests {
     #[test]
     // One persisted chain exercises scanning, spending, rollback, and reopening.
     #[allow(clippy::too_many_lines)]
-    fn scanning_finds_notes_persists_records_and_detects_spends() {
+    fn scanning_finds_coins_persists_records_and_detects_spends() {
         let mut rng = ChaCha20Rng::seed_from_u64(3);
         let other_keys = WalletKeys::from_spending_key(sk(4)).unwrap();
         let genesis = BlockHash::from_bytes([2; 32]);
@@ -937,12 +937,12 @@ mod tests {
         let wallet = Wallet::open(&path, genesis).unwrap();
         assert_eq!(wallet.next_height().unwrap(), 2);
         assert_eq!(wallet.scanned_hash(1).unwrap(), Some(b1.hash()));
-        let note = &wallet.unspent().unwrap()[0];
-        assert_eq!(note.memo.to_text(), Some("cb"));
+        let coin = &wallet.unspent().unwrap()[0];
+        assert_eq!(coin.memo.to_text(), Some("cb"));
 
-        let (path_to_note, anchor) = wallet.witness(note.position).unwrap();
+        let (path_to_coin, anchor) = wallet.witness(coin.position).unwrap();
         let mut b = Builder::new(anchor);
-        b.add_spend(SpendInfo::new(sk(3), note.note.clone(), path_to_note))
+        b.add_spend(SpendInfo::new(sk(3), coin.coin.clone(), path_to_coin))
             .unwrap();
         b.add_output(OutputInfo::new(
             other_keys.default_address().unwrap(),
@@ -965,7 +965,7 @@ mod tests {
             txid: spend.txid(),
             height: 2,
         };
-        operation.locked = vec![note.position];
+        operation.locked = vec![coin.position];
         operation.transaction = Some(spend.to_vec());
         wallet.put_operation(&operation).unwrap();
         let mut retained = wallet.add_operation(Vec::new(), 1, 0).unwrap();
@@ -977,12 +977,12 @@ mod tests {
         let mut header = empty_header(2, b1.hash(), anchor);
         header.tx_root = protocol::block::tx_root([spend.txid()]);
         let b2 = Block::new(header, vec![spend]);
-        let position = note.position;
-        let unspent_record = raw_note(&wallet, position);
+        let position = coin.position;
+        let unspent_record = raw_coin(&wallet, position);
         assert_eq!(wallet.scan(&b2).unwrap(), ScanReport { found: 1, spent: 1 });
         assert_eq!(wallet.balance().unwrap(), change);
-        assert_eq!(wallet.notes().unwrap().len(), 2);
-        let spent_record = raw_note(&wallet, position);
+        assert_eq!(wallet.coins().unwrap().len(), 2);
+        let spent_record = raw_coin(&wallet, position);
 
         wallet.rollback_to(1).unwrap();
         let pending = wallet.operation(operation.id).unwrap();
@@ -996,13 +996,13 @@ mod tests {
         assert_eq!(pending.transaction, operation.transaction);
         assert_eq!(wallet.locked_positions().unwrap(), vec![position]);
         assert_eq!(wallet.operation(retained.id).unwrap(), retained);
-        let restored_record = raw_note(&wallet, position);
+        let restored_record = raw_coin(&wallet, position);
         assert!(!unspent_record.is_empty());
         assert!(!spent_record.is_empty());
         assert!(!restored_record.is_empty());
         assert_eq!(wallet.balance().unwrap(), 1_000_000_000);
         assert_eq!(wallet.tree_size().unwrap(), 4);
-        assert_eq!(wallet.notes().unwrap().len(), 1);
+        assert_eq!(wallet.coins().unwrap().len(), 1);
         wallet.rollback_to(5).unwrap();
         assert_eq!(
             wallet.next_height().unwrap(),
@@ -1016,7 +1016,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_scanning_finds_the_same_notes_and_tree_as_full_scanning() {
+    fn compact_scanning_finds_the_same_coins_and_tree_as_full_scanning() {
         use protocol::compact::CompactBlock;
 
         let mut rng = ChaCha20Rng::seed_from_u64(11);
@@ -1078,15 +1078,15 @@ mod tests {
                 naive.append(leaf).unwrap();
             }
         }
-        let notes = wallet.unspent().unwrap();
-        assert_eq!(notes.len(), 2);
-        let positions: Vec<u64> = notes.iter().map(|n| n.position).collect();
+        let coins = wallet.unspent().unwrap();
+        assert_eq!(coins.len(), 2);
+        let positions: Vec<u64> = coins.iter().map(|n| n.position).collect();
         let (paths, anchor) = wallet.witnesses(&positions).unwrap();
         assert_eq!(anchor, Anchor::from_base(naive.root()));
         assert_eq!(anchor, wallet.anchor().unwrap());
-        for (note, path) in notes.iter().zip(&paths) {
-            assert_eq!(path.root(note.note.cmx().unwrap().inner()), naive.root());
-            assert_eq!(*path, naive.path(note.position).unwrap());
+        for (coin, path) in coins.iter().zip(&paths) {
+            assert_eq!(path.root(coin.coin.cmx().unwrap().inner()), naive.root());
+            assert_eq!(*path, naive.path(coin.position).unwrap());
         }
         assert!(matches!(wallet.witness(99), Err(Error::NoWitness(99))));
         assert_eq!(wallet.tree_size().unwrap(), 6);
@@ -1132,7 +1132,7 @@ mod tests {
     }
 
     #[test]
-    fn operations_persist_and_lock_notes_while_pending() {
+    fn operations_persist_and_lock_coins_while_pending() {
         let mut rng = ChaCha20Rng::seed_from_u64(13);
         let (_dir, wallet) = temp_wallet(&sk(13), BlockHash::ZERO, &mut rng);
         let payment = Payment {
@@ -1207,7 +1207,7 @@ mod tests {
             .unspent()
             .unwrap()
             .into_iter()
-            .find(|n| n.note.value().raw() == 8)
+            .find(|n| n.coin.value().raw() == 8)
             .unwrap();
         let leaves = size_before..size_before + b1.transactions()[0].actions().len() as u64;
         assert!(

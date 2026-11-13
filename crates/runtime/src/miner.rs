@@ -7,9 +7,9 @@ use chain::target::Target;
 use crypto::commitment::ValueCommitTrapdoor;
 use crypto::signature::BindingSigningKey;
 use protocol::address::RhombusAddress;
+use protocol::amount::Amount;
 use protocol::block::{empty_header, tx_root, Block, BlockHash, BlockHeader, PowSolution};
 use protocol::builder::{Builder, OutputInfo};
-use protocol::coin::Rhombus;
 use protocol::consensus::{next_height, subsidy, BLOCK_VERSION};
 use protocol::fee::FeeOpening;
 use protocol::memo::Memo;
@@ -122,7 +122,7 @@ impl Template {
 
     /// The scheduled subsidy plus fee amounts from selected relay openings.
     ///
-    pub fn credit(&self) -> Result<Rhombus> {
+    pub fn credit(&self) -> Result<Amount> {
         let height = next_height(self.parent.height)?;
         let mut credit = subsidy(height);
         for tx in &self.transactions {

@@ -91,7 +91,7 @@ pub struct BlockHeader {
     pub height: u32,
     /// Seconds since the Unix epoch.
     pub timestamp: u64,
-    /// Note commitment tree root after this block.
+    /// Coin commitment tree root after this block.
     pub commitment_root: Anchor,
     /// Commitment to the transactions.
     pub tx_root: [u8; SHORT_OUTPUT_LEN],

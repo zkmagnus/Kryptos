@@ -1,8 +1,8 @@
-//! Note gadgets: commitment, nullifier and the membership-or-dummy gate.
+//! Coin gadgets: commitment, nullifier and the membership-or-dummy gate.
 
 #![allow(clippy::arithmetic_side_effects)] // gate expressions are symbolic
 
-use crypto::poseidon::{IVK_INPUTS, NOTE_COMMIT_INPUTS, NULLIFIER_INPUTS};
+use crypto::poseidon::{IVK_INPUTS, COIN_COMMIT_INPUTS, NULLIFIER_INPUTS};
 use halo2_proofs::circuit::{Layouter, Value};
 use halo2_proofs::plonk::{
     Advice, Column, ConstraintSystem, Constraints, Error, Instance, Selector,
@@ -13,8 +13,8 @@ use super::poseidon::{self, PoseidonConfig};
 use super::witness::{load, Cell};
 use crate::Fp;
 
-/// Number of advice columns the note gadget needs.
-pub const NOTE_ADVICES: usize = 3;
+/// Number of advice columns the coin gadget needs.
+pub const COIN_ADVICES: usize = 3;
 
 /// Coordinate cells of a point already constrained elsewhere.
 #[derive(Clone, Debug)]
@@ -31,9 +31,9 @@ impl From<(Cell, Cell)> for PointCells {
     }
 }
 
-/// The cells a note commitment produces.
+/// The cells a coin commitment produces.
 #[derive(Clone, Debug)]
-pub struct CommittedNote {
+pub struct CommittedCoin {
     /// The commitment.
     pub cm: Cell,
     /// The value, for the membership gate and the value commitment.
@@ -44,9 +44,9 @@ pub struct CommittedNote {
     pub psi: Cell,
 }
 
-/// Plaintext fields of a note as `Value`s.
+/// Plaintext fields of a coin as `Value`s.
 #[derive(Clone, Copy, Debug)]
-pub struct NoteValues {
+pub struct CoinValues {
     /// Value in smallest units.
     pub value: Value<u64>,
     /// Nullifier nonce.
@@ -55,10 +55,10 @@ pub struct NoteValues {
     pub rcm: Value<Fp>,
 }
 
-/// Columns and selectors of the note gadget.
+/// Columns and selectors of the coin gadget.
 #[derive(Clone, Debug)]
-pub struct NoteGadgetConfig {
-    advices: [Column<Advice>; NOTE_ADVICES],
+pub struct CoinGadgetConfig {
+    advices: [Column<Advice>; COIN_ADVICES],
     poseidon: PoseidonConfig,
     q_member: Selector,
     q_net: Selector,
@@ -71,12 +71,12 @@ pub fn net_witness(old: u64, new: u64) -> (u64, bool) {
     (old.abs_diff(new), new > old)
 }
 
-impl NoteGadgetConfig {
+impl CoinGadgetConfig {
     /// Configures the membership gate on `advices` and keeps the Poseidon
     /// configuration for hashing.
     pub fn configure(
         meta: &mut ConstraintSystem<Fp>,
-        advices: [Column<Advice>; NOTE_ADVICES],
+        advices: [Column<Advice>; COIN_ADVICES],
         poseidon: PoseidonConfig,
     ) -> Self {
         for column in advices {
@@ -141,7 +141,7 @@ impl NoteGadgetConfig {
         )
     }
 
-    /// Commits to a note whose `rho` is an existing cell.
+    /// Commits to a coin whose `rho` is an existing cell.
     ///
     /// # Errors
     /// Propagates layouter errors.
@@ -151,18 +151,18 @@ impl NoteGadgetConfig {
         g_d: &PointCells,
         pk_d: &PointCells,
         rho: Cell,
-        note: NoteValues,
-    ) -> Result<CommittedNote, Error> {
+        coin: CoinValues,
+    ) -> Result<CommittedCoin, Error> {
         let value = self.load(
             layouter.namespace(|| "value"),
             "value",
-            note.value.map(Fp::from),
+            coin.value.map(Fp::from),
         )?;
-        let psi = self.load(layouter.namespace(|| "psi"), "psi", note.psi)?;
-        let rcm = self.load(layouter.namespace(|| "rcm"), "rcm", note.rcm)?;
-        let cm = poseidon::hash::<NOTE_COMMIT_INPUTS>(
+        let psi = self.load(layouter.namespace(|| "psi"), "psi", coin.psi)?;
+        let rcm = self.load(layouter.namespace(|| "rcm"), "rcm", coin.rcm)?;
+        let cm = poseidon::hash::<COIN_COMMIT_INPUTS>(
             &self.poseidon,
-            layouter.namespace(|| "note commitment"),
+            layouter.namespace(|| "coin commitment"),
             [
                 g_d.x.clone(),
                 g_d.y.clone(),
@@ -174,7 +174,7 @@ impl NoteGadgetConfig {
                 rcm,
             ],
         )?;
-        Ok(CommittedNote {
+        Ok(CommittedCoin {
             cm,
             value,
             rho,
@@ -190,12 +190,12 @@ impl NoteGadgetConfig {
         &self,
         layouter: impl Layouter<Fp>,
         nk: Cell,
-        note: &CommittedNote,
+        coin: &CommittedCoin,
     ) -> Result<Cell, Error> {
         poseidon::hash::<NULLIFIER_INPUTS>(
             &self.poseidon,
             layouter,
-            [nk, note.rho.clone(), note.psi.clone(), note.cm.clone()],
+            [nk, coin.rho.clone(), coin.psi.clone(), coin.cm.clone()],
         )
     }
 

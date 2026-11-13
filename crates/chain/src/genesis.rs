@@ -46,7 +46,7 @@ mod tests {
     }
 
     #[test]
-    fn both_networks_start_without_transactions_or_allocated_notes() {
+    fn both_networks_start_without_transactions_or_allocated_coins() {
         for params in [ChainParams::mainnet(), ChainParams::test()] {
             let (block, tree) = genesis_with_tree(&params);
             assert_eq!(block.header().commitment_root, tree.root());

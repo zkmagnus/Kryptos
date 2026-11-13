@@ -1,4 +1,4 @@
-//! The `rhombus` command line.
+//! The `Amount` command line.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -8,9 +8,9 @@ use clap::{Parser, Subcommand};
 use crypto::encoding::{from_hex, to_hex};
 use crypto::keys::SpendingKey;
 use protocol::address::RhombusAddress;
+use protocol::amount::Amount;
 use protocol::block::{Block, BlockHash};
 use protocol::bytes::Encodable;
-use protocol::coin::Rhombus;
 use protocol::compact::CompactBlock;
 use protocol::consensus::{next_height, BranchId};
 use protocol::memo::Memo;
@@ -37,7 +37,7 @@ const PHRASE_ENV: &str = "SEED_PHRASE";
 
 /// The node daemon and wallet tools.
 #[derive(Parser, Debug)]
-#[command(name = "rhombus", version)]
+#[command(name = "Amount", version)]
 pub struct Cli {
     /// What to do.
     #[command(subcommand)]
@@ -240,7 +240,7 @@ pub enum Command {
         /// Recipient address.
         #[arg(long)]
         to: String,
-        /// Rhombus in smallest units.
+        /// Amount in smallest units.
         #[arg(long)]
         amount: u64,
         /// Private fee amount in raw units (default: 1 raw unit per encoded byte).
@@ -387,7 +387,7 @@ async fn batch_transfer(
             .map_err(|_| Error::Argument("payment amount must be an unsigned integer".into()))?;
         payments.push(Payment {
             recipient,
-            amount: Rhombus::from_raw(amount)?,
+            amount: Amount::from_raw(amount)?,
             memo: Memo::empty(),
         });
     }
@@ -402,7 +402,7 @@ async fn batch_transfer(
         Some(raw) => build_payments_with_fee(
             &wallet,
             &payments,
-            Rhombus::from_raw(raw)?,
+            Amount::from_raw(raw)?,
             &pk,
             branch,
             &[],
@@ -440,12 +440,12 @@ async fn balance(wallet: &WalletArgs, rpc: &RpcArgs, light: bool) -> Result<()> 
     let _network = network_of(&genesis)?;
     let wallet = open_wallet(wallet, genesis)?;
     let scanned = sync_wallet(&mut client, &wallet, light).await?;
-    for note in wallet.unspent()? {
+    for coin in wallet.unspent()? {
         println!(
-            "note at height {} position {}: {}",
-            note.height,
-            note.position,
-            note.note.value().raw()
+            "coin at height {} position {}: {}",
+            coin.height,
+            coin.position,
+            coin.coin.value().raw()
         );
     }
     println!("scanned to height {scanned}, balance {}", wallet.balance()?);
@@ -461,7 +461,7 @@ async fn send(
     rpc: &RpcArgs,
     light: bool,
 ) -> Result<()> {
-    let amount = Rhombus::from_raw(amount)?;
+    let amount = Amount::from_raw(amount)?;
     let mut client = rpc.connect().await?;
     let genesis = fetch_genesis(&mut client).await?;
     let network = network_of(&genesis)?;
@@ -482,7 +482,7 @@ async fn send(
         Some(raw) => build_payments_with_fee(
             &wallet,
             &[payment],
-            Rhombus::from_raw(raw)?,
+            Amount::from_raw(raw)?,
             &pk,
             branch,
             &[],
@@ -511,7 +511,7 @@ async fn send(
     Ok(())
 }
 
-/// The chain directory for `rhombus run`: the given one, the per-user
+/// The chain directory for `Amount run`: the given one, the per-user
 /// default. Directories are created owner-only.
 fn node_datadir(datadir: Option<PathBuf>, network: Network) -> Result<PathBuf> {
     let dir = match datadir {
@@ -524,7 +524,7 @@ fn node_datadir(datadir: Option<PathBuf>, network: Network) -> Result<PathBuf> {
 
 /// Starts a node and runs it until interrupted.
 #[allow(clippy::too_many_arguments)] // mirrors the command line options
-/// The options `rhombus run` was given.
+/// The options `Amount run` was given.
 struct RunOptions {
     network: Network,
     datadir: PathBuf,
@@ -587,7 +587,7 @@ async fn run_node(opts: RunOptions) -> Result<()> {
     let shutdown = Shutdown::listen()?;
     let handle = crate::node::spawn(config).await?;
     let log = crate::node::log;
-    log(&format!("rhombus up on the {network} network"));
+    log(&format!("Amount up on the {network} network"));
     match handle.listen_addr {
         Some(addr) => log(&format!("peers      listening on {addr}")),
         None => log("peers      outbound only"),
@@ -624,7 +624,7 @@ pub async fn pay(
     wallet: &Wallet,
     pk: &ProvingKey,
     recipient: RhombusAddress,
-    amount: Rhombus,
+    amount: Amount,
     fee: u64,
     branch: BranchId,
 ) -> Result<String> {
@@ -636,7 +636,7 @@ pub async fn pay(
     let built = build_payments_with_fee(
         wallet,
         &[payment],
-        Rhombus::from_raw(fee)?,
+        Amount::from_raw(fee)?,
         pk,
         branch,
         &[],
@@ -863,7 +863,7 @@ mod tests {
 
     #[test]
     fn advertising_requires_a_listener_and_conflicts_with_a_proxy() {
-        let base = ["rhombus", "run", "--advertise", "8.8.8.8:19000"];
+        let base = ["Amount", "run", "--advertise", "8.8.8.8:19000"];
         assert!(Cli::try_parse_from(base).is_err());
         let listener = ["--listen", "0.0.0.0:19000"];
         assert!(Cli::try_parse_from(base.into_iter().chain(listener)).is_ok());
@@ -891,10 +891,10 @@ mod tests {
     #[test]
     fn every_command_defaults_to_the_main_network() {
         for argv in [
-            &["rhombus", "run"][..],
-            &["rhombus", "keygen"],
-            &["rhombus", "create", "--wallet", "w"],
-            &["rhombus", "address", "--wallet", "w"],
+            &["Amount", "run"][..],
+            &["Amount", "keygen"],
+            &["Amount", "create", "--wallet", "w"],
+            &["Amount", "address", "--wallet", "w"],
         ] {
             let cli = Cli::try_parse_from(argv).unwrap();
             assert_eq!(
@@ -903,7 +903,7 @@ mod tests {
                 "{argv:?}"
             );
         }
-        let explicit = Cli::try_parse_from(["rhombus", "keygen", "--network", "test"]).unwrap();
+        let explicit = Cli::try_parse_from(["Amount", "keygen", "--network", "test"]).unwrap();
         assert_eq!(network_of_command(&explicit.command), Some(Network::Test));
     }
 }

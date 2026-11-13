@@ -15,7 +15,7 @@ use chain::genesis::genesis;
 use chain::params::{ChainParams, Upgrade};
 use chain::target::Target;
 use chain::Error;
-use common::{proving_key, spend_first_note_for, spend_first_note_with_fee, Harness, Wallet};
+use common::{proving_key, spend_first_coin_for, spend_first_coin_with_fee, Harness, Wallet};
 use protocol::block::{empty_header, Block, PowSolution};
 use protocol::builder::{Builder, OutputInfo, SpendInfo};
 use protocol::bytes::Encodable;
@@ -30,7 +30,7 @@ use storage::tree::CommitmentTree;
 #[test]
 fn mining_extends_the_chain_and_pays_the_miner() {
     let mut h = Harness::new(1);
-    assert_eq!(h.miner.tree.len(), 0, "genesis has no allocated notes");
+    assert_eq!(h.miner.tree.len(), 0, "genesis has no allocated coins");
     for height in 1..=3u32 {
         let block = h.extend(Vec::new());
         assert_eq!(block.header().height, height);
@@ -54,7 +54,7 @@ fn private_fee_is_relay_metadata_and_is_paid_into_the_private_coinbase() {
     let recipient = Wallet::new(&mut ChaCha20Rng::seed_from_u64(102));
     let fee = 17;
     let spending_wallet = h.miner.clone_for_test(0);
-    let tx = spend_first_note_with_fee(&mut h, &spending_wallet, &recipient.address, 1_000, fee);
+    let tx = spend_first_coin_with_fee(&mut h, &spending_wallet, &recipient.address, 1_000, fee);
     assert_eq!(tx.fee().raw(), fee);
     assert!(tx.fee_opening().is_some());
 
@@ -73,7 +73,7 @@ fn private_fee_is_relay_metadata_and_is_paid_into_the_private_coinbase() {
     let reward = protocol::consensus::subsidy(decoded_block.header().height)
         .checked_add(protocol::coin::Rhombus::from_raw(fee).unwrap())
         .unwrap();
-    assert!(h.miner.notes.iter().any(|(note, _)| note.value() == reward));
+    assert!(h.miner.coins.iter().any(|(coin, _)| coin.value() == reward));
 }
 
 #[test]
@@ -81,15 +81,15 @@ fn a_coinbase_output_can_be_spent_once() {
     let mut h = Harness::new(2);
     h.extend(Vec::new());
     h.extend(Vec::new());
-    let (note, position) = h.miner.notes[0].clone();
+    let (coin, position) = h.miner.coins[0].clone();
     let path = h.miner.tree.path(position).unwrap();
     let parent = h.tip_header();
 
     let mut rng = ChaCha20Rng::seed_from_u64(99);
     let recipient = Wallet::new(&mut rng);
-    let pay = note.value().raw();
+    let pay = coin.value().raw();
     let mut b = Builder::new(parent.commitment_root);
-    b.add_spend(SpendInfo::new(h.miner.sk.clone(), note, path))
+    b.add_spend(SpendInfo::new(h.miner.sk.clone(), coin, path))
         .unwrap();
     b.add_output(OutputInfo::new(
         recipient.address,
@@ -316,7 +316,7 @@ fn an_upgrade_changes_which_signatures_a_block_accepts() {
 
     // A transaction signed for the old branch is refused at height 3.
     let parent = h.tip_header();
-    let stale = spend_first_note_for(&mut h, &wallet, &other.address, 1_000, old);
+    let stale = spend_first_coin_for(&mut h, &wallet, &other.address, 1_000, old);
     let coinbase = coinbase_for(&mut h, &parent, old);
     let block = block_over(&mut h, &parent, vec![coinbase, stale]);
     assert!(matches!(
@@ -326,7 +326,7 @@ fn an_upgrade_changes_which_signatures_a_block_accepts() {
     assert_eq!(h.chain.tip().unwrap().height, 2);
 
     // The same payment signed for the new branch is accepted.
-    let fresh = spend_first_note_for(&mut h, &wallet, &other.address, 1_000, new);
+    let fresh = spend_first_coin_for(&mut h, &wallet, &other.address, 1_000, new);
     let block = h.make_block(&parent, vec![fresh]);
     assert_eq!(h.import(&block).unwrap(), Import::Extended);
     assert_eq!(h.chain.params().branch_at(3), new);
@@ -485,11 +485,11 @@ fn a_failed_apply_leaves_no_partial_state() {
     h.extend(Vec::new());
     h.extend(Vec::new());
     let other = Wallet::new(&mut ChaCha20Rng::seed_from_u64(80));
-    // Two transactions spending the same note: the store's own duplicate
+    // Two transactions spending the same coin: the store's own duplicate
     // check fails mid-transaction, and nothing of the block persists.
     let wallet = h.miner.clone_for_test(0);
-    let a = common::spend_first_note(&mut h, &wallet, &other.address, 1_000);
-    let b = common::spend_first_note(&mut h, &wallet, &other.address, 2_000);
+    let a = common::spend_first_coin(&mut h, &wallet, &other.address, 1_000);
+    let b = common::spend_first_coin(&mut h, &wallet, &other.address, 2_000);
     let parent = h.tip_header();
     let block = block_over(&mut h, &parent, vec![a.clone(), b]);
     let tree = h.chain.store().tree().unwrap();
@@ -542,7 +542,7 @@ fn a_side_chain_block_repeating_a_transaction_is_not_stored() {
     h.extend(Vec::new());
     let other = Wallet::new(&mut ChaCha20Rng::seed_from_u64(12_000));
     let wallet = h.miner.clone_for_test(0);
-    let tx = common::spend_first_note(&mut h, &wallet, &other.address, 1_000);
+    let tx = common::spend_first_coin(&mut h, &wallet, &other.address, 1_000);
     let fork_tree = h.chain.store().tree_at(fork.height).unwrap().unwrap();
     let (side, _) = h.make_block_on(&fork, &fork_tree, vec![tx.clone(), tx]);
     assert!(matches!(
@@ -710,7 +710,7 @@ fn transactions_are_indexed_by_id_while_in_the_main_chain() {
     h.extend(Vec::new());
     let other = Wallet::new(&mut ChaCha20Rng::seed_from_u64(14_000));
     let wallet = h.miner.clone_for_test(0);
-    let tx = common::spend_first_note(&mut h, &wallet, &other.address, 1_000);
+    let tx = common::spend_first_coin(&mut h, &wallet, &other.address, 1_000);
     let txid = tx.txid();
     assert_eq!(h.chain.store().transaction_location(&txid).unwrap(), None);
     let block = h.extend(vec![tx.clone()]);

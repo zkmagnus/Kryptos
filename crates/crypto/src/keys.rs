@@ -204,7 +204,7 @@ impl SpendValidatingKey {
     }
 }
 
-/// `nk`: the key that makes nullifiers unlinkable to note commitments.
+/// `nk`: the key that makes nullifiers unlinkable to coin commitments.
 #[derive(Clone, Debug, Zeroize, ZeroizeOnDrop)]
 pub struct NullifierKey(SecretBase);
 
@@ -265,7 +265,7 @@ impl CommitIvkRandomness {
 /// Byte length of a serialized full viewing key: `ak || nk || rivk`.
 pub const FULL_VIEWING_KEY_LEN: usize = 3 * ENCODED_LEN;
 
-/// The full viewing key: sees incoming and outgoing notes, cannot spend.
+/// The full viewing key: sees incoming and outgoing coins, cannot spend.
 #[derive(Clone, Debug, Zeroize, ZeroizeOnDrop)]
 pub struct FullViewingKey {
     #[zeroize(skip)]
@@ -338,7 +338,7 @@ impl FullViewingKey {
     }
 
     /// Derives the outgoing viewing key, which lets the holder decrypt the
-    /// notes this key sent.
+    /// coins this key sent.
     pub fn outgoing_viewing_key(&self) -> OutgoingViewingKey {
         let [rivk, ak, nk] = self.viewing_key_material();
         OutgoingViewingKey(blake2b_short(OVK, &[&rivk, &ak, &nk]))
@@ -346,7 +346,7 @@ impl FullViewingKey {
 
     /// The ML-KEM key pair derived from this full viewing key.
     ///
-    /// The decapsulation key can detect incoming notes but cannot spend.
+    /// The decapsulation key can detect incoming coins but cannot spend.
     /// One encapsulation key is shared across the key's diversified addresses.
     pub fn receiver_key(&self) -> (ReceiverKey, TransmissionKey) {
         let [rivk, ak, nk] = self.viewing_key_material();
@@ -387,7 +387,7 @@ impl FullViewingKey {
     }
 }
 
-/// `ivk`: detects and decrypts incoming notes. Never zero.
+/// `ivk`: detects and decrypts incoming coins. Never zero.
 #[derive(Clone, Debug, Zeroize, ZeroizeOnDrop)]
 pub struct IncomingViewingKey(SecretScalar);
 
@@ -413,7 +413,7 @@ impl IncomingViewingKey {
     }
 }
 
-/// `ovk`: decrypts the outgoing ciphertext of notes this key sent.
+/// `ovk`: decrypts the outgoing ciphertext of coins this key sent.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct OutgoingViewingKey([u8; OUTGOING_VIEWING_KEY_LEN]);
 

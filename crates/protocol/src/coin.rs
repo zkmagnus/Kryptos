@@ -1,211 +1,456 @@
-//! Monetary amounts represented as unsigned 64-bit values. [`ValueSum`] is a
-//! signed running total used when checking that a transaction balances.
+//! Coins: the unit of value in the shielded pool.
+//!
+//! A coin is `(recipient, value, rho, rseed)`. From `rseed` and `rho` the
+//! coin derives its commitment trapdoor `rcm` and the nullifier nonce `psi`.
+//!
+//! ```text
+//! cm  = Poseidon(g_d.x, pk_d.x, pack(value, signs), rho, psi, rcm)
+//! nf  = Poseidon(nk, rho, psi, cm)
+//! ```
+//!
+//! `rho` of an output coin is the nullifier of the coin spent in the same
+//! action, which is what makes nullifiers unique across the chain.
 
-use core::ops::{Add, Sub};
+use crypto::commitment::{CoinCommitInputs, CoinCommitTrapdoor, CoinCommitment};
+use crypto::encoding::{base_from_bytes, base_to_bytes, Encoded};
+use crypto::encryption::EphemeralSecretKey;
+use crypto::hash::{prf_expand, wide_to_base, wide_to_scalar};
+use crypto::keys::{DiversifiedTransmissionKey, Diversifier, NullifierKey};
+use crypto::pallas;
+use crypto::poseidon::nullifier;
+use ff::Field;
+use rand_core::{CryptoRng, RngCore};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::{Error, Result};
+use crate::amount::Amount;
+use crate::bytes::{Encodable, Reader, Writer};
+use crate::nullifier::Nullifier;
+use crate::Result;
 
-/// Smallest unit. Provisional: 8 decimal places.
-pub const RAWCOIN: u64 = 100_000_000;
+/// `PRF^expand` tag deriving `esk` from the random seed.
+const ESK_TAG: u8 = 0x04;
+/// `PRF^expand` tag deriving `rcm` from the random seed.
+const RCM_TAG: u8 = 0x05;
+/// `PRF^expand` tag deriving `psi` from the random seed.
+const PSI_TAG: u8 = 0x09;
 
-/// A non-negative amount represented as a `u64`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Rhombus(u64);
+/// Byte length of a random seed.
+pub const RANDOM_SEED_LEN: usize = 32;
 
-impl Rhombus {
-    /// Zero.
-    pub const ZERO: Self = Self(0);
-    /// The maximum representable amount.
-    pub const MAX: Self = Self(u64::MAX);
+/// The 32-byte seed from which a coin's randomness is derived.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct RandomSeed([u8; RANDOM_SEED_LEN]);
 
-    /// Wraps a raw value.
+impl RandomSeed {
+    /// Samples a fresh seed.
+    pub fn random(rng: &mut (impl RngCore + CryptoRng)) -> Self {
+        let mut bytes = [0u8; RANDOM_SEED_LEN];
+        rng.fill_bytes(&mut bytes);
+        Self(bytes)
+    }
+
+    /// Wraps raw bytes, as recovered from a decrypted coin plaintext.
+    pub fn from_bytes(bytes: [u8; RANDOM_SEED_LEN]) -> Self {
+        Self(bytes)
+    }
+
+    /// The raw bytes, for the coin plaintext.
+    pub fn as_bytes(&self) -> &[u8; RANDOM_SEED_LEN] {
+        &self.0
+    }
+
+    /// `esk`: the ephemeral secret used to encrypt this coin.
+    pub fn esk(&self, rho: &Rho) -> EphemeralSecretKey {
+        EphemeralSecretKey::from_scalar(wide_to_scalar(&self.expand(ESK_TAG, rho)))
+    }
+
+    fn expand(&self, tag: u8, rho: &Rho) -> [u8; crypto::hash::WIDE_OUTPUT_LEN] {
+        let mut input = [0u8; 33];
+        let (t, r) = input.split_at_mut(1);
+        t.copy_from_slice(&[tag]);
+        r.copy_from_slice(&rho.to_bytes());
+        prf_expand(&self.0, &input)
+    }
+
+    /// `rcm`: the coin commitment trapdoor.
+    pub fn rcm(&self, rho: &Rho) -> CoinCommitTrapdoor {
+        CoinCommitTrapdoor::from_base(wide_to_base(&self.expand(RCM_TAG, rho)))
+    }
+
+    /// `psi`: the nullifier nonce.
+    pub fn psi(&self, rho: &Rho) -> pallas::Base {
+        wide_to_base(&self.expand(PSI_TAG, rho))
+    }
+}
+
+impl core::fmt::Debug for RandomSeed {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("RandomSeed(<redacted>)")
+    }
+}
+
+/// `rho`: the uniqueness nonce of a coin, the nullifier of the coin that
+/// was spent to create it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rho(pallas::Base);
+
+impl Rho {
+    /// A coin created by spending the coin with nullifier `nf`.
     ///
     /// # Errors
-    /// Every `u64` is representable; retained as a fallible constructor for API compatibility.
-    pub fn from_raw(raw: u64) -> Result<Self> {
-        Ok(Self(raw))
+    /// Cannot fail for a well-formed nullifier.
+    pub fn from_nullifier(nf: &Nullifier) -> Result<Self> {
+        nf.to_base().map(Self)
     }
 
-    /// The raw value in smallest units.
-    pub fn raw(self) -> u64 {
-        self.0
+    /// Wraps a field element directly, for coinbase coins and tests.
+    pub fn from_base(value: pallas::Base) -> Self {
+        Self(value)
     }
 
-    /// Converts to a signed balance when representable.
-    pub fn to_i64(self) -> Result<i64> {
-        i64::try_from(self.0).map_err(|_| Error::AmountOutOfRange)
+    /// A random `rho`, for dummy coins that are never spent.
+    pub fn random(rng: &mut (impl RngCore + CryptoRng)) -> Self {
+        Self(pallas::Base::random(rng))
     }
 
-    /// Little-endian encoding, used inside note commitments.
-    pub fn to_le_bytes(self) -> [u8; 8] {
-        self.0.to_le_bytes()
+    /// Canonical encoding.
+    pub fn to_bytes(&self) -> [u8; 32] {
+        base_to_bytes(&self.0)
     }
 
-    /// Checked addition.
+    /// The field element.
+    pub fn inner(&self) -> &pallas::Base {
+        &self.0
+    }
+}
+
+/// `cmx`: the x-coordinate of a coin commitment, as stored in the tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExtractedCoinCommitment(pallas::Base);
+
+impl ExtractedCoinCommitment {
+    /// Extracts from a full commitment.
+    pub fn from_commitment(cm: &CoinCommitment) -> Self {
+        Self(*cm.inner())
+    }
+
+    /// The field element.
+    pub fn inner(&self) -> &pallas::Base {
+        &self.0
+    }
+
+    /// Canonical encoding.
+    pub fn to_bytes(&self) -> Encoded {
+        base_to_bytes(&self.0)
+    }
+
+    /// Parses a canonical encoding.
     ///
     /// # Errors
-    /// Returns [`Error::AmountOutOfRange`] if the sum overflows `u64`.
-    pub fn checked_add(self, other: Self) -> Result<Self> {
-        self.0
-            .checked_add(other.0)
-            .map(Self)
-            .ok_or(Error::AmountOutOfRange)
+    /// Fails if the bytes are not a canonical base field element.
+    pub fn from_bytes(bytes: &Encoded) -> Result<Self> {
+        Ok(Self(base_from_bytes(bytes)?))
+    }
+}
+
+impl Encodable for ExtractedCoinCommitment {
+    fn write(&self, w: &mut Writer) {
+        w.put(&self.to_bytes());
+    }
+    fn read(r: &mut Reader<'_>) -> Result<Self> {
+        Self::from_bytes(&r.take_array()?)
+    }
+}
+
+/// A coin in the shielded pool.
+#[derive(Clone, Debug)]
+pub struct Coin {
+    diversifier: Diversifier,
+    pk_d: DiversifiedTransmissionKey,
+    value: Amount,
+    rho: Rho,
+    rseed: RandomSeed,
+}
+
+impl Coin {
+    /// Builds a coin from its parts.
+    pub fn new(
+        diversifier: Diversifier,
+        pk_d: DiversifiedTransmissionKey,
+        value: Amount,
+        rho: Rho,
+        rseed: RandomSeed,
+    ) -> Self {
+        Self {
+            diversifier,
+            pk_d,
+            value,
+            rho,
+            rseed,
+        }
     }
 
-    /// Checked subtraction.
+    /// The recipient address.
+    pub fn diversifier(&self) -> &Diversifier {
+        &self.diversifier
+    }
+
+    /// The diversified transmission key.
+    pub fn pk_d(&self) -> &DiversifiedTransmissionKey {
+        &self.pk_d
+    }
+
+    /// The value.
+    pub fn value(&self) -> Amount {
+        self.value
+    }
+
+    /// The uniqueness nonce.
+    pub fn rho(&self) -> &Rho {
+        &self.rho
+    }
+
+    /// The random seed.
+    pub fn rseed(&self) -> &RandomSeed {
+        &self.rseed
+    }
+
+    /// `psi`, derived from the seed and `rho`.
+    pub fn psi(&self) -> pallas::Base {
+        self.rseed.psi(&self.rho)
+    }
+
+    /// The ephemeral secret key used to encrypt this coin.
+    pub fn esk(&self) -> EphemeralSecretKey {
+        self.rseed.esk(&self.rho)
+    }
+
+    /// The coin commitment `cm`.
     ///
     /// # Errors
-    /// Returns [`Error::AmountOutOfRange`] if the result would be negative.
-    pub fn checked_sub(self, other: Self) -> Result<Self> {
-        self.0
-            .checked_sub(other.0)
-            .map(Self)
-            .ok_or(Error::AmountOutOfRange)
-    }
-}
-
-impl TryFrom<u64> for Rhombus {
-    type Error = Error;
-    fn try_from(raw: u64) -> Result<Self> {
-        Self::from_raw(raw)
-    }
-}
-
-impl From<Rhombus> for u64 {
-    fn from(amount: Rhombus) -> Self {
-        amount.raw()
-    }
-}
-
-/// A signed sum of amounts. `i128` cannot overflow with fewer than
-/// `2^64` terms, so arithmetic here is unchecked by design.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ValueSum(i128);
-
-impl ValueSum {
-    /// Zero.
-    pub const ZERO: Self = Self(0);
-
-    /// Whether the sum is exactly zero, i.e. inputs equal outputs.
-    pub fn is_balanced(self) -> bool {
-        self.0 == 0
+    /// Fails if the recipient's diversifier is invalid.
+    pub fn commitment(&self) -> Result<CoinCommitment> {
+        let g_d = self.diversifier.base()?;
+        let inputs = CoinCommitInputs {
+            g_d: &g_d,
+            pk_d: self.pk_d().as_point(),
+            value: self.value.raw(),
+            rho: &self.rho.0,
+            psi: &self.psi(),
+        };
+        Ok(CoinCommitment::commit(&inputs, &self.rseed.rcm(&self.rho)))
     }
 
-    /// The raw signed value.
-    pub fn raw(self) -> i128 {
-        self.0
-    }
-
-    /// Sums amounts into a signed total. Cannot overflow, see the type doc.
-    #[allow(clippy::arithmetic_side_effects)] // see type-level doc on overflow
-    pub fn sum(amounts: impl IntoIterator<Item = Rhombus>) -> Self {
-        amounts
-            .into_iter()
-            .fold(Self::ZERO, |acc, amount| acc + amount)
-    }
-
-    /// `self - other`.
-    #[allow(clippy::arithmetic_side_effects)] // see type-level doc on overflow
-    #[must_use]
-    pub fn minus_sum(self, other: Self) -> Self {
-        Self(self.0 - other.0)
-    }
-
-    /// `self - amount`, by value.
-    #[allow(clippy::arithmetic_side_effects)] // see type-level doc on overflow
-    #[must_use]
-    pub fn minus(self, amount: Rhombus) -> Self {
-        self - amount
-    }
-
-    /// `self + amount`, by value.
-    #[allow(clippy::arithmetic_side_effects)] // see type-level doc on overflow
-    #[must_use]
-    pub fn plus(self, amount: Rhombus) -> Self {
-        self + amount
-    }
-
-    /// Converts to an `i64` for value commitments.
+    /// `cmx`, the extracted coin commitment.
     ///
     /// # Errors
-    /// Returns [`Error::AmountOutOfRange`] if the magnitude exceeds `i64`.
-    pub fn to_i64(self) -> Result<i64> {
-        i64::try_from(self.0).map_err(|_| Error::AmountOutOfRange)
+    /// Propagates commitment errors.
+    pub fn cmx(&self) -> Result<ExtractedCoinCommitment> {
+        self.commitment()
+            .map(|cm| ExtractedCoinCommitment::from_commitment(&cm))
+    }
+
+    /// The nullifier that spending this coin reveals.
+    ///
+    /// # Errors
+    /// Propagates commitment errors.
+    pub fn nullifier(&self, nk: &NullifierKey) -> Result<Nullifier> {
+        let cm = self.commitment()?;
+        Ok(Nullifier::from_base(&nullifier(
+            &nk.expose(),
+            &self.rho.0,
+            &self.psi(),
+            cm.inner(),
+        )))
     }
 }
 
-#[allow(clippy::arithmetic_side_effects)] // see type-level doc on overflow
-impl Add<Rhombus> for ValueSum {
-    type Output = Self;
-    fn add(self, rhs: Rhombus) -> Self {
-        Self(self.0 + i128::from(rhs.0))
+impl Encodable for Coin {
+    fn write(&self, w: &mut Writer) {
+        w.put(self.diversifier.as_bytes())
+            .put(&self.pk_d.to_bytes())
+            .put_u64_le(self.value.raw())
+            .put(&self.rho.to_bytes())
+            .put(self.rseed.as_bytes());
     }
-}
-
-#[allow(clippy::arithmetic_side_effects)] // see type-level doc on overflow
-impl Sub<Rhombus> for ValueSum {
-    type Output = Self;
-    fn sub(self, rhs: Rhombus) -> Self {
-        Self(self.0 - i128::from(rhs.0))
+    fn read(r: &mut Reader<'_>) -> Result<Self> {
+        let diversifier = Diversifier::from_bytes(r.take_array()?);
+        diversifier.base()?; // validation diversifier
+        let pk_d = DiversifiedTransmissionKey::from_bytes(&r.take_array()?)?;
+        let value = Amount::from_raw(r.take_u64_le()?)?;
+        let rho = Rho::from_base(base_from_bytes(&r.take_array()?)?);
+        let rseed = RandomSeed::from_bytes(r.take_array()?);
+        Ok(Self::new(diversifier, pk_d, value, rho, rseed))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::address::RhombusAddress as Address;
+    use crate::amount::Amount;
+    use crypto::keys::{Diversifier, FullViewingKey, SpendingKey};
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha20Rng;
+
     use super::*;
 
-    fn amt(raw: u64) -> Rhombus {
-        Rhombus::from_raw(raw).unwrap()
+    struct Fixture {
+        fvk: FullViewingKey,
+        coin: Coin,
+    }
+
+    fn fixture(seed: u64) -> Fixture {
+        let mut rng = ChaCha20Rng::seed_from_u64(seed);
+        let fvk = FullViewingKey::derive(&SpendingKey::random(&mut rng)).unwrap();
+        let recipient = Address::derive(&fvk, Diversifier::random(&mut rng)).unwrap();
+        let rho = Rho::from_base(pallas::Base::from(seed));
+        let coin = Coin::new(
+            recipient,
+            Amount::from_raw(1_000).unwrap(),
+            rho,
+            RandomSeed::random(&mut rng),
+        );
+        Fixture { fvk, coin }
     }
 
     #[test]
-    fn full_u64_amount_range_is_representable() {
-        assert_eq!(Rhombus::from_raw(u64::MAX), Ok(Rhombus::MAX));
-        assert_eq!(Rhombus::try_from(0), Ok(Rhombus::ZERO));
+    fn commitment_is_deterministic() {
+        let f = fixture(1);
+        assert_eq!(f.coin.commitment().unwrap(), f.coin.commitment().unwrap());
     }
 
     #[test]
-    fn checked_add_detects_u64_overflow() {
-        assert_eq!(amt(1).checked_add(amt(2)), Ok(amt(3)));
-        assert_eq!(
-            Rhombus::MAX.checked_add(amt(1)),
-            Err(Error::AmountOutOfRange)
+    fn commitment_changes_with_every_field() {
+        let f = fixture(2);
+        let base = f.coin.commitment().unwrap();
+        let mut rng = ChaCha20Rng::seed_from_u64(99);
+
+        let other_value = Coin::new(
+            f.coin.recipient,
+            Amount::from_raw(1_001).unwrap(),
+            f.coin.rho,
+            f.coin.rseed.clone(),
+        );
+        assert_ne!(base, other_value.commitment().unwrap(), "value");
+
+        let other_rho = Coin::new(
+            f.coin.recipient,
+            f.coin.value,
+            Rho::from_base(pallas::Base::from(7u64)),
+            f.coin.rseed.clone(),
+        );
+        assert_ne!(base, other_rho.commitment().unwrap(), "rho");
+
+        let other_seed = Coin::new(
+            f.coin.recipient,
+            f.coin.value,
+            f.coin.rho,
+            RandomSeed::random(&mut rng),
+        );
+        assert_ne!(base, other_seed.commitment().unwrap(), "rseed");
+
+        let other_recipient = Coin::new(
+            fixture(3).coin.recipient,
+            f.coin.value,
+            f.coin.rho,
+            f.coin.rseed.clone(),
+        );
+        assert_ne!(base, other_recipient.commitment().unwrap(), "recipient");
+    }
+
+    #[test]
+    fn nullifier_is_deterministic_and_key_dependent() {
+        let f = fixture(4);
+        let nf = f.coin.nullifier(f.fvk.nk()).unwrap();
+        assert_eq!(nf, f.coin.nullifier(f.fvk.nk()).unwrap());
+        let other_key = fixture(5).fvk;
+        assert_ne!(nf, f.coin.nullifier(other_key.nk()).unwrap());
+    }
+
+    #[test]
+    fn distinct_coins_have_distinct_nullifiers() {
+        let (a, b) = (fixture(6), fixture(7));
+        assert_ne!(
+            a.coin.nullifier(a.fvk.nk()).unwrap(),
+            b.coin.nullifier(a.fvk.nk()).unwrap()
         );
     }
 
     #[test]
-    fn checked_sub_rejects_negative() {
-        assert_eq!(amt(3).checked_sub(amt(2)), Ok(amt(1)));
-        assert_eq!(amt(2).checked_sub(amt(3)), Err(Error::AmountOutOfRange));
+    fn rho_chains_from_nullifier() {
+        let f = fixture(8);
+        let nf = f.coin.nullifier(f.fvk.nk()).unwrap();
+        let rho = Rho::from_nullifier(&nf).unwrap();
+        assert_eq!(rho.to_bytes(), nf.to_bytes());
     }
 
     #[test]
-    fn value_sum_balances_when_inputs_equal_outputs() {
-        let sum = ValueSum::ZERO + amt(10) + amt(5) - amt(15);
-        assert!(sum.is_balanced());
-        assert_eq!(sum.to_i64(), Ok(0));
+    fn rcm_and_psi_depend_on_rho() {
+        let seed = RandomSeed::from_bytes([9; 32]);
+        let (r1, r2) = (
+            Rho::from_base(pallas::Base::from(1u64)),
+            Rho::from_base(pallas::Base::from(2u64)),
+        );
+        assert_ne!(seed.psi(&r1), seed.psi(&r2));
+        let coin = |rho| {
+            Coin::new(
+                fixture(9).coin.recipient,
+                Amount::ZERO,
+                rho,
+                RandomSeed::from_bytes([9; 32]),
+            )
+        };
+        assert_ne!(
+            coin(r1).commitment().unwrap(),
+            coin(r2).commitment().unwrap()
+        );
     }
 
     #[test]
-    fn value_sum_helpers_match_operators() {
-        let total = ValueSum::sum([amt(1), amt(2), amt(3)]);
-        assert_eq!(total, ValueSum::ZERO + amt(1) + amt(2) + amt(3));
-        assert_eq!(total.plus(amt(4)), total + amt(4));
-        assert_eq!(total.minus_sum(ValueSum::sum([amt(6)])), ValueSum::ZERO);
-        assert_eq!(total.minus(amt(6)), ValueSum::ZERO);
+    fn esk_differs_from_rcm_and_depends_on_rho() {
+        let seed = RandomSeed::from_bytes([3; RANDOM_SEED_LEN]);
+        let (r1, r2) = (
+            Rho::from_base(pallas::Base::from(1u64)),
+            Rho::from_base(pallas::Base::from(2u64)),
+        );
+        assert_ne!(seed.esk(&r1).to_bytes(), seed.esk(&r2).to_bytes());
+        assert_eq!(seed.esk(&r1).to_bytes(), seed.esk(&r1).to_bytes());
+        assert_eq!(
+            fixture(10).coin.esk().to_bytes(),
+            fixture(10).coin.esk().to_bytes()
+        );
     }
 
     #[test]
-    fn value_sum_can_go_negative() {
-        let sum = ValueSum::ZERO - amt(7);
-        assert!(!sum.is_balanced());
-        assert_eq!(sum.raw(), -7);
-        assert_eq!(sum.to_i64(), Ok(-7));
+    fn cmx_matches_extracted_commitment_and_roundtrips() {
+        let f = fixture(11);
+        let cmx = f.coin.cmx().unwrap();
+        assert_eq!(cmx.inner(), f.coin.commitment().unwrap().inner());
+        assert_eq!(ExtractedCoinCommitment::from_slice(&cmx.to_vec()), Ok(cmx));
+        assert!(ExtractedCoinCommitment::from_bytes(&[0xFF; 32]).is_err());
     }
 
     #[test]
-    fn le_bytes_match_raw() {
-        assert_eq!(amt(0x0102).to_le_bytes(), [2, 1, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(u64::from(amt(9)), 9);
+    fn random_rho_differs_per_call() {
+        let mut rng = ChaCha20Rng::seed_from_u64(12);
+        assert_ne!(Rho::random(&mut rng), Rho::random(&mut rng));
+    }
+
+    #[test]
+    fn coin_encoding_roundtrips_and_preserves_the_commitment() {
+        let f = fixture(13);
+        let decoded = Coin::from_slice(&f.coin.to_vec()).unwrap();
+        assert_eq!(decoded.recipient(), f.coin.recipient());
+        assert_eq!(decoded.value(), f.coin.value());
+        assert_eq!(decoded.rho(), f.coin.rho());
+        assert_eq!(decoded.cmx().unwrap(), f.coin.cmx().unwrap());
+    }
+
+    #[test]
+    fn random_seed_debug_is_redacted() {
+        assert_eq!(
+            format!("{:?}", RandomSeed::from_bytes([0; 32])),
+            "RandomSeed(<redacted>)"
+        );
     }
 }

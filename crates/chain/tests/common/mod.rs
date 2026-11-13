@@ -27,8 +27,8 @@ use protocol::builder::{Builder, OutputInfo, SpendInfo};
 use protocol::coin::Rhombus;
 use protocol::consensus::{subsidy, BranchId, BLOCK_VERSION};
 use protocol::memo::Memo;
-use protocol::note::{Note, Rho};
-use protocol::note_encryption::decrypt_note_with_ivk;
+use protocol::coin::{Coin, Rho};
+use protocol::coin_encryption::decrypt_coin_with_ivk;
 use protocol::transaction::Transaction;
 use protocol::tree_order::tree_transactions;
 use rand::SeedableRng;
@@ -51,8 +51,8 @@ pub struct Wallet {
     pub address: RhombusAddress,
     /// Every commitment on the chain, in tree order, for witnesses.
     pub tree: MerkleTree,
-    /// Notes this wallet owns, with their tree positions.
-    pub notes: Vec<(Note, u64)>,
+    /// Coins this wallet owns, with their tree positions.
+    pub coins: Vec<(Coin, u64)>,
 }
 
 impl Wallet {
@@ -68,7 +68,7 @@ impl Wallet {
             transmission_key,
             address,
             tree: MerkleTree::new(),
-            notes: Vec::new(),
+            coins: Vec::new(),
         }
     }
 
@@ -81,27 +81,26 @@ impl Wallet {
                 let body = action.body();
                 let position = self.tree.append(*body.cmx().inner()).unwrap();
                 let rho = Rho::from_nullifier(body.nullifier()).unwrap();
-                if let Ok((note, _)) = decrypt_note_with_ivk(
+                if let Ok((coin, _)) = decrypt_coin_with_ivk(
                     &ivk,
                     &self.receiver_key,
                     &self.transmission_key,
-                    body.encrypted_note(),
+                    body.encrypted_coin(),
                     rho,
                     body.cmx(),
-                )
-                {
-                    if note.value().raw() > 0 {
-                        self.notes.push((note, position));
+                ) {
+                    if coin.value().raw() > 0 {
+                        self.coins.push((coin, position));
                     }
                 }
             }
         }
     }
 
-    /// A copy whose first note is note `index`, for spending helpers.
+    /// A copy whose first coin is coin `index`, for spending helpers.
     pub fn clone_for_test(&self, index: usize) -> Self {
-        let mut notes = self.notes.clone();
-        notes.swap(0, index);
+        let mut coins = self.coins.clone();
+        coins.swap(0, index);
         Self {
             sk: self.sk.clone(),
             fvk: FullViewingKey::derive(&self.sk).unwrap(),
@@ -109,12 +108,12 @@ impl Wallet {
             transmission_key: self.fvk.receiver_key().1,
             address: self.address,
             tree: self.tree.clone(),
-            notes,
+            coins,
         }
     }
 
     pub fn balance(&self) -> u64 {
-        self.notes.iter().map(|(n, _)| n.value().raw()).sum()
+        self.coins.iter().map(|(n, _)| n.value().raw()).sum()
     }
 }
 
@@ -150,7 +149,7 @@ impl Harness {
         )
         .unwrap();
         let miner = Wallet::new(&mut rng);
-        // Genesis is empty; first notes arrive through mined coinbases.
+        // Genesis is empty; first coins arrive through mined coinbases.
         Self {
             spacing: params.block_interval,
             chain,
@@ -291,33 +290,33 @@ impl Harness {
     }
 }
 
-/// A regular transaction paying `pay` from the wallet's first note to
+/// A regular transaction paying `pay` from the wallet's first coin to
 /// `recipient`, built against the current tip and signed for the branch
 /// of the next block.
-pub fn spend_first_note(
+pub fn spend_first_coin(
     h: &mut Harness,
     wallet: &Wallet,
     recipient: &RhombusAddress,
     pay: u64,
 ) -> Transaction {
     let branch = h.chain.params().branch_at(h.tip_header().height + 1);
-    spend_first_note_for(h, wallet, recipient, pay, branch)
+    spend_first_coin_for(h, wallet, recipient, pay, branch)
 }
 
-/// As [`spend_first_note`], signed for an explicit `branch`.
-pub fn spend_first_note_for(
+/// As [`spend_first_coin`], signed for an explicit `branch`.
+pub fn spend_first_coin_for(
     h: &mut Harness,
     wallet: &Wallet,
     recipient: &RhombusAddress,
     pay: u64,
     branch: BranchId,
 ) -> Transaction {
-    let (note, position) = wallet.notes[0].clone();
+    let (coin, position) = wallet.coins[0].clone();
     let path = wallet.tree.path(position).unwrap();
     let parent = h.tip_header();
-    let change = note.value().raw() - pay;
+    let change = coin.value().raw() - pay;
     let mut b = Builder::new(parent.commitment_root);
-    b.add_spend(SpendInfo::new(wallet.sk.clone(), note, path))
+    b.add_spend(SpendInfo::new(wallet.sk.clone(), coin, path))
         .unwrap();
     b.add_output(OutputInfo::new(
         *recipient,
@@ -339,7 +338,7 @@ pub fn spend_first_note_for(
 }
 
 /// A regular transaction with a nonzero private fee opening.
-pub fn spend_first_note_with_fee(
+pub fn spend_first_coin_with_fee(
     h: &mut Harness,
     wallet: &Wallet,
     recipient: &RhombusAddress,
@@ -347,12 +346,12 @@ pub fn spend_first_note_with_fee(
     fee: u64,
 ) -> Transaction {
     let branch = h.chain.params().branch_at(h.tip_header().height + 1);
-    let (note, position) = wallet.notes[0].clone();
+    let (coin, position) = wallet.coins[0].clone();
     let path = wallet.tree.path(position).unwrap();
     let parent = h.tip_header();
-    let change = note.value().raw() - pay - fee;
+    let change = coin.value().raw() - pay - fee;
     let mut b = Builder::new(parent.commitment_root);
-    b.add_spend(SpendInfo::new(wallet.sk.clone(), note, path))
+    b.add_spend(SpendInfo::new(wallet.sk.clone(), coin, path))
         .unwrap();
     b.add_output(OutputInfo::new(
         *recipient,
