@@ -2,7 +2,7 @@
 
 #![allow(clippy::arithmetic_side_effects)] // gate expressions are symbolic
 
-use crypto::poseidon::{IVK_INPUTS, COIN_COMMIT_INPUTS, NULLIFIER_INPUTS};
+use crypto::poseidon::{COIN_COMMIT_INPUTS, IVK_INPUTS, NULLIFIER_INPUTS};
 use halo2_proofs::circuit::{Layouter, Value};
 use halo2_proofs::plonk::{
     Advice, Column, ConstraintSystem, Constraints, Error, Instance, Selector,

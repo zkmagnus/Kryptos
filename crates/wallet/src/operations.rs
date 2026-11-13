@@ -3,7 +3,7 @@
 //! restart and is rebuilt if its transaction fails to be mined.
 
 use protocol::address::RhombusAddress;
-use protocol::amount::Amount;
+use protocol::amount::RawCoin;
 use protocol::bytes::{Encodable, Reader, Writer};
 use protocol::fee::FeeOpening;
 use protocol::memo::Memo;
@@ -174,7 +174,7 @@ impl Encodable for Payment {
     fn read(r: &mut Reader<'_>) -> protocol::Result<Self> {
         Ok(Self {
             recipient: RhombusAddress::read(r)?,
-            amount: Amount::from_raw(r.take_u64_le()?)?,
+            amount: RawCoin::from_raw(r.take_u64_le()?)?,
             memo: Memo::read(r)?,
         })
     }
@@ -331,7 +331,7 @@ impl Encodable for Operation {
 #[cfg(test)]
 mod tests {
     use crypto::keys::SpendingKey;
-    use protocol::amount::Amount;
+    use protocol::amount::RawCoin;
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
 
@@ -348,12 +348,12 @@ mod tests {
             vec![
                 Payment {
                     recipient: keys.default_address().unwrap(),
-                    amount: Amount::from_raw(1_000).unwrap(),
+                    amount: RawCoin::from_raw(1_000).unwrap(),
                     memo: Memo::from_text("rent").unwrap(),
                 },
                 Payment {
                     recipient: keys.address(7u64.into()).unwrap(),
-                    amount: Amount::from_raw(2_000).unwrap(),
+                    amount: RawCoin::from_raw(2_000).unwrap(),
                     memo: Memo::empty(),
                 },
             ],

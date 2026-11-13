@@ -34,7 +34,7 @@ impl fmt::Display for DecodeError {
 impl std::error::Error for DecodeError {}
 
 /// Decode the only supported program call. Recipient and amount remain
-/// private in the transaction's notes and are checked by the Rhombus proof.
+/// private in the transaction's coins and are checked by the Rhombus proof.
 pub fn decode(opcode: u8, payload: &[u8]) -> Result<TransferCall, DecodeError> {
     if opcode != TRANSFER_OPCODE {
         return Err(DecodeError::UnknownOpcode);

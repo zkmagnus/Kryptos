@@ -14,7 +14,7 @@ pub mod halo2 {
     pub use circuit::{Error, Fp};
 }
 
-pub use halo2::{ActionWitness, Error, Fp, CoinWitness, PublicInputs, SpendWitness};
+pub use halo2::{ActionWitness, CoinWitness, Error, Fp, PublicInputs, SpendWitness};
 
 /// Version of the SystemCall circuit adapter API, not the consensus version.
 pub const API_VERSION: u16 = 1;

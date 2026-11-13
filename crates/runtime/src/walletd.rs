@@ -1,4 +1,4 @@
-//! The wallet daemon `Amount-wallet-rpc`: a long-running process that
+//! The wallet daemon `RawCoin-wallet-rpc`: a long-running process that
 //! holds one wallet file, keeps it synced from a node, serves the wallet
 //! methods over JSON-RPC, and carries send operations from request to
 //! confirmation, rebuilding them if their transaction is not mined.
@@ -18,7 +18,7 @@ use chain::params::ChainParams;
 use clap::Parser;
 use crypto::encoding::to_hex;
 use protocol::address::RhombusAddress;
-use protocol::amount::Amount;
+use protocol::amount::RawCoin;
 use protocol::bytes::Encodable;
 use protocol::consensus::next_height;
 use protocol::memo::Memo;
@@ -72,14 +72,14 @@ pub const METHODS: &[&str] = &[
     "help",
 ];
 
-/// Command line of `Amount-wallet-rpc`.
+/// Command line of `RawCoin-wallet-rpc`.
 #[derive(Parser, Debug)]
 #[command(
-    name = "Amount-wallet-rpc",
+    name = "RawCoin-wallet-rpc",
     about = "Wallet daemon: sync, addresses, sends, JSON-RPC"
 )]
 pub struct Args {
-    /// Wallet file, created with `Amount create` or the desktop app;
+    /// Wallet file, created with `RawCoin create` or the desktop app;
     /// defaults to `<user data>/<network>/wallet.redb`.
     #[arg(long)]
     pub wallet: Option<PathBuf>,
@@ -98,7 +98,7 @@ pub struct Args {
     )]
     pub node_token: Option<String>,
     /// File holding the node's token; defaults to the `rpc.token` a
-    /// default `Amount run` writes, `<user data>/<network>/chain/rpc.token`.
+    /// default `RawCoin run` writes, `<user data>/<network>/chain/rpc.token`.
     #[arg(long)]
     pub node_token_file: Option<PathBuf>,
     /// Address to serve the wallet's JSON-RPC on.
@@ -265,7 +265,7 @@ fn node_token(text: Option<String>, file: Option<PathBuf>, network: Network) -> 
     }
 }
 
-/// Runs the `Amount-wallet-rpc` command line: opens the wallet, starts the
+/// Runs the `RawCoin-wallet-rpc` command line: opens the wallet, starts the
 /// daemon and waits for a stop request.
 ///
 /// # Errors
@@ -284,7 +284,7 @@ pub async fn main(args: Args) -> Result<()> {
     // an empty file behind a mistyped or missing path.
     if !wallet_path.try_exists()? {
         return Err(Error::Argument(format!(
-            "no wallet at {}; create one with the desktop app or `Amount create --wallet <file>`",
+            "no wallet at {}; create one with the desktop app or `RawCoin create --wallet <file>`",
             wallet_path.display()
         )));
     }
@@ -313,7 +313,7 @@ pub async fn main(args: Args) -> Result<()> {
     })
     .await?;
     logging::info(&format!(
-        "Amount-wallet-rpc up on the {} network, json-rpc http://{}/",
+        "RawCoin-wallet-rpc up on the {} network, json-rpc http://{}/",
         args.network, handle.addr
     ));
     shutdown.requested().await;
@@ -824,7 +824,7 @@ fn is_cancellable(op: &Operation) -> bool {
 
 /// A memo as text when it is text, else as hex, else null when empty.
 /// An amount given as a decimal string or a number, in smallest units.
-fn parse_amount(value: Option<&Value>) -> core::result::Result<Amount, RpcError> {
+fn parse_amount(value: Option<&Value>) -> core::result::Result<RawCoin, RpcError> {
     let raw = match value {
         Some(Value::String(text)) => text
             .parse::<u64>()
@@ -834,7 +834,7 @@ fn parse_amount(value: Option<&Value>) -> core::result::Result<Amount, RpcError>
             .ok_or_else(|| RpcError::invalid_params("amount must be a whole number"))?,
         _ => return Err(RpcError::invalid_params("amount")),
     };
-    Ok(Amount::from_raw(raw)?)
+    Ok(RawCoin::from_raw(raw)?)
 }
 
 impl Dispatch for WalletDaemon {
@@ -1022,7 +1022,7 @@ impl WalletDaemon {
             })?;
         let sent = recipients
             .iter()
-            .try_fold(Amount::ZERO, |acc, p| acc.checked_add(p.amount))
+            .try_fold(RawCoin::ZERO, |acc, p| acc.checked_add(p.amount))
             .map_err(|e| RpcError::from(Error::from(e)))?;
         Ok(json!({
             "total": sent.raw().to_string(),
@@ -1112,7 +1112,7 @@ mod tests {
 
     #[test]
     fn the_wallet_daemon_defaults_to_the_main_network() {
-        let args = Args::try_parse_from(["Amount-wallet-rpc"]).unwrap();
+        let args = Args::try_parse_from(["RawCoin-wallet-rpc"]).unwrap();
         assert_eq!(args.network, Network::Main);
     }
 
@@ -1157,7 +1157,7 @@ mod tests {
             .add_operation(
                 vec![Payment {
                     recipient: wallet.keys().address(1u64.into()).unwrap(),
-                    amount: Amount::from_raw(1_000).unwrap(),
+                    amount: RawCoin::from_raw(1_000).unwrap(),
                     memo: Memo::empty(),
                 }],
                 1,
@@ -1175,7 +1175,7 @@ mod tests {
         builder
             .add_output(protocol::builder::OutputInfo::new(
                 keys.default_address().unwrap(),
-                Amount::ZERO,
+                RawCoin::ZERO,
                 Memo::empty(),
                 None,
             ))
@@ -1183,7 +1183,7 @@ mod tests {
         builder
             .build_coinbase(
                 &ProvingKey::build().unwrap(),
-                Amount::ZERO,
+                RawCoin::ZERO,
                 Network::Test.params().genesis_branch,
                 &mut rng,
             )
@@ -1199,7 +1199,7 @@ mod tests {
         };
         op.transaction = Some(tx.to_vec());
         op.fee_opening = Some(protocol::fee::FeeOpening::new(
-            Amount::ZERO,
+            RawCoin::ZERO,
             ValueCommitTrapdoor::zero(),
         ));
         op.locked = vec![0];
@@ -1289,7 +1289,7 @@ mod tests {
                         transaction: tx.clone(),
                         spent: vec![0],
                         fee_opening: protocol::fee::FeeOpening::new(
-                            Amount::ZERO,
+                            RawCoin::ZERO,
                             ValueCommitTrapdoor::zero(),
                         ),
                     },

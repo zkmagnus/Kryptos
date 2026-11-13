@@ -13,13 +13,13 @@ use halo2_proofs::circuit::{Layouter, SimpleFloorPlanner, Value};
 use halo2_proofs::plonk::{Advice, Circuit, Column, ConstraintSystem, Error, Fixed, Instance};
 use pasta_curves::pallas;
 
+use crate::gadgets::coin::{
+    net_witness, CoinGadgetConfig, CoinValues, CommittedCoin, COIN_ADVICES,
+};
 use crate::gadgets::ecc::{
     any_coords, coords, EccGadgetConfig, FullBase, ECC_ADVICES, ECC_LAGRANGE,
 };
 use crate::gadgets::merkle::{position_bits, MerkleConfig};
-use crate::gadgets::coin::{
-    net_witness, CommittedCoin, CoinGadgetConfig, CoinValues, COIN_ADVICES,
-};
 use crate::gadgets::poseidon::{self, WIDTH};
 use crate::gadgets::range::check_value;
 use crate::gadgets::witness::Cell;

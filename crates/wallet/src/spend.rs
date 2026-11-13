@@ -1,7 +1,7 @@
 //! Selecting coins and building a payment.
 
 use protocol::address::RhombusAddress;
-use protocol::amount::Amount;
+use protocol::amount::RawCoin;
 use protocol::builder::{Builder, OutputInfo, SpendInfo};
 use protocol::consensus::action_class_for;
 use protocol::consensus::{BranchId, MAX_ACTIONS};
@@ -27,7 +27,7 @@ pub const MAX_RECIPIENTS: usize = MAX_ACTIONS - 1;
 /// or a protocol error if the spends would exceed the largest class.
 pub fn select_coins<'a>(
     unspent: &[&'a OwnedCoin],
-    amount: Amount,
+    amount: RawCoin,
     outputs: usize,
 ) -> Result<Vec<&'a OwnedCoin>> {
     let mut sorted: Vec<&OwnedCoin> = unspent.to_vec();
@@ -61,10 +61,10 @@ fn action_class(spends: usize, outputs: usize) -> Result<usize> {
 ///
 /// # Errors
 /// Returns a protocol error if the sum overflows the money range.
-fn total(payments: &[Payment]) -> Result<Amount> {
+fn total(payments: &[Payment]) -> Result<RawCoin> {
     Ok(payments
         .iter()
-        .try_fold(Amount::ZERO, |acc, p| acc.checked_add(p.amount))?)
+        .try_fold(RawCoin::ZERO, |acc, p| acc.checked_add(p.amount))?)
 }
 
 /// Transaction shape and input count for a payment, without proving it.
@@ -87,7 +87,7 @@ pub struct Quote {
 fn plan<'a>(
     unspent: &'a [OwnedCoin],
     payments: &[Payment],
-    fee: Amount,
+    fee: RawCoin,
     excluded: &[u64],
     max_coin_height: u32,
 ) -> Result<Vec<&'a OwnedCoin>> {
@@ -130,8 +130,8 @@ fn plan_with_default_fee<'a>(
     payments: &[Payment],
     excluded: &[u64],
     max_coin_height: u32,
-) -> Result<(Vec<&'a OwnedCoin>, Amount)> {
-    let mut fee = Amount::ZERO;
+) -> Result<(Vec<&'a OwnedCoin>, RawCoin)> {
+    let mut fee = RawCoin::ZERO;
     for _ in 0..=protocol::consensus::ACTION_CLASSES.len() {
         let chosen = plan(unspent, payments, fee, excluded, max_coin_height)?;
         let actions = action_class(chosen.len(), payments.len().saturating_add(1))?;
@@ -166,7 +166,7 @@ pub struct Payment {
     /// The recipient.
     pub recipient: RhombusAddress,
     /// The amount.
-    pub amount: Amount,
+    pub amount: RawCoin,
     /// The memo.
     pub memo: Memo,
 }
@@ -202,7 +202,7 @@ pub fn build_payment(
 pub fn build_payment_with_fee(
     wallet: &Wallet,
     payment: Payment,
-    fee: Amount,
+    fee: RawCoin,
     pk: &ProvingKey,
     branch: BranchId,
     rng: &mut (impl RngCore + CryptoRng),
@@ -242,7 +242,7 @@ pub fn build_payments(
 pub fn build_payments_with_fee(
     wallet: &Wallet,
     payments: &[Payment],
-    fee: Amount,
+    fee: RawCoin,
     pk: &ProvingKey,
     branch: BranchId,
     excluded: &[u64],
@@ -261,7 +261,7 @@ fn spendable_coins(wallet: &Wallet) -> Result<Vec<OwnedCoin>> {
 fn build_selected(
     wallet: &Wallet,
     payments: &[Payment],
-    fee: Amount,
+    fee: RawCoin,
     chosen: &[&OwnedCoin],
     pk: &ProvingKey,
     branch: BranchId,
@@ -290,11 +290,11 @@ fn build_selected(
     let change = total
         .checked_sub(amount.raw())
         .and_then(|value| value.checked_sub(fee.raw()))
-        .ok_or(protocol::Error::AmountOutOfRange)?;
+        .ok_or(protocol::Error::RawCoinOutOfRange)?;
     if change > 0 {
         builder.add_output(OutputInfo::new(
             keys.default_address()?,
-            Amount::from_raw(change)?,
+            RawCoin::from_raw(change)?,
             Memo::empty(),
             ovk,
         ))?;
@@ -311,7 +311,7 @@ fn build_selected(
 mod tests {
     use crypto::keys::SpendingKey;
     use crypto::pallas;
-    use protocol::amount::Amount;
+    use protocol::amount::RawCoin;
     use protocol::coin::{Coin, RandomSeed, Rho};
     use protocol::nullifier::Nullifier;
     use rand::SeedableRng;
@@ -323,7 +323,7 @@ mod tests {
     fn owned(rng: &mut ChaCha20Rng, keys: &WalletKeys, value: u64, position: u32) -> OwnedCoin {
         let coin = Coin::new(
             keys.default_address().unwrap(),
-            Amount::from_raw(value).unwrap(),
+            RawCoin::from_raw(value).unwrap(),
             Rho::random(rng),
             RandomSeed::random(rng),
         );
@@ -350,26 +350,26 @@ mod tests {
             owned(&mut rng, &keys, 3_000_000, 2),
         ];
         let refs: Vec<&OwnedCoin> = coins.iter().collect();
-        let chosen = select_coins(&refs, Amount::from_raw(4_000_000).unwrap(), 2).unwrap();
+        let chosen = select_coins(&refs, RawCoin::from_raw(4_000_000).unwrap(), 2).unwrap();
         assert_eq!(chosen.len(), 1, "the largest coin covers the amount");
         assert_eq!(chosen[0].position, 1);
 
-        let chosen = select_coins(&refs, Amount::from_raw(6_000_000).unwrap(), 2).unwrap();
+        let chosen = select_coins(&refs, RawCoin::from_raw(6_000_000).unwrap(), 2).unwrap();
         assert_eq!(chosen.len(), 2, "two coins needed");
 
-        let err = select_coins(&refs, Amount::from_raw(100_000_000).unwrap(), 2).unwrap_err();
+        let err = select_coins(&refs, RawCoin::from_raw(100_000_000).unwrap(), 2).unwrap_err();
         assert!(matches!(err, Error::InsufficientFunds { .. }));
 
         // Three recipients plus change need the four-action class even
         // from one coin.
-        let chosen = select_coins(&refs, Amount::from_raw(1_000).unwrap(), 4).unwrap();
+        let chosen = select_coins(&refs, RawCoin::from_raw(1_000).unwrap(), 4).unwrap();
         assert_eq!(chosen.len(), 1);
     }
 
     fn pay(keys: &WalletKeys, amount: u64) -> Payment {
         Payment {
             recipient: keys.default_address().unwrap(),
-            amount: Amount::from_raw(amount).unwrap(),
+            amount: RawCoin::from_raw(amount).unwrap(),
             memo: Memo::empty(),
         }
     }

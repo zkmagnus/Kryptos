@@ -1,6 +1,6 @@
 //! Trial decryption of one block into owned coins.
 
-use protocol::amount::Amount;
+use protocol::amount::RawCoin;
 use protocol::block::Block;
 use protocol::bytes::{Encodable, Reader, Writer};
 use protocol::coin::{Coin, RandomSeed, Rho};
@@ -132,7 +132,7 @@ impl StandIn {
             coin: Coin::new(
                 *address.diversifier(),
                 *address.pk_d(),
-                Amount::ZERO,
+                RawCoin::ZERO,
                 Rho::from_nullifier(&Nullifier::from_bytes(&[0; 32])?)?,
                 RandomSeed::from_bytes([0; 32]),
             ),

@@ -10,9 +10,9 @@ pub const RAWCOIN: u64 = 100_000_000;
 
 /// A non-negative amount represented as a `u64`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Amount(u64);
+pub struct RawCoin(u64);
 
-impl Amount {
+impl RawCoin {
     /// Zero.
     pub const ZERO: Self = Self(0);
     /// The maximum representable amount.
@@ -33,7 +33,7 @@ impl Amount {
 
     /// Converts to a signed balance when representable.
     pub fn to_i64(self) -> Result<i64> {
-        i64::try_from(self.0).map_err(|_| Error::AmountOutOfRange)
+        i64::try_from(self.0).map_err(|_| Error::RawCoinOutOfRange)
     }
 
     /// Little-endian encoding, used inside coin commitments.
@@ -44,35 +44,35 @@ impl Amount {
     /// Checked addition.
     ///
     /// # Errors
-    /// Returns [`Error::AmountOutOfRange`] if the sum overflows `u64`.
+    /// Returns [`Error::RawCoinOutOfRange`] if the sum overflows `u64`.
     pub fn checked_add(self, other: Self) -> Result<Self> {
         self.0
             .checked_add(other.0)
             .map(Self)
-            .ok_or(Error::AmountOutOfRange)
+            .ok_or(Error::RawCoinOutOfRange)
     }
 
     /// Checked subtraction.
     ///
     /// # Errors
-    /// Returns [`Error::AmountOutOfRange`] if the result would be negative.
+    /// Returns [`Error::RawCoinOutOfRange`] if the result would be negative.
     pub fn checked_sub(self, other: Self) -> Result<Self> {
         self.0
             .checked_sub(other.0)
             .map(Self)
-            .ok_or(Error::AmountOutOfRange)
+            .ok_or(Error::RawCoinOutOfRange)
     }
 }
 
-impl TryFrom<u64> for Amount {
+impl TryFrom<u64> for RawCoin {
     type Error = Error;
     fn try_from(raw: u64) -> Result<Self> {
         Self::from_raw(raw)
     }
 }
 
-impl From<Amount> for u64 {
-    fn from(amount: Amount) -> Self {
+impl From<RawCoin> for u64 {
+    fn from(amount: RawCoin) -> Self {
         amount.raw()
     }
 }
@@ -98,7 +98,7 @@ impl ValueSum {
 
     /// Sums amounts into a signed total. Cannot overflow, see the type doc.
     #[allow(clippy::arithmetic_side_effects)] // see type-level doc on overflow
-    pub fn sum(amounts: impl IntoIterator<Item = Amount>) -> Self {
+    pub fn sum(amounts: impl IntoIterator<Item = RawCoin>) -> Self {
         amounts
             .into_iter()
             .fold(Self::ZERO, |acc, amount| acc + amount)
@@ -114,38 +114,38 @@ impl ValueSum {
     /// `self - amount`, by value.
     #[allow(clippy::arithmetic_side_effects)] // see type-level doc on overflow
     #[must_use]
-    pub fn minus(self, amount: Amount) -> Self {
+    pub fn minus(self, amount: RawCoin) -> Self {
         self - amount
     }
 
     /// `self + amount`, by value.
     #[allow(clippy::arithmetic_side_effects)] // see type-level doc on overflow
     #[must_use]
-    pub fn plus(self, amount: Amount) -> Self {
+    pub fn plus(self, amount: RawCoin) -> Self {
         self + amount
     }
 
     /// Converts to an `i64` for value commitments.
     ///
     /// # Errors
-    /// Returns [`Error::AmountOutOfRange`] if the magnitude exceeds `i64`.
+    /// Returns [`Error::RawCoinOutOfRange`] if the magnitude exceeds `i64`.
     pub fn to_i64(self) -> Result<i64> {
-        i64::try_from(self.0).map_err(|_| Error::AmountOutOfRange)
+        i64::try_from(self.0).map_err(|_| Error::RawCoinOutOfRange)
     }
 }
 
 #[allow(clippy::arithmetic_side_effects)] // see type-level doc on overflow
-impl Add<Amount> for ValueSum {
+impl Add<RawCoin> for ValueSum {
     type Output = Self;
-    fn add(self, rhs: Amount) -> Self {
+    fn add(self, rhs: RawCoin) -> Self {
         Self(self.0 + i128::from(rhs.0))
     }
 }
 
 #[allow(clippy::arithmetic_side_effects)] // see type-level doc on overflow
-impl Sub<Amount> for ValueSum {
+impl Sub<RawCoin> for ValueSum {
     type Output = Self;
-    fn sub(self, rhs: Amount) -> Self {
+    fn sub(self, rhs: RawCoin) -> Self {
         Self(self.0 - i128::from(rhs.0))
     }
 }
@@ -154,29 +154,29 @@ impl Sub<Amount> for ValueSum {
 mod tests {
     use super::*;
 
-    fn amt(raw: u64) -> Amount {
-        Amount::from_raw(raw).unwrap()
+    fn amt(raw: u64) -> RawCoin {
+        RawCoin::from_raw(raw).unwrap()
     }
 
     #[test]
     fn full_u64_amount_range_is_representable() {
-        assert_eq!(Amount::from_raw(u64::MAX), Ok(Amount::MAX));
-        assert_eq!(Amount::try_from(0), Ok(Amount::ZERO));
+        assert_eq!(RawCoin::from_raw(u64::MAX), Ok(RawCoin::MAX));
+        assert_eq!(RawCoin::try_from(0), Ok(RawCoin::ZERO));
     }
 
     #[test]
     fn checked_add_detects_u64_overflow() {
         assert_eq!(amt(1).checked_add(amt(2)), Ok(amt(3)));
         assert_eq!(
-            Amount::MAX.checked_add(amt(1)),
-            Err(Error::AmountOutOfRange)
+            RawCoin::MAX.checked_add(amt(1)),
+            Err(Error::RawCoinOutOfRange)
         );
     }
 
     #[test]
     fn checked_sub_rejects_negative() {
         assert_eq!(amt(3).checked_sub(amt(2)), Ok(amt(1)));
-        assert_eq!(amt(2).checked_sub(amt(3)), Err(Error::AmountOutOfRange));
+        assert_eq!(amt(2).checked_sub(amt(3)), Err(Error::RawCoinOutOfRange));
     }
 
     #[test]

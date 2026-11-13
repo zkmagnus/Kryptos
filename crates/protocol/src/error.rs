@@ -5,7 +5,7 @@ use thiserror::Error;
 pub enum Error {
     /// An amount could not be represented in a required signed balance or an operation overflowed.
     #[error("amount out of range")]
-    AmountOutOfRange,
+    RawCoinOutOfRange,
     /// An address string or byte string could not be parsed.
     #[error("invalid address: {0}")]
     InvalidAddress(String),

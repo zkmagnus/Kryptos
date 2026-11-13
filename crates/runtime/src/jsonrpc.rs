@@ -4,7 +4,7 @@
 //!
 //! Every method dispatches to the same [`Request`] enum the line protocol
 //! uses, so both interfaces have one behaviour. Method names follow
-//! Bitcoin's where the meaning is the same. Amounts are strings in the
+//! Bitcoin's where the meaning is the same. RawCoins are strings in the
 //! smallest unit; hashes, ids and encoded objects are lowercase hex;
 //! heights are numbers. See `docs/rpc.md`.
 

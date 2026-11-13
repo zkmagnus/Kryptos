@@ -812,7 +812,7 @@ mod tests {
     use crypto::pallas;
     use protocol::block::{empty_header, BlockHeader};
     use protocol::builder::{Builder, OutputInfo, SpendInfo};
-    use protocol::coin::Rhombus as Amount;
+    use protocol::coin::Rhombus as RawCoin;
     use protocol::consensus::BranchId;
     use protocol::memo::Memo;
     use rand::SeedableRng;
@@ -861,7 +861,7 @@ mod tests {
         value: u64,
     ) -> Block {
         let mut b = Builder::new(Anchor::from_base(pallas::Base::from(0u64)));
-        let credit = Amount::from_raw(value).unwrap();
+        let credit = RawCoin::from_raw(value).unwrap();
         b.add_output(OutputInfo::new(
             keys.default_address().unwrap(),
             credit,
@@ -946,7 +946,7 @@ mod tests {
             .unwrap();
         b.add_output(OutputInfo::new(
             other_keys.default_address().unwrap(),
-            Amount::from_raw(1_000).unwrap(),
+            RawCoin::from_raw(1_000).unwrap(),
             Memo::empty(),
             None,
         ))
@@ -954,7 +954,7 @@ mod tests {
         let change = 1_000_000_000 - 1_000;
         b.add_output(OutputInfo::new(
             owner.default_address().unwrap(),
-            Amount::from_raw(change).unwrap(),
+            RawCoin::from_raw(change).unwrap(),
             Memo::empty(),
             None,
         ))
@@ -1137,7 +1137,7 @@ mod tests {
         let (_dir, wallet) = temp_wallet(&sk(13), BlockHash::ZERO, &mut rng);
         let payment = Payment {
             recipient: wallet.keys().default_address().unwrap(),
-            amount: Amount::from_raw(5).unwrap(),
+            amount: RawCoin::from_raw(5).unwrap(),
             memo: Memo::empty(),
         };
         let mut op = wallet

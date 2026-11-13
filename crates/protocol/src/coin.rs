@@ -22,7 +22,7 @@ use ff::Field;
 use rand_core::{CryptoRng, RngCore};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::amount::Amount;
+use crate::amount::RawCoin;
 use crate::bytes::{Encodable, Reader, Writer};
 use crate::nullifier::Nullifier;
 use crate::Result;
@@ -167,7 +167,7 @@ impl Encodable for ExtractedCoinCommitment {
 pub struct Coin {
     diversifier: Diversifier,
     pk_d: DiversifiedTransmissionKey,
-    value: Amount,
+    value: RawCoin,
     rho: Rho,
     rseed: RandomSeed,
 }
@@ -177,7 +177,7 @@ impl Coin {
     pub fn new(
         diversifier: Diversifier,
         pk_d: DiversifiedTransmissionKey,
-        value: Amount,
+        value: RawCoin,
         rho: Rho,
         rseed: RandomSeed,
     ) -> Self {
@@ -201,7 +201,7 @@ impl Coin {
     }
 
     /// The value.
-    pub fn value(&self) -> Amount {
+    pub fn value(&self) -> RawCoin {
         self.value
     }
 
@@ -277,7 +277,7 @@ impl Encodable for Coin {
         let diversifier = Diversifier::from_bytes(r.take_array()?);
         diversifier.base()?; // validation diversifier
         let pk_d = DiversifiedTransmissionKey::from_bytes(&r.take_array()?)?;
-        let value = Amount::from_raw(r.take_u64_le()?)?;
+        let value = RawCoin::from_raw(r.take_u64_le()?)?;
         let rho = Rho::from_base(base_from_bytes(&r.take_array()?)?);
         let rseed = RandomSeed::from_bytes(r.take_array()?);
         Ok(Self::new(diversifier, pk_d, value, rho, rseed))
@@ -287,7 +287,7 @@ impl Encodable for Coin {
 #[cfg(test)]
 mod tests {
     use crate::address::RhombusAddress as Address;
-    use crate::amount::Amount;
+    use crate::amount::RawCoin;
     use crypto::keys::{Diversifier, FullViewingKey, SpendingKey};
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
@@ -306,7 +306,7 @@ mod tests {
         let rho = Rho::from_base(pallas::Base::from(seed));
         let coin = Coin::new(
             recipient,
-            Amount::from_raw(1_000).unwrap(),
+            RawCoin::from_raw(1_000).unwrap(),
             rho,
             RandomSeed::random(&mut rng),
         );
@@ -327,7 +327,7 @@ mod tests {
 
         let other_value = Coin::new(
             f.coin.recipient,
-            Amount::from_raw(1_001).unwrap(),
+            RawCoin::from_raw(1_001).unwrap(),
             f.coin.rho,
             f.coin.rseed.clone(),
         );
@@ -395,7 +395,7 @@ mod tests {
         let coin = |rho| {
             Coin::new(
                 fixture(9).coin.recipient,
-                Amount::ZERO,
+                RawCoin::ZERO,
                 rho,
                 RandomSeed::from_bytes([9; 32]),
             )

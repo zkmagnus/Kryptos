@@ -166,7 +166,7 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::address::RhombusAddress as Address;
-    use crate::amount::Rhombus as Amount;
+    use crate::amount::Rhombus as RawCoin;
     use crate::coin::{Coin, RandomSeed, Rho};
     use crate::encryption::encrypt_coin;
     use crate::memo::Memo;
@@ -178,7 +178,7 @@ pub(crate) mod tests {
         let address = Address::derive(&fvk, crypto::keys::Diversifier::random(rng)).unwrap();
         let coin = Coin::new(
             address,
-            Amount::from_raw(5).unwrap(),
+            RawCoin::from_raw(5).unwrap(),
             Rho::random(rng),
             RandomSeed::random(rng),
         );

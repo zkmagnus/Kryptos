@@ -20,7 +20,7 @@ use systemcall_proof::{PrivateTransactionProofV2, ProvingKey};
 
 use crate::action::{Action, ActionBody};
 use crate::address::RhombusAddress;
-use crate::amount::{Amount, ValueSum};
+use crate::amount::{RawCoin, ValueSum};
 use crate::coin::{Coin, RandomSeed, Rho};
 use crate::consensus::action_class_for;
 use crate::consensus::{BranchId, COINBASE_ENTRYPOINT, TRANSFER_ENTRYPOINT};
@@ -57,7 +57,7 @@ impl SpendInfo {
         let coin = Coin::new(
             *address.diversifier(),
             *address.pk_d(),
-            Amount::ZERO,
+            RawCoin::ZERO,
             Rho::random(rng),
             RandomSeed::random(rng),
         );
@@ -78,7 +78,7 @@ impl SpendInfo {
 #[derive(Clone, Debug)]
 pub struct OutputInfo {
     recipient: RhombusAddress,
-    value: Amount,
+    value: RawCoin,
     memo: Memo,
     ovk: Option<OutgoingViewingKey>,
 }
@@ -87,7 +87,7 @@ impl OutputInfo {
     /// A real output. Pass `ovk` so the sender can later recover the coin.
     pub fn new(
         recipient: RhombusAddress,
-        value: Amount,
+        value: RawCoin,
         memo: Memo,
         ovk: Option<OutgoingViewingKey>,
     ) -> Self {
@@ -105,11 +105,11 @@ impl OutputInfo {
     /// Fails only if key derivation fails, which has negligible probability.
     pub fn dummy(rng: &mut (impl RngCore + CryptoRng)) -> Result<Self> {
         let recipient = random_address(&SpendingKey::random(rng), rng)?;
-        Ok(Self::new(recipient, Amount::ZERO, Memo::empty(), None))
+        Ok(Self::new(recipient, RawCoin::ZERO, Memo::empty(), None))
     }
 
     /// The value.
-    pub fn value(&self) -> Amount {
+    pub fn value(&self) -> RawCoin {
         self.value
     }
 }
@@ -176,7 +176,7 @@ impl Builder {
         branch: BranchId,
         rng: &mut (impl RngCore + CryptoRng),
     ) -> Result<Transaction> {
-        self.build_with_fee(Amount::ZERO, pk, branch, rng)
+        self.build_with_fee(RawCoin::ZERO, pk, branch, rng)
     }
 
     /// Builds a transfer offering the explicit public `fee` to the block
@@ -186,7 +186,7 @@ impl Builder {
     /// Returns [`Error::Unbalanced`] unless spends equal outputs plus fee.
     pub fn build_with_fee(
         self,
-        fee: Amount,
+        fee: RawCoin,
         pk: &ProvingKey,
         branch: BranchId,
         rng: &mut (impl RngCore + CryptoRng),
@@ -199,7 +199,7 @@ impl Builder {
     /// metadata. The opening must not be added to the transaction or block.
     pub fn build_with_fee_opening(
         self,
-        fee: Amount,
+        fee: RawCoin,
         pk: &ProvingKey,
         branch: BranchId,
         rng: &mut (impl RngCore + CryptoRng),
@@ -212,7 +212,7 @@ impl Builder {
 
     fn build_v2_with_balance(
         mut self,
-        fee: Amount,
+        fee: RawCoin,
         pk: &ProvingKey,
         branch: BranchId,
         spent_minus_created: ValueSum,
@@ -303,7 +303,7 @@ impl Builder {
     pub fn build_coinbase(
         self,
         pk: &ProvingKey,
-        credit: Amount,
+        credit: RawCoin,
         branch: BranchId,
         rng: &mut (impl RngCore + CryptoRng),
     ) -> Result<Transaction> {
@@ -316,7 +316,7 @@ impl Builder {
     pub fn build_coinbase_with_opening(
         self,
         pk: &ProvingKey,
-        credit: Amount,
+        credit: RawCoin,
         branch: BranchId,
         rng: &mut (impl RngCore + CryptoRng),
     ) -> Result<(Transaction, ValueCommitTrapdoor)> {
@@ -326,9 +326,9 @@ impl Builder {
         let balance = credit
             .to_i64()?
             .checked_neg()
-            .ok_or(Error::AmountOutOfRange)?;
+            .ok_or(Error::RawCoinOutOfRange)?;
         self.build_v2_with_balance(
-            Amount::ZERO,
+            RawCoin::ZERO,
             pk,
             branch,
             ValueSum::ZERO.minus(credit),
@@ -391,7 +391,7 @@ fn prepare_action(
         .value()
         .to_i64()?
         .checked_sub(output.value.to_i64()?)
-        .ok_or(Error::AmountOutOfRange)?;
+        .ok_or(Error::RawCoinOutOfRange)?;
     let cv_net = ValueCommitment::commit(net_value, &rcv);
 
     let alpha = SpendAuthRandomizer::random(rng);
@@ -457,7 +457,7 @@ fn shuffle<T>(items: &mut [T], rng: &mut (impl RngCore + CryptoRng)) {
 #[cfg(test)]
 mod tests {
     use crate::address::RhombusAddress as Address;
-    use crate::amount::Amount;
+    use crate::amount::RawCoin;
     /// The branch every test transaction is signed for.
     const BRANCH: BranchId = BranchId::new(1);
 
@@ -508,8 +508,8 @@ mod tests {
         }
     }
 
-    fn amount(raw: u64) -> Amount {
-        Amount::from_raw(raw).unwrap()
+    fn amount(raw: u64) -> RawCoin {
+        RawCoin::from_raw(raw).unwrap()
     }
 
     fn verify_regular(
@@ -748,8 +748,8 @@ mod tests {
         let mut rng = ChaCha20Rng::seed_from_u64(7);
         let a = SpendInfo::dummy(&mut rng).unwrap();
         let b = SpendInfo::dummy(&mut rng).unwrap();
-        assert_eq!(a.coin().value(), Amount::ZERO);
-        assert_eq!(OutputInfo::dummy(&mut rng).unwrap().value(), Amount::ZERO);
+        assert_eq!(a.coin().value(), RawCoin::ZERO);
+        assert_eq!(OutputInfo::dummy(&mut rng).unwrap().value(), RawCoin::ZERO);
         let nf = |s: &SpendInfo| {
             s.coin()
                 .nullifier(FullViewingKey::derive(&s.sk).unwrap().nk())

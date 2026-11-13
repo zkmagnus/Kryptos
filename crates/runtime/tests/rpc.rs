@@ -17,7 +17,7 @@ use crypto::encoding::{from_hex, to_hex};
 use crypto::keys::SpendingKey;
 use protocol::block::Block;
 use protocol::bytes::Encodable;
-use protocol::coin::Rhombus as Amount;
+use protocol::coin::Rhombus as RawCoin;
 use protocol::compact::CompactBlock;
 use protocol::memo::Memo;
 use rand::SeedableRng;
@@ -266,7 +266,7 @@ async fn json_rpc_serves_the_chain_and_accepts_transactions() {
     let pk = ProvingKey::build().unwrap();
     let payment = Payment {
         recipient: receiver.default_address().unwrap(),
-        amount: Amount::from_raw(1_000).unwrap(),
+        amount: RawCoin::from_raw(1_000).unwrap(),
         memo: Memo::empty(),
     };
     let branch = Network::Test.params().genesis_branch;

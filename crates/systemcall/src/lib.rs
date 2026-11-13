@@ -150,9 +150,9 @@ mod tests {
     use protocol::builder::{Builder, OutputInfo, SpendInfo};
     use protocol::bytes::Encodable;
     use protocol::coin::Rhombus;
+    use protocol::coin::{Coin, RandomSeed, Rho};
     use protocol::consensus::BranchId;
     use protocol::memo::Memo;
-    use protocol::coin::{Coin, RandomSeed, Rho};
     use protocol::transaction::{Anchor, Transaction};
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;

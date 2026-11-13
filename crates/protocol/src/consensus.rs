@@ -2,7 +2,7 @@
 //! Transaction fees are relay metadata and block reward conservation is
 //! checked with the block-wide value-binding signature.
 
-use crate::amount::Amount;
+use crate::amount::RawCoin;
 use crate::{Error, Result};
 
 /// The private-fee transaction format with an explicit SystemCall opcode.
@@ -56,9 +56,9 @@ pub const EMISSION_HALVINGS_TO_TAIL: u64 = 1;
 pub const EMISSION_INTERVAL: u64 = 1_000_000;
 
 /// The block subsidy at `height`. Genesis pays nothing.
-pub fn subsidy(height: u32) -> Amount {
+pub fn subsidy(height: u32) -> RawCoin {
     if height == 0 {
-        return Amount::ZERO;
+        return RawCoin::ZERO;
     }
     let completed_intervals = u64::from(height - 1) / EMISSION_INTERVAL;
     let raw = if completed_intervals >= EMISSION_HALVINGS_TO_TAIL {
@@ -66,7 +66,7 @@ pub fn subsidy(height: u32) -> Amount {
     } else {
         BLOCK_EMISSION_START >> completed_intervals
     };
-    Amount::from_raw(raw).unwrap_or(Amount::ZERO)
+    RawCoin::from_raw(raw).unwrap_or(RawCoin::ZERO)
 }
 
 /// The height of the block after one at `height`.
@@ -167,7 +167,7 @@ mod tests {
 
     #[test]
     fn emission_reaches_the_permanent_tail_after_one_interval() {
-        assert_eq!(subsidy(0), Amount::ZERO);
+        assert_eq!(subsidy(0), RawCoin::ZERO);
         assert_eq!(subsidy(1).raw(), BLOCK_EMISSION_START);
         assert_eq!(subsidy(100_000).raw(), BLOCK_EMISSION_START);
         assert_eq!(BLOCK_EMISSION_START, 12_500_000);

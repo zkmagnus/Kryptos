@@ -5,7 +5,7 @@
 Rhombus is a shielded-only privacy cryptocurrency written in Rust. Its ticker
 is `Rhombus`; payment addresses use an unprefixed, checksummed, unpadded
 Base58Check encoding of the diversifier and transmission key. Transactions
-transfer private notes and are authorized with zero-knowledge proofs built on
+transfer private coins and are authorized with zero-knowledge proofs built on
 Halo2.
 There are no transparent addresses.
 
@@ -107,7 +107,7 @@ cargo run --release -p runtime --bin rhomscan -- --network test
 ```
 
 Use `--light` to scan compact actions without recovering memos, `--verbose` to
-print found notes, or `--chain` and `--wallet` to select database files.
+print found coins, or `--chain` and `--wallet` to select database files.
 The scanner follows the local chain tip and rolls the wallet back when it sees
 a reorganization.
 

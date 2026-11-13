@@ -1,4 +1,4 @@
-//! The `Amount` command line.
+//! The `RawCoin` command line.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 use crypto::encoding::{from_hex, to_hex};
 use crypto::keys::SpendingKey;
 use protocol::address::RhombusAddress;
-use protocol::amount::Amount;
+use protocol::amount::RawCoin;
 use protocol::block::{Block, BlockHash};
 use protocol::bytes::Encodable;
 use protocol::compact::CompactBlock;
@@ -37,7 +37,7 @@ const PHRASE_ENV: &str = "SEED_PHRASE";
 
 /// The node daemon and wallet tools.
 #[derive(Parser, Debug)]
-#[command(name = "Amount", version)]
+#[command(name = "RawCoin", version)]
 pub struct Cli {
     /// What to do.
     #[command(subcommand)]
@@ -240,7 +240,7 @@ pub enum Command {
         /// Recipient address.
         #[arg(long)]
         to: String,
-        /// Amount in smallest units.
+        /// RawCoin in smallest units.
         #[arg(long)]
         amount: u64,
         /// Private fee amount in raw units (default: 1 raw unit per encoded byte).
@@ -387,7 +387,7 @@ async fn batch_transfer(
             .map_err(|_| Error::Argument("payment amount must be an unsigned integer".into()))?;
         payments.push(Payment {
             recipient,
-            amount: Amount::from_raw(amount)?,
+            amount: RawCoin::from_raw(amount)?,
             memo: Memo::empty(),
         });
     }
@@ -402,7 +402,7 @@ async fn batch_transfer(
         Some(raw) => build_payments_with_fee(
             &wallet,
             &payments,
-            Amount::from_raw(raw)?,
+            RawCoin::from_raw(raw)?,
             &pk,
             branch,
             &[],
@@ -461,7 +461,7 @@ async fn send(
     rpc: &RpcArgs,
     light: bool,
 ) -> Result<()> {
-    let amount = Amount::from_raw(amount)?;
+    let amount = RawCoin::from_raw(amount)?;
     let mut client = rpc.connect().await?;
     let genesis = fetch_genesis(&mut client).await?;
     let network = network_of(&genesis)?;
@@ -482,7 +482,7 @@ async fn send(
         Some(raw) => build_payments_with_fee(
             &wallet,
             &[payment],
-            Amount::from_raw(raw)?,
+            RawCoin::from_raw(raw)?,
             &pk,
             branch,
             &[],
@@ -511,7 +511,7 @@ async fn send(
     Ok(())
 }
 
-/// The chain directory for `Amount run`: the given one, the per-user
+/// The chain directory for `RawCoin run`: the given one, the per-user
 /// default. Directories are created owner-only.
 fn node_datadir(datadir: Option<PathBuf>, network: Network) -> Result<PathBuf> {
     let dir = match datadir {
@@ -524,7 +524,7 @@ fn node_datadir(datadir: Option<PathBuf>, network: Network) -> Result<PathBuf> {
 
 /// Starts a node and runs it until interrupted.
 #[allow(clippy::too_many_arguments)] // mirrors the command line options
-/// The options `Amount run` was given.
+/// The options `RawCoin run` was given.
 struct RunOptions {
     network: Network,
     datadir: PathBuf,
@@ -587,7 +587,7 @@ async fn run_node(opts: RunOptions) -> Result<()> {
     let shutdown = Shutdown::listen()?;
     let handle = crate::node::spawn(config).await?;
     let log = crate::node::log;
-    log(&format!("Amount up on the {network} network"));
+    log(&format!("RawCoin up on the {network} network"));
     match handle.listen_addr {
         Some(addr) => log(&format!("peers      listening on {addr}")),
         None => log("peers      outbound only"),
@@ -624,7 +624,7 @@ pub async fn pay(
     wallet: &Wallet,
     pk: &ProvingKey,
     recipient: RhombusAddress,
-    amount: Amount,
+    amount: RawCoin,
     fee: u64,
     branch: BranchId,
 ) -> Result<String> {
@@ -636,7 +636,7 @@ pub async fn pay(
     let built = build_payments_with_fee(
         wallet,
         &[payment],
-        Amount::from_raw(fee)?,
+        RawCoin::from_raw(fee)?,
         pk,
         branch,
         &[],
@@ -863,7 +863,7 @@ mod tests {
 
     #[test]
     fn advertising_requires_a_listener_and_conflicts_with_a_proxy() {
-        let base = ["Amount", "run", "--advertise", "8.8.8.8:19000"];
+        let base = ["RawCoin", "run", "--advertise", "8.8.8.8:19000"];
         assert!(Cli::try_parse_from(base).is_err());
         let listener = ["--listen", "0.0.0.0:19000"];
         assert!(Cli::try_parse_from(base.into_iter().chain(listener)).is_ok());
@@ -891,10 +891,10 @@ mod tests {
     #[test]
     fn every_command_defaults_to_the_main_network() {
         for argv in [
-            &["Amount", "run"][..],
-            &["Amount", "keygen"],
-            &["Amount", "create", "--wallet", "w"],
-            &["Amount", "address", "--wallet", "w"],
+            &["RawCoin", "run"][..],
+            &["RawCoin", "keygen"],
+            &["RawCoin", "create", "--wallet", "w"],
+            &["RawCoin", "address", "--wallet", "w"],
         ] {
             let cli = Cli::try_parse_from(argv).unwrap();
             assert_eq!(
@@ -903,7 +903,7 @@ mod tests {
                 "{argv:?}"
             );
         }
-        let explicit = Cli::try_parse_from(["Amount", "keygen", "--network", "test"]).unwrap();
+        let explicit = Cli::try_parse_from(["RawCoin", "keygen", "--network", "test"]).unwrap();
         assert_eq!(network_of_command(&explicit.command), Some(Network::Test));
     }
 }

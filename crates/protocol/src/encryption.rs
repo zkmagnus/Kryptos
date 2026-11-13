@@ -23,7 +23,7 @@ use crypto::keys::{
 };
 use rand_core::{CryptoRng, RngCore};
 
-use crate::amount::Amount;
+use crate::amount::RawCoin;
 use crate::bytes::{Encodable, Reader, Writer};
 use crate::coin::{Coin, ExtractedCoinCommitment, RandomSeed, Rho, RANDOM_SEED_LEN};
 use crate::memo::{Memo, MEMO_LEN};
@@ -203,7 +203,7 @@ pub fn detect_coin_with_ivk(
 /// The fields of a coin plaintext before the memo.
 struct CoinLead {
     diversifier: Diversifier,
-    value: Amount,
+    value: RawCoin,
     rseed: RandomSeed,
 }
 
@@ -214,7 +214,7 @@ impl CoinLead {
             return Err(Error::CoinDecryption("unknown plaintext version"));
         }
         let diversifier = Diversifier::from_bytes(r.take_array()?);
-        let value = Amount::from_raw(r.take_u64_le()?)?;
+        let value = RawCoin::from_raw(r.take_u64_le()?)?;
         let rseed = RandomSeed::from_bytes(r.take_array()?);
         r.finish()?;
         Ok(Self {
@@ -307,7 +307,7 @@ fn finish_decryption(
 #[derive(Debug)]
 struct CoinPlaintext {
     diversifier: Diversifier,
-    value: Amount,
+    value: RawCoin,
     rseed: RandomSeed,
     memo: Memo,
 }
@@ -338,7 +338,7 @@ impl CoinPlaintext {
             return Err(Error::CoinDecryption("unknown plaintext version"));
         }
         let diversifier = Diversifier::from_bytes(r.take_array()?);
-        let value = Amount::from_raw(r.take_u64_le()?)?;
+        let value = RawCoin::from_raw(r.take_u64_le()?)?;
         let rseed = RandomSeed::from_bytes(r.take_array()?);
         let memo = Memo::from_bytes(r.take_array()?);
         r.finish()?;
@@ -390,7 +390,7 @@ fn parse_out_plaintext(
 #[cfg(test)]
 mod tests {
     use crate::address::RhombusAddress as Address;
-    use crate::amount::Amount;
+    use crate::amount::RawCoin;
     use crypto::commitment::ValueCommitTrapdoor;
     use crypto::keys::{FullViewingKey, SpendingKey};
     use crypto::pallas;
@@ -434,7 +434,7 @@ mod tests {
         let rho = Rho::from_base(pallas::Base::from(seed));
         let coin = Coin::new(
             receiver.address,
-            Amount::from_raw(4_200).unwrap(),
+            RawCoin::from_raw(4_200).unwrap(),
             rho,
             RandomSeed::random(&mut rng),
         );

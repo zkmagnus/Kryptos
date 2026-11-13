@@ -12,7 +12,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use crypto::keys::SpendingKey;
-use protocol::coin::Rhombus as Amount;
+use protocol::coin::Rhombus as RawCoin;
 use protocol::memo::Memo;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
@@ -118,7 +118,7 @@ async fn follower_syncs_from_miner_and_relays_a_payment() {
     let pk = ProvingKey::build().unwrap();
     let payment = Payment {
         recipient: receiver.default_address().unwrap(),
-        amount: Amount::from_raw(1_000).unwrap(),
+        amount: RawCoin::from_raw(1_000).unwrap(),
         memo: Memo::empty(),
     };
     // The test network schedules no upgrades, so the genesis branch is in

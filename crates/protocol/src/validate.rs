@@ -66,11 +66,11 @@ fn check_shape_and_program(tx: &Transaction, entrypoint: u16) -> Result<()> {
 ///
 /// # Errors
 /// If `credit` does not fit an `i64`.
-pub fn coinbase_balance(credit: crate::amount::Amount) -> Result<i64> {
+pub fn coinbase_balance(credit: crate::amount::RawCoin) -> Result<i64> {
     credit
         .to_i64()?
         .checked_neg()
-        .ok_or(Error::AmountOutOfRange)
+        .ok_or(Error::RawCoinOutOfRange)
 }
 
 /// Queues every transaction signature into `batch` for later verification.
@@ -200,7 +200,7 @@ mod tests {
         let v2_proof = PrivateTransactionProofV2::new(&action_proof).unwrap();
         Transaction::new(
             sample_anchor(),
-            crate::amount::Amount::ZERO,
+            crate::amount::RawCoin::ZERO,
             actions,
             v2_proof,
             BindingSignature::from_bytes([0; 64]),
@@ -234,7 +234,7 @@ mod tests {
         let v2_proof = PrivateTransactionProofV2::new(&dummy_proof(4)).unwrap();
         let tx = Transaction::new(
             sample_anchor(),
-            crate::amount::Amount::ZERO,
+            crate::amount::RawCoin::ZERO,
             actions,
             v2_proof,
             BindingSignature::from_bytes([0; 64]),
@@ -275,7 +275,7 @@ mod tests {
         // sample_action signs "x", not the real sighash.
         let tx = unsigned_tx(5, 2);
         let mut rng = ChaCha20Rng::seed_from_u64(6);
-        let balance = crate::amount::Amount::from_raw(20_000)
+        let balance = crate::amount::RawCoin::from_raw(20_000)
             .unwrap()
             .to_i64()
             .unwrap();
