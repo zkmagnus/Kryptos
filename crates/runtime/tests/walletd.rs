@@ -132,7 +132,6 @@ async fn the_wallet_daemon_serves_an_exchange() {
     let unspent = call(addr, t, "listunspent", json!([])).await;
     assert_eq!(unspent[0]["address_index"], 0);
     assert!(unspent[0]["txid"].is_string());
-    assert_eq!(unspent[0]["memo"], Value::Null);
 
     // Deposit addresses with labels.
     let alice = call(addr, t, "getnewaddress", json!(["alice"])).await;
@@ -166,7 +165,7 @@ async fn the_wallet_daemon_serves_an_exchange() {
         t,
         "sendmany",
         json!([[
-        {"address": customer_address, "amount": "1000", "memo": "withdrawal 1"},
+        {"address": customer_address, "amount": "1000"},
         {"address": alice_address, "amount": 500},
     ], 1]),
     )

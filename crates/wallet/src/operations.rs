@@ -6,7 +6,6 @@ use protocol::address::RhombusAddress;
 use protocol::amount::RawCoin;
 use protocol::bytes::{Encodable, Reader, Writer};
 use protocol::fee::FeeOpening;
-use protocol::memo::Memo;
 use protocol::transaction::TxId;
 
 use crate::spend::Payment;
@@ -84,7 +83,7 @@ pub struct Operation {
     pub created_at: u64,
     /// Who gets what.
     pub recipients: Vec<Payment>,
-    /// Notes with fewer confirmations than this are not spent.
+    /// Coins with fewer confirmations than this are not spent.
     pub min_confirmations: u32,
     /// Where it is.
     pub status: OperationStatus,
@@ -168,14 +167,12 @@ impl Encodable for Payment {
     fn write(&self, w: &mut Writer) {
         self.recipient.write(w);
         w.put_u64_le(self.amount.raw());
-        self.memo.write(w);
     }
 
     fn read(r: &mut Reader<'_>) -> protocol::Result<Self> {
         Ok(Self {
             recipient: RhombusAddress::read(r)?,
             amount: RawCoin::from_raw(r.take_u64_le()?)?,
-            memo: Memo::read(r)?,
         })
     }
 }
@@ -349,12 +346,10 @@ mod tests {
                 Payment {
                     recipient: keys.default_address().unwrap(),
                     amount: RawCoin::from_raw(1_000).unwrap(),
-                    memo: Memo::from_text("rent").unwrap(),
                 },
                 Payment {
                     recipient: keys.address(7u64.into()).unwrap(),
                     amount: RawCoin::from_raw(2_000).unwrap(),
-                    memo: Memo::empty(),
                 },
             ],
             6,

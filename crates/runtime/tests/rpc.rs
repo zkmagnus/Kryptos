@@ -19,7 +19,6 @@ use protocol::block::Block;
 use protocol::bytes::Encodable;
 use protocol::coin::Rhombus as RawCoin;
 use protocol::compact::CompactBlock;
-use protocol::memo::Memo;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 use runtime::config::{Config, Network};
@@ -267,7 +266,6 @@ async fn json_rpc_serves_the_chain_and_accepts_transactions() {
     let payment = Payment {
         recipient: receiver.default_address().unwrap(),
         amount: RawCoin::from_raw(1_000).unwrap(),
-        memo: Memo::empty(),
     };
     let branch = Network::Test.params().genesis_branch;
     let tx = build_payment(&wallet, payment, &pk, branch, &mut rng).unwrap();

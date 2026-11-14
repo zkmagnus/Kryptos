@@ -5,7 +5,6 @@
 //! - [`address`]: diversified payment addresses and their encodings.
 //! - [`coin`]: coins, their commitments and their nullifiers.
 //! - [`nullifier`]: the nullifier newtype.
-//! - [`memo`]: the fixed-size encrypted memo.
 //! - [`encryption`]: coin plaintext layout, encryption and trial decryption.
 //! - [`bytes`]: reader and writer helpers for canonical encodings.
 //! - [`consensus`]: action classes, state accounting and size limits.
@@ -36,7 +35,6 @@ pub mod consensus;
 pub mod encryption;
 mod error;
 pub mod fee;
-pub mod memo;
 pub mod nullifier;
 pub mod transaction;
 pub mod tree_order;

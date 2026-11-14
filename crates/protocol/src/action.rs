@@ -169,7 +169,6 @@ pub(crate) mod tests {
     use crate::amount::Rhombus as RawCoin;
     use crate::coin::{Coin, RandomSeed, Rho};
     use crate::encryption::encrypt_coin;
-    use crate::memo::Memo;
 
     /// A syntactically valid action whose signature is over `message`.
     pub(crate) fn sample_action(rng: &mut ChaCha20Rng, message: &[u8]) -> Action {
@@ -184,7 +183,7 @@ pub(crate) mod tests {
         );
         let nullifier = coin.nullifier(fvk.nk()).unwrap();
         let cv = ValueCommitment::commit(0, &ValueCommitTrapdoor::random(rng));
-        let encrypted = encrypt_coin(&coin, &Memo::empty(), None, &cv, rng).unwrap();
+        let encrypted = encrypt_coin(&coin, None, &cv, rng).unwrap();
         let rsk = RandomizedSigningKey::new(
             &SpendAuthorizingKey::derive(&sk).unwrap(),
             &SpendAuthRandomizer::random(rng),
@@ -203,8 +202,8 @@ pub(crate) mod tests {
 
     #[test]
     fn lengths_are_fixed() {
-        assert_eq!(ACTION_BODY_LEN, 820);
-        assert_eq!(ACTION_LEN, 884);
+        assert_eq!(ACTION_BODY_LEN, 4 * ENCODED_LEN + ENCRYPTED_COIN_LEN);
+        assert_eq!(ACTION_LEN, ACTION_BODY_LEN + SIGNATURE_LEN);
         let action = sample_action(&mut ChaCha20Rng::seed_from_u64(1), b"m");
         assert_eq!(action.body().to_vec().len(), ACTION_BODY_LEN);
         assert_eq!(action.to_vec().len(), ACTION_LEN);

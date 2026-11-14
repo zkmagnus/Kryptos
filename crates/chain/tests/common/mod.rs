@@ -28,7 +28,6 @@ use protocol::coin::Rhombus;
 use protocol::coin::{Coin, Rho};
 use protocol::coin_encryption::decrypt_coin_with_ivk;
 use protocol::consensus::{subsidy, BranchId, BLOCK_VERSION};
-use protocol::memo::Memo;
 use protocol::transaction::Transaction;
 use protocol::tree_order::tree_transactions;
 use rand::SeedableRng;
@@ -190,13 +189,8 @@ impl Harness {
         let credit = subsidy(height).checked_add(fees).unwrap();
         let anchor = parent.commitment_root;
         let mut b = Builder::new(anchor);
-        b.add_output(OutputInfo::new(
-            self.miner.address,
-            credit,
-            Memo::empty(),
-            None,
-        ))
-        .unwrap();
+        b.add_output(OutputInfo::new(self.miner.address, credit, None))
+            .unwrap();
         let branch = self.chain.params().branch_at(height);
         let (coinbase, coinbase_blinding) = b
             .build_coinbase_with_opening(proving_key(), credit, branch, &mut self.rng)
@@ -321,7 +315,6 @@ pub fn spend_first_coin_for(
     b.add_output(OutputInfo::new(
         *recipient,
         Rhombus::from_raw(pay).unwrap(),
-        Memo::empty(),
         None,
     ))
     .unwrap();
@@ -329,7 +322,6 @@ pub fn spend_first_coin_for(
         b.add_output(OutputInfo::new(
             wallet.address,
             Rhombus::from_raw(change).unwrap(),
-            Memo::empty(),
             None,
         ))
         .unwrap();
@@ -356,7 +348,6 @@ pub fn spend_first_coin_with_fee(
     b.add_output(OutputInfo::new(
         *recipient,
         Rhombus::from_raw(pay).unwrap(),
-        Memo::empty(),
         None,
     ))
     .unwrap();
@@ -364,7 +355,6 @@ pub fn spend_first_coin_with_fee(
         b.add_output(OutputInfo::new(
             wallet.address,
             Rhombus::from_raw(change).unwrap(),
-            Memo::empty(),
             None,
         ))
         .unwrap();

@@ -6,7 +6,6 @@ use protocol::builder::{Builder, OutputInfo, SpendInfo};
 use protocol::consensus::action_class_for;
 use protocol::consensus::{BranchId, MAX_ACTIONS};
 use protocol::fee::FeeOpening;
-use protocol::memo::Memo;
 use protocol::transaction::Transaction;
 use rand_core::{CryptoRng, RngCore};
 use systemcall_proof::ProvingKey;
@@ -160,15 +159,13 @@ fn quote_from(
     })
 }
 
-/// What to pay, to whom, with which memo.
+/// What to pay, to whom
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Payment {
     /// The recipient.
     pub recipient: RhombusAddress,
     /// The amount.
     pub amount: RawCoin,
-    /// The memo.
-    pub memo: Memo,
 }
 
 /// A built transaction and the coins it spends.
@@ -283,7 +280,6 @@ fn build_selected(
         builder.add_output(OutputInfo::new(
             payment.recipient.clone(),
             payment.amount,
-            payment.memo.clone(),
             ovk.clone(),
         ))?;
     }
@@ -295,7 +291,6 @@ fn build_selected(
         builder.add_output(OutputInfo::new(
             keys.default_address()?,
             RawCoin::from_raw(change)?,
-            Memo::empty(),
             ovk,
         ))?;
     }
@@ -330,7 +325,6 @@ mod tests {
         let nullifier = Nullifier::from_base(&pallas::Base::from(u64::from(position)));
         OwnedCoin {
             coin,
-            memo: Memo::empty(),
             position: u64::from(position),
             nullifier,
             height: 1,
@@ -370,7 +364,6 @@ mod tests {
         Payment {
             recipient: keys.default_address().unwrap(),
             amount: RawCoin::from_raw(amount).unwrap(),
-            memo: Memo::empty(),
         }
     }
 

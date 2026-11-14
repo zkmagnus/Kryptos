@@ -12,7 +12,7 @@ pub use systemcall_circuit::Error;
 
 /// Version of the SystemCall proof adapter API, not the wire transaction
 /// version. V2 exposes a top-level private-fee transaction proof envelope.
-pub const API_VERSION: u16 = 2;
+pub const API_VERSION: u16 = 1;
 
 /// Name of the proving backend currently used by this adapter.
 pub const BACKEND: &str = "halo2";

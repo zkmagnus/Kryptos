@@ -20,7 +20,6 @@ use protocol::block::{empty_header, Block, PowSolution};
 use protocol::builder::{Builder, OutputInfo, SpendInfo};
 use protocol::bytes::Encodable;
 use protocol::consensus::{subsidy, BranchId};
-use protocol::memo::Memo;
 use protocol::transaction::Transaction;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
@@ -94,7 +93,6 @@ fn a_coinbase_output_can_be_spent_once() {
     b.add_output(OutputInfo::new(
         recipient.address,
         protocol::coin::Rhombus::from_raw(pay).unwrap(),
-        Memo::empty(),
         None,
     ))
     .unwrap();
@@ -340,13 +338,8 @@ fn coinbase_for(
 ) -> protocol::transaction::Transaction {
     let credit = subsidy(parent.height + 1);
     let mut b = Builder::new(parent.commitment_root);
-    b.add_output(OutputInfo::new(
-        h.miner.address,
-        credit,
-        Memo::empty(),
-        None,
-    ))
-    .unwrap();
+    b.add_output(OutputInfo::new(h.miner.address, credit, None))
+        .unwrap();
     b.build_coinbase(proving_key(), credit, branch, &mut h.rng)
         .unwrap()
 }
@@ -409,13 +402,8 @@ fn a_coinbase_claiming_the_wrong_credit_is_rejected() {
     for wrong in [subsidy(height).raw() + 1, subsidy(height).raw() - 1] {
         let credit = protocol::coin::Rhombus::from_raw(wrong).unwrap();
         let mut b = Builder::new(parent.commitment_root);
-        b.add_output(OutputInfo::new(
-            h.miner.address,
-            credit,
-            Memo::empty(),
-            None,
-        ))
-        .unwrap();
+        b.add_output(OutputInfo::new(h.miner.address, credit, None))
+            .unwrap();
         let coinbase = b
             .build_coinbase(
                 proving_key(),
@@ -443,12 +431,7 @@ fn only_the_first_transaction_may_create_value() {
     let credit = subsidy(parent.height + 1);
     let mut first = Builder::new(parent.commitment_root);
     first
-        .add_output(OutputInfo::new(
-            h.miner.address,
-            credit,
-            Memo::empty(),
-            None,
-        ))
+        .add_output(OutputInfo::new(h.miner.address, credit, None))
         .unwrap();
     let coinbase = first
         .build_coinbase(
@@ -460,12 +443,7 @@ fn only_the_first_transaction_may_create_value() {
         .unwrap();
     let mut second = Builder::new(parent.commitment_root);
     second
-        .add_output(OutputInfo::new(
-            h.miner.address,
-            credit,
-            Memo::empty(),
-            None,
-        ))
+        .add_output(OutputInfo::new(h.miner.address, credit, None))
         .unwrap();
     let extra = second
         .build_coinbase(

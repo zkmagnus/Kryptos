@@ -13,7 +13,6 @@ use protocol::block::{Block, BlockHash};
 use protocol::bytes::Encodable;
 use protocol::compact::CompactBlock;
 use protocol::consensus::{next_height, BranchId};
-use protocol::memo::Memo;
 use systemcall_proof::ProvingKey;
 use wallet::keys::WalletKeys;
 use wallet::seed::SeedPhrase;
@@ -227,7 +226,6 @@ pub enum Command {
         /// The node.
         #[command(flatten)]
         rpc: RpcArgs,
-        /// Scan compact blocks instead of full ones. Memos are not
         /// recovered, but the balance and witnesses are the same.
         #[arg(long)]
         light: bool,
@@ -388,7 +386,6 @@ async fn batch_transfer(
         payments.push(Payment {
             recipient,
             amount: RawCoin::from_raw(amount)?,
-            memo: Memo::empty(),
         });
     }
     let wallet = open_wallet(wallet_args, genesis)?;
@@ -473,11 +470,7 @@ async fn send(
     let pk = tokio::task::spawn_blocking(ProvingKey::build)
         .await
         .map_err(|_| Error::Stopped)??;
-    let payment = Payment {
-        recipient,
-        amount,
-        memo: Memo::empty(),
-    };
+    let payment = Payment { recipient, amount };
     let built = match fee {
         Some(raw) => build_payments_with_fee(
             &wallet,
@@ -628,11 +621,7 @@ pub async fn pay(
     fee: u64,
     branch: BranchId,
 ) -> Result<String> {
-    let payment = Payment {
-        recipient,
-        amount,
-        memo: Memo::empty(),
-    };
+    let payment = Payment { recipient, amount };
     let built = build_payments_with_fee(
         wallet,
         &[payment],

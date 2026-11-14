@@ -25,7 +25,6 @@ struct Args {
     /// Wallet database; defaults to rhombus-data/<network>/wallet.redb.
     #[arg(long)]
     wallet: Option<PathBuf>,
-    /// Scan compact blocks. Memos will not be recovered.
     #[arg(long)]
     light: bool,
     /// Print each coin found while scanning.

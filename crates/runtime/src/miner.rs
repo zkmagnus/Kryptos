@@ -12,7 +12,6 @@ use protocol::block::{empty_header, tx_root, Block, BlockHash, BlockHeader, PowS
 use protocol::builder::{Builder, OutputInfo};
 use protocol::consensus::{next_height, subsidy, BLOCK_VERSION};
 use protocol::fee::FeeOpening;
-use protocol::memo::Memo;
 use protocol::transaction::Transaction;
 use protocol::tree_order::tree_transactions;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -72,7 +71,7 @@ impl Template {
         let height = next_height(self.parent.height)?;
         let credit = self.credit()?;
         let mut coinbase = Builder::new(self.parent.commitment_root);
-        coinbase.add_output(OutputInfo::new(miner.clone(), credit, Memo::empty(), None))?;
+        coinbase.add_output(OutputInfo::new(miner.clone(), credit, None))?;
         let (coinbase, coinbase_blinding) =
             coinbase.build_coinbase_with_opening(pk, credit, self.params.branch_at(height), rng)?;
 

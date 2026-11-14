@@ -152,7 +152,6 @@ mod tests {
     use protocol::coin::Rhombus;
     use protocol::coin::{Coin, RandomSeed, Rho};
     use protocol::consensus::BranchId;
-    use protocol::memo::Memo;
     use protocol::transaction::{Anchor, Transaction};
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
@@ -180,7 +179,7 @@ mod tests {
         builder
             .add_spend(spend)
             .unwrap()
-            .add_output(OutputInfo::new(address, output, Memo::empty(), None))
+            .add_output(OutputInfo::new(address, output, None))
             .unwrap();
         let pk = ProvingKey::build().unwrap();
         let vk = pk.verifying_key();

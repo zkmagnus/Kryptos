@@ -26,7 +26,6 @@ use crate::consensus::action_class_for;
 use crate::consensus::{BranchId, COINBASE_ENTRYPOINT, TRANSFER_ENTRYPOINT};
 use crate::encryption::encrypt_coin;
 use crate::fee::FeeOpening;
-use crate::memo::Memo;
 use crate::transaction::{sighash_of, Anchor, Transaction};
 use crate::{Error, Result};
 
@@ -79,22 +78,15 @@ impl SpendInfo {
 pub struct OutputInfo {
     recipient: RhombusAddress,
     value: RawCoin,
-    memo: Memo,
     ovk: Option<OutgoingViewingKey>,
 }
 
 impl OutputInfo {
     /// A real output. Pass `ovk` so the sender can later recover the coin.
-    pub fn new(
-        recipient: RhombusAddress,
-        value: RawCoin,
-        memo: Memo,
-        ovk: Option<OutgoingViewingKey>,
-    ) -> Self {
+    pub fn new(recipient: RhombusAddress, value: RawCoin, ovk: Option<OutgoingViewingKey>) -> Self {
         Self {
             recipient,
             value,
-            memo,
             ovk,
         }
     }
@@ -105,7 +97,7 @@ impl OutputInfo {
     /// Fails only if key derivation fails, which has negligible probability.
     pub fn dummy(rng: &mut (impl RngCore + CryptoRng)) -> Result<Self> {
         let recipient = random_address(&SpendingKey::random(rng), rng)?;
-        Ok(Self::new(recipient, RawCoin::ZERO, Memo::empty(), None))
+        Ok(Self::new(recipient, RawCoin::ZERO, None))
     }
 
     /// The value.
@@ -401,7 +393,6 @@ fn prepare_action(
     let encrypted = encrypt_coin(
         &coin,
         &output.recipient.kem_key(),
-        &output.memo,
         output.ovk.as_ref(),
         &cv_net,
         rng,
@@ -533,14 +524,12 @@ mod tests {
         b.add_output(OutputInfo::new(
             bob.address,
             amount(3_000),
-            Memo::from_text("hi").unwrap(),
             Some(alice.fvk.outgoing_viewing_key()),
         ))
         .unwrap();
         b.add_output(OutputInfo::new(
             alice.address,
             amount(change),
-            Memo::empty(),
             Some(alice.fvk.outgoing_viewing_key()),
         ))
         .unwrap();
@@ -572,11 +561,10 @@ mod tests {
         for action in tx.actions() {
             let body = action.body();
             let rho = Rho::from_nullifier(body.nullifier()).unwrap();
-            if let Ok((coin, memo)) =
+            if let Ok(coin) =
                 decrypt_coin_with_ivk(&bob_ivk, body.encrypted_coin(), rho, body.cmx())
             {
                 assert_eq!(coin.value(), amount(3_000));
-                assert_eq!(memo.to_text(), Some("hi"));
                 bob_found += 1;
             }
             if let Ok((coin, _)) = decrypt_coin_with_ovk(
@@ -603,13 +591,8 @@ mod tests {
         let mut b = Builder::new(ledger.anchor());
         b.add_spend(spend).unwrap();
         for _ in 0..3 {
-            b.add_output(OutputInfo::new(
-                alice.address,
-                amount(10_000),
-                Memo::empty(),
-                None,
-            ))
-            .unwrap();
+            b.add_output(OutputInfo::new(alice.address, amount(10_000), None))
+                .unwrap();
         }
         let tx = b.build(test_keys::proving_key(), BRANCH, &mut rng).unwrap();
         assert_eq!(tx.actions().len(), 4);
@@ -624,13 +607,8 @@ mod tests {
         let spend = ledger.fund(&mut rng, &alice, 10_000);
         let mut b = Builder::new(Anchor::from_base(crypto::pallas::Base::from(99u64)));
         b.add_spend(spend).unwrap();
-        b.add_output(OutputInfo::new(
-            alice.address,
-            amount(10_000),
-            Memo::empty(),
-            None,
-        ))
-        .unwrap();
+        b.add_output(OutputInfo::new(alice.address, amount(10_000), None))
+            .unwrap();
         // The prover does not check constraints; the proof it emits for a
         // path that does not reach the anchor simply fails to verify.
         let tx = b.build(test_keys::proving_key(), BRANCH, &mut rng).unwrap();
@@ -649,7 +627,6 @@ mod tests {
         b.add_output(OutputInfo::new(
             miner.address,
             credit,
-            Memo::empty(),
             Some(miner.fvk.outgoing_viewing_key()),
         ))
         .unwrap();
@@ -695,12 +672,7 @@ mod tests {
         ));
         let mut short = Builder::new(ledger.anchor());
         short
-            .add_output(OutputInfo::new(
-                miner.address,
-                amount(4),
-                Memo::empty(),
-                None,
-            ))
+            .add_output(OutputInfo::new(miner.address, amount(4), None))
             .unwrap();
         assert!(matches!(
             short.build_coinbase(test_keys::proving_key(), amount(5), BRANCH, &mut rng),
@@ -716,13 +688,8 @@ mod tests {
         let spend = ledger.fund(&mut rng, &alice, 1_000);
         let mut b = Builder::new(ledger.anchor());
         b.add_spend(spend).unwrap();
-        b.add_output(OutputInfo::new(
-            alice.address,
-            amount(999),
-            Memo::empty(),
-            None,
-        ))
-        .unwrap();
+        b.add_output(OutputInfo::new(alice.address, amount(999), None))
+            .unwrap();
         assert!(matches!(
             b.build(test_keys::proving_key(), BRANCH, &mut rng),
             Err(Error::Unbalanced)
@@ -764,7 +731,7 @@ mod tests {
         let alice = wallet(&mut rng);
         let mut ledger = Ledger::default();
         let spend = ledger.fund(&mut rng, &alice, 500);
-        let output = OutputInfo::new(alice.address, amount(200), Memo::empty(), None);
+        let output = OutputInfo::new(alice.address, amount(200), None);
         let prepared = prepare_action(&spend, &output, &mut rng).unwrap();
         let anchor = ledger.anchor();
         let aggregate = *prepared.body.cv_net().as_point();

@@ -335,7 +335,7 @@ impl Wallet {
 
     /// Scans the next full block: appends its commitments to the witness
     /// tree, marking the ones it owns, takes a checkpoint at the block's
-    /// height, records owned coins with their memos and marks coins it
+    /// height, records owned coins marks coins it
     /// spent. All or nothing.
     ///
     /// Commitments enter in the block's transaction order.
@@ -353,7 +353,7 @@ impl Wallet {
 
     /// Scans the next block from its compact form, as a light client does.
     /// It maintains the same witness tree and finds the same coins, but
-    /// their memos are not recovered.
+
     ///
     /// # Errors
     /// Returns [`Error::OutOfOrder`] if `block` is not the next height.
@@ -814,7 +814,6 @@ mod tests {
     use protocol::builder::{Builder, OutputInfo, SpendInfo};
     use protocol::coin::Rhombus as RawCoin;
     use protocol::consensus::BranchId;
-    use protocol::memo::Memo;
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
     use systemcall_proof::ProvingKey;
@@ -865,7 +864,6 @@ mod tests {
         b.add_output(OutputInfo::new(
             keys.default_address().unwrap(),
             credit,
-            Memo::from_text("cb").unwrap(),
             None,
         ))
         .unwrap();
@@ -938,7 +936,6 @@ mod tests {
         assert_eq!(wallet.next_height().unwrap(), 2);
         assert_eq!(wallet.scanned_hash(1).unwrap(), Some(b1.hash()));
         let coin = &wallet.unspent().unwrap()[0];
-        assert_eq!(coin.memo.to_text(), Some("cb"));
 
         let (path_to_coin, anchor) = wallet.witness(coin.position).unwrap();
         let mut b = Builder::new(anchor);
@@ -947,7 +944,6 @@ mod tests {
         b.add_output(OutputInfo::new(
             other_keys.default_address().unwrap(),
             RawCoin::from_raw(1_000).unwrap(),
-            Memo::empty(),
             None,
         ))
         .unwrap();
@@ -955,7 +951,6 @@ mod tests {
         b.add_output(OutputInfo::new(
             owner.default_address().unwrap(),
             RawCoin::from_raw(change).unwrap(),
-            Memo::empty(),
             None,
         ))
         .unwrap();
@@ -1049,9 +1044,6 @@ mod tests {
         let (fp, fa) = full.witness(full.unspent().unwrap()[0].position).unwrap();
         assert_eq!(la, fa, "same anchor");
         assert_eq!(lp, fp, "same witness");
-        // The memo is the one difference: compact blocks omit it.
-        assert_eq!(light.unspent().unwrap()[0].memo.to_text(), Some(""));
-        assert_eq!(full.unspent().unwrap()[0].memo.to_text(), Some("cb"));
 
         light
             .scan_compact(&CompactBlock::from_block(&b1).unwrap())
@@ -1138,7 +1130,6 @@ mod tests {
         let payment = Payment {
             recipient: wallet.keys().default_address().unwrap(),
             amount: RawCoin::from_raw(5).unwrap(),
-            memo: Memo::empty(),
         };
         let mut op = wallet
             .add_operation(vec![payment.clone()], 3, 1_000)

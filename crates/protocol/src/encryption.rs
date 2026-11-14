@@ -1,7 +1,7 @@
 //! Coin plaintext layout, encryption, and trial decryption.
 //!
 //! ```text
-//! coin plaintext  = version(1) || d(11) || value(8 LE) || rseed(32) || memo(512)
+//! coin plaintext  = version(1) || d(11) || value(8 LE) || rseed(32) ||
 //! out plaintext   = pk_d(32) || ek(1184) || KEM shared secret(32)
 //! ```
 //!
@@ -26,14 +26,13 @@ use rand_core::{CryptoRng, RngCore};
 use crate::amount::RawCoin;
 use crate::bytes::{Encodable, Reader, Writer};
 use crate::coin::{Coin, ExtractedCoinCommitment, RandomSeed, Rho, RANDOM_SEED_LEN};
-use crate::memo::{Memo, MEMO_LEN};
 use crate::{Error, Result};
 
 /// The only plaintext version currently defined.
 const PLAINTEXT_VERSION: u8 = 0x01;
 
 /// Byte length of a coin plaintext.
-pub const COIN_PLAINTEXT_LEN: usize = 1 + DIVERSIFIER_LEN + 8 + RANDOM_SEED_LEN + MEMO_LEN;
+pub const COIN_PLAINTEXT_LEN: usize = 1 + DIVERSIFIER_LEN + 8 + RANDOM_SEED_LEN;
 /// Byte length of a coin ciphertext.
 pub const COIN_CIPHERTEXT_LEN: usize = COIN_PLAINTEXT_LEN + TAG_LEN;
 /// Byte length of an outgoing plaintext.
@@ -45,7 +44,7 @@ pub const OUT_CIPHERTEXT_LEN: usize = OUT_PLAINTEXT_LEN + TAG_LEN;
 pub const ENCRYPTED_COIN_LEN: usize =
     1 + KEM_CIPHERTEXT_LEN + COIN_CIPHERTEXT_LEN + OUT_CIPHERTEXT_LEN;
 /// Bytes of the coin ciphertext a light client needs to detect and
-/// rebuild a coin: version, diversifier, value and seed, but not the memo.
+/// rebuild a coin: version, diversifier, value and seed.
 pub const COMPACT_COIN_LEAD: usize = 1 + DIVERSIFIER_LEN + 8 + RANDOM_SEED_LEN;
 
 /// The encrypted form of a coin as it appears in an action.
@@ -116,7 +115,6 @@ impl Encodable for EncryptedCoin {
 pub fn encrypt_coin(
     coin: &Coin,
     ek: &TransmissionKey,
-    memo: &Memo,
     ovk: Option<&OutgoingViewingKey>,
     cv: &ValueCommitment,
     rng: &mut (impl RngCore + CryptoRng),
@@ -124,7 +122,7 @@ pub fn encrypt_coin(
     let cmx = coin.cmx()?.to_bytes();
     let (kem_ciphertext, shared_secret) = ek.encapsulate(rng)?;
     let key = shared_secret.coin_key(&kem_ciphertext, &cmx);
-    let enc_ciphertext = fixed(key.encrypt(&CoinPlaintext::from_coin(coin, memo).encode()))?;
+    let enc_ciphertext = fixed(key.encrypt(&CoinPlaintext::from_coin(coin).encode()))?;
 
     let (ock, out_plaintext) = match ovk {
         Some(ovk) => (
@@ -155,7 +153,7 @@ pub fn decrypt_coin_with_ivk(
     encrypted: &EncryptedCoin,
     rho: Rho,
     cmx: &ExtractedCoinCommitment,
-) -> Result<(Coin, Memo)> {
+) -> Result<Coin> {
     let shared_secret = receiver_key.decapsulate(&encrypted.kem_ciphertext)?;
     let key = shared_secret.coin_key(&encrypted.kem_ciphertext, &cmx.to_bytes());
     let plaintext = CoinPlaintext::decode(&key.decrypt(&encrypted.enc_ciphertext)?)?;
@@ -168,7 +166,6 @@ pub fn decrypt_coin_with_ivk(
 ///
 /// The lead is decrypted with the receiver's key but not authenticated,
 /// so the coin is accepted only once it matches the action's commitment.
-/// The memo, which is past the lead, is not recovered.
 ///
 /// # Errors
 /// Returns [`crypto::Error::DecryptionFailed`] when the coin is not
@@ -200,7 +197,7 @@ pub fn detect_coin_with_ivk(
     Ok(coin)
 }
 
-/// The fields of a coin plaintext before the memo.
+/// The fields of a coin plaintext.
 struct CoinLead {
     diversifier: Diversifier,
     value: RawCoin,
@@ -236,7 +233,7 @@ pub fn decrypt_coin_with_ovk(
     cv: &ValueCommitment,
     rho: Rho,
     cmx: &ExtractedCoinCommitment,
-) -> Result<(Coin, Memo)> {
+) -> Result<Coin> {
     let (pk_d, _, shared_secret) = recover_output_keys(ovk, encrypted, cv, cmx)?;
     decrypt_coin_with_keys(&pk_d, &shared_secret, encrypted, rho, cmx)
 }
@@ -276,7 +273,7 @@ pub fn decrypt_coin_with_keys(
     encrypted: &EncryptedCoin,
     rho: Rho,
     cmx: &ExtractedCoinCommitment,
-) -> Result<(Coin, Memo)> {
+) -> Result<Coin> {
     let key = shared_secret.coin_key(&encrypted.kem_ciphertext, &cmx.to_bytes());
     let plaintext = CoinPlaintext::decode(&key.decrypt(&encrypted.enc_ciphertext)?)?;
     finish_decryption(plaintext, *pk_d, rho, cmx)
@@ -288,7 +285,7 @@ fn finish_decryption(
     pk_d: DiversifiedTransmissionKey,
     rho: Rho,
     cmx: &ExtractedCoinCommitment,
-) -> Result<(Coin, Memo)> {
+) -> Result<Coin> {
     let coin = Coin::new(
         plaintext.diversifier,
         pk_d,
@@ -300,7 +297,7 @@ fn finish_decryption(
     if coin.cmx()? != *cmx {
         return Err(Error::CoinDecryption("commitment mismatch"));
     }
-    Ok((coin, plaintext.memo))
+    Ok(coin)
 }
 
 /// The decrypted contents of a coin ciphertext.
@@ -309,16 +306,14 @@ struct CoinPlaintext {
     diversifier: Diversifier,
     value: RawCoin,
     rseed: RandomSeed,
-    memo: Memo,
 }
 
 impl CoinPlaintext {
-    fn from_coin(coin: &Coin, memo: &Memo) -> Self {
+    fn from_coin(coin: &Coin) -> Self {
         Self {
             diversifier: *coin.diversifier(),
             value: coin.value(),
             rseed: coin.rseed().clone(),
-            memo: memo.clone(),
         }
     }
 
@@ -327,8 +322,7 @@ impl CoinPlaintext {
         w.put_u8(PLAINTEXT_VERSION)
             .put(self.diversifier.as_bytes())
             .put_u64_le(self.value.raw())
-            .put(self.rseed.as_bytes())
-            .put(self.memo.as_bytes());
+            .put(self.rseed.as_bytes());
         w.into_bytes()
     }
 
@@ -340,13 +334,11 @@ impl CoinPlaintext {
         let diversifier = Diversifier::from_bytes(r.take_array()?);
         let value = RawCoin::from_raw(r.take_u64_le()?)?;
         let rseed = RandomSeed::from_bytes(r.take_array()?);
-        let memo = Memo::from_bytes(r.take_array()?);
         r.finish()?;
         Ok(Self {
             diversifier,
             value,
             rseed,
-            memo,
         })
     }
 }
@@ -421,7 +413,6 @@ mod tests {
         sender: Party,
         receiver: Party,
         coin: Coin,
-        memo: Memo,
         cv: ValueCommitment,
         cmx: ExtractedCoinCommitment,
         encrypted: EncryptedCoin,
@@ -438,17 +429,15 @@ mod tests {
             rho,
             RandomSeed::random(&mut rng),
         );
-        let memo = Memo::from_text("grazie").unwrap();
         let cv = ValueCommitment::commit(-4_200, &ValueCommitTrapdoor::random(&mut rng));
         let cmx = coin.cmx().unwrap();
         let ovk = with_ovk.then_some(&sender.ovk);
-        let encrypted = encrypt_coin(&coin, &memo, ovk, &cv, &mut rng).unwrap();
+        let encrypted = encrypt_coin(&coin, ovk, &cv, &mut rng).unwrap();
         Scenario {
             rng,
             sender,
             receiver,
             coin,
-            memo,
             cv,
             cmx,
             encrypted,
@@ -464,28 +453,28 @@ mod tests {
 
     #[test]
     fn sizes_are_fixed() {
-        assert_eq!(COIN_PLAINTEXT_LEN, 564);
-        assert_eq!(COIN_CIPHERTEXT_LEN, 580);
-        assert_eq!(OUT_CIPHERTEXT_LEN, 80);
+        assert_eq!(
+            COIN_PLAINTEXT_LEN,
+            1 + DIVERSIFIER_LEN + 8 + RANDOM_SEED_LEN
+        );
+        assert_eq!(COIN_CIPHERTEXT_LEN, COIN_PLAINTEXT_LEN + TAG_LEN);
     }
 
     #[test]
     fn receiver_decrypts_with_ivk() {
         let s = scenario(1, true);
-        let (coin, memo) =
+        let (coin) =
             decrypt_coin_with_ivk(&s.receiver.ivk, &s.encrypted, *s.coin.rho(), &s.cmx).unwrap();
         assert_same_coin(&coin, &s.coin);
-        assert_eq!(memo, s.memo);
     }
 
     #[test]
     fn sender_decrypts_with_ovk() {
         let s = scenario(2, true);
-        let (coin, memo) =
+        let (coin) =
             decrypt_coin_with_ovk(&s.sender.ovk, &s.encrypted, &s.cv, *s.coin.rho(), &s.cmx)
                 .unwrap();
         assert_same_coin(&coin, &s.coin);
-        assert_eq!(memo, s.memo);
     }
 
     #[test]
@@ -551,11 +540,10 @@ mod tests {
     #[test]
     fn plaintext_roundtrips_and_rejects_bad_version_and_length() {
         let s = scenario(8, true);
-        let encoded = CoinPlaintext::from_coin(&s.coin, &s.memo).encode();
+        let encoded = CoinPlaintext::from_coin(&s.coin).encode();
         assert_eq!(encoded.len(), COIN_PLAINTEXT_LEN);
         let decoded = CoinPlaintext::decode(&encoded).unwrap();
         assert_eq!(decoded.value, s.coin.value());
-        assert_eq!(decoded.memo, s.memo);
 
         let mut bad_version = encoded.clone();
         bad_version[0] = 0x02;
@@ -572,7 +560,7 @@ mod tests {
     #[test]
     fn plaintext_accepts_the_full_raw_amount_range() {
         let s = scenario(9, true);
-        let mut encoded = CoinPlaintext::from_coin(&s.coin, &s.memo).encode();
+        let mut encoded = CoinPlaintext::from_coin(&s.coin).encode();
         encoded[12..20].copy_from_slice(&u64::MAX.to_le_bytes());
         assert_eq!(
             CoinPlaintext::decode(&encoded).unwrap().value.raw(),

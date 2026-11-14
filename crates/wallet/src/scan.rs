@@ -6,7 +6,6 @@ use protocol::bytes::{Encodable, Reader, Writer};
 use protocol::coin::{Coin, RandomSeed, Rho};
 use protocol::compact::CompactBlock;
 use protocol::encryption::{decrypt_coin_with_ivk, detect_coin_with_ivk};
-use protocol::memo::Memo;
 use protocol::nullifier::Nullifier;
 use protocol::transaction::{Transaction, TxId};
 
@@ -18,8 +17,6 @@ use crate::Result;
 pub struct OwnedCoin {
     /// The coin.
     pub coin: Coin,
-    /// Its memo.
-    pub memo: Memo,
     /// Its position in the commitment tree.
     pub position: u64,
     /// The nullifier spending it reveals.
@@ -37,7 +34,6 @@ pub struct OwnedCoin {
 impl Encodable for OwnedCoin {
     fn write(&self, w: &mut Writer) {
         self.coin.write(w);
-        self.memo.write(w);
         w.put_u64_le(self.position);
         self.nullifier.write(w);
         w.put(&self.height.to_le_bytes());
@@ -55,7 +51,6 @@ impl Encodable for OwnedCoin {
 
     fn read(r: &mut Reader<'_>) -> protocol::Result<Self> {
         let coin = Coin::read(r)?;
-        let memo = Memo::read(r)?;
         let position = r.take_u64_le()?;
         let nullifier = Nullifier::read(r)?;
         let height = u32::from_le_bytes(r.take_array()?);
@@ -68,7 +63,6 @@ impl Encodable for OwnedCoin {
         let spent_by = read_txid(r)?;
         Ok(Self {
             coin,
-            memo,
             position,
             nullifier,
             height,
@@ -199,7 +193,7 @@ pub fn scan_block(
                 rho,
                 body.cmx(),
             );
-            let Ok((coin, memo)) = decrypted else {
+            let Ok(coin) = decrypted else {
                 stand_in.work(keys)?;
                 continue;
             };
@@ -209,7 +203,6 @@ pub fn scan_block(
             }
             scan.found.push(OwnedCoin {
                 coin,
-                memo,
                 position,
                 nullifier,
                 height: block.header().height,
@@ -223,7 +216,7 @@ pub fn scan_block(
 }
 
 /// Detects owned coins in one compact block. Produces the same leaves as
-/// [`scan_block`] and the same owned coins, except that their memos are
+/// [`scan_block`] and the same owned coins
 /// empty, since a compact block omits them. Its spent nullifiers are those
 /// of its block-order actions. It includes the coinbase, which differs only
 /// in dummy spends that never match a wallet coin.
@@ -261,7 +254,6 @@ pub fn scan_compact_block(
         }
         scan.found.push(OwnedCoin {
             coin,
-            memo: Memo::empty(),
             position,
             nullifier,
             height: block.height,

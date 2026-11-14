@@ -26,7 +26,6 @@ use protocol::consensus::{
     next_height, proof_len, BranchId, ACTION_CLASSES, BLOCK_EMISSION_START, EMISSION_INTERVAL,
     MAX_ACTIONS, MAX_BLOCK_TRANSACTIONS, TAIL_BLOCK_EMISSION,
 };
-use protocol::memo::Memo;
 use protocol::nullifier::Nullifier;
 use protocol::transaction::{Transaction, TxId};
 use serde::de::DeserializeOwned;
@@ -1197,31 +1196,9 @@ fn peer_json(peer: &PeerSummary) -> Value {
     })
 }
 
-/// A memo as both services report it: `null` when empty, the text when it
-/// is UTF-8, otherwise `{"hex": ...}` so binary memos are never lost.
-pub(crate) fn memo_json(memo: &Memo) -> Value {
-    if memo.is_empty() {
-        return Value::Null;
-    }
-    match memo.to_text() {
-        Some(text) => json!(text),
-        None => json!({ "hex": to_hex(memo.as_bytes()) }),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use protocol::address::RhombusAddress as Address;
-
-    #[test]
-    fn memo_json_reports_empty_text_and_binary_memos() {
-        assert_eq!(memo_json(&Memo::empty()), Value::Null);
-        assert_eq!(memo_json(&Memo::from_text("ciao").unwrap()), json!("ciao"));
-        let mut bytes = [0u8; protocol::memo::MEMO_LEN];
-        bytes[0] = 0xff;
-        let hex = memo_json(&Memo::from_bytes(bytes));
-        assert_eq!(hex["hex"].as_str().unwrap(), to_hex(&bytes));
-    }
 
     use super::*;
 

@@ -21,7 +21,6 @@ use protocol::address::RhombusAddress;
 use protocol::amount::RawCoin;
 use protocol::bytes::Encodable;
 use protocol::consensus::next_height;
-use protocol::memo::Memo;
 use protocol::transaction::{Transaction, TxId};
 use serde_json::{json, Value};
 use systemcall_proof::ProvingKey;
@@ -34,7 +33,7 @@ use wallet::wallet::Wallet;
 
 use crate::cli::sync_wallet;
 use crate::config::Network;
-use crate::jsonrpc::{memo_json, serve_with, unknown_method, Dispatch, Params, RpcError, REJECTED};
+use crate::jsonrpc::{serve_with, unknown_method, Dispatch, Params, RpcError, REJECTED};
 use crate::node::TxStatus;
 use crate::paths;
 use crate::rpc::{transaction_status, Control, Endpoint, Source, Token};
@@ -112,7 +111,7 @@ pub struct Args {
     /// Seconds between syncs from the node.
     #[arg(long, default_value_t = DEFAULT_SYNC_SECONDS)]
     pub sync_interval: u64,
-    /// Scan compact blocks instead of full ones: faster, no memos.
+    /// Scan compact blocks instead of full ones: faster
     #[arg(long)]
     pub light: bool,
     /// Log level: debug, info, warn or error.
@@ -743,7 +742,6 @@ impl WalletDaemon {
             "address": address.encode(self.0.params.address_prefix),
             "address_index": index,
             "label": index.and_then(|i| labels.get(&i).cloned()),
-            "memo": memo_json(&coin.memo),
             "spent": coin.spent_at.is_some(),
             "spent_at": coin.spent_at,
             "spent_by": coin.spent_by.map(|t| t.to_string()),
@@ -772,14 +770,10 @@ impl WalletDaemon {
                     .and_then(Value::as_str)
                     .ok_or_else(|| RpcError::invalid_params("recipient address"))?;
                 let amount = parse_amount(item.get("amount"))?;
-                let memo = match item.get("memo").and_then(Value::as_str) {
-                    Some(text) => Memo::from_text(text)?,
-                    None => Memo::empty(),
-                };
+
                 Ok(Payment {
                     recipient: self.parse_address(address)?,
                     amount,
-                    memo,
                 })
             })
             .collect()
@@ -799,7 +793,6 @@ impl WalletDaemon {
             "recipients": op.recipients.iter().map(|p| json!({
                 "address": p.recipient.encode(prefix),
                 "amount": p.amount.raw().to_string(),
-                "memo": memo_json(&p.memo),
             })).collect::<Vec<_>>(),
             "total": op.total().to_string(),
             "min_confirmations": op.min_confirmations,
@@ -822,7 +815,6 @@ fn is_cancellable(op: &Operation) -> bool {
     op.status == OperationStatus::Queued && op.transaction.is_none()
 }
 
-/// A memo as text when it is text, else as hex, else null when empty.
 /// An amount given as a decimal string or a number, in smallest units.
 fn parse_amount(value: Option<&Value>) -> core::result::Result<RawCoin, RpcError> {
     let raw = match value {
@@ -1158,7 +1150,6 @@ mod tests {
                 vec![Payment {
                     recipient: wallet.keys().address(1u64.into()).unwrap(),
                     amount: RawCoin::from_raw(1_000).unwrap(),
-                    memo: Memo::empty(),
                 }],
                 1,
                 0,
@@ -1176,7 +1167,6 @@ mod tests {
             .add_output(protocol::builder::OutputInfo::new(
                 keys.default_address().unwrap(),
                 RawCoin::ZERO,
-                Memo::empty(),
                 None,
             ))
             .unwrap();
@@ -1600,15 +1590,6 @@ mod tests {
         assert!(parse_amount(Some(&json!(1.5))).is_err());
         assert!(parse_amount(None).is_err());
         assert!(parse_amount(Some(&json!("99999999999999999999"))).is_err());
-    }
-
-    #[test]
-    fn memos_render_as_text_hex_or_null() {
-        assert_eq!(memo_json(&Memo::empty()), Value::Null);
-        assert_eq!(memo_json(&Memo::from_text("hi").unwrap()), json!("hi"));
-        let mut raw = [0u8; protocol::memo::MEMO_LEN];
-        raw[0] = 0xff;
-        assert!(memo_json(&Memo::from_bytes(raw))["hex"].is_string());
     }
 
     #[test]
