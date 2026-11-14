@@ -1,13 +1,13 @@
-# ML-KEM note encryption proposal
+# ML-KEM coin encryption proposal
 
 Status: implementation draft; not activated on a public network.
 
 ## Motivation
 
-Add post-quantum key establishment for encrypted note payloads while keeping
-the current spend authorization, diversified Pallas transmission key, note
+Add post-quantum key establishment for encrypted coin payloads while keeping
+the current spend authorization, diversified Pallas transmission key, coin
 commitment, nullifier, and proof circuit unchanged. This is a hybrid protocol:
-ML-KEM protects note encryption key establishment; it does not make the
+ML-KEM protects coin encryption key establishment; it does not make the
 shielded pool or spend authorization post-quantum.
 
 ## Rules and encoding
@@ -18,22 +18,22 @@ shielded pool or spend authorization post-quantum.
 - Add one ML-KEM encapsulation key to each payment address. It is shared by all
   diversified addresses of the same full viewing key, so those addresses are
   linkable by this key.
-- Each encrypted note carries a fixed-size ML-KEM-768 ciphertext. The sender
-  derives the note AEAD key from the KEM shared secret, ciphertext, and note
+- Each encrypted coin carries a fixed-size ML-KEM-768 ciphertext. The sender
+  derives the coin AEAD key from the KEM shared secret, ciphertext, and coin
   commitment. ChaCha20-Poly1305 and the current plaintext remain in use.
 - The outgoing ciphertext carries the transmission key and KEM shared secret,
   encrypted under the sender's outgoing viewing key, so sender recovery remains
   possible.
-- Compact actions carry the KEM ciphertext plus the existing encrypted-note
+- Compact actions carry the KEM ciphertext plus the existing encrypted-coin
   lead. Light-wallet scans decapsulate, decrypt the lead, and confirm the
-  existing note commitment.
-- The encrypted-note encoding receives an explicit format tag. Old encrypted
-  notes and old addresses are not accepted by this draft encoding.
+  existing coin commitment.
+- The encrypted-coin encoding receives an explicit format tag. Old encrypted
+  coins and old addresses are not accepted by this draft encoding.
 
 ## Compatibility and activation
 
 This changes address and action bytes, transaction IDs, compact blocks, and
-stored wallet notes. It requires a new genesis for each network (or a separately
+stored wallet coins. It requires a new genesis for each network (or a separately
 specified height-based activation before any public deployment). The consensus
 revision and rules digest must change so existing chain stores are rejected.
 No mixed old/new validity period is defined here.
@@ -50,8 +50,8 @@ scan and bandwidth costs before activation.
 ## Failure behavior
 
 ML-KEM decapsulation uses implicit rejection: malformed-but-correctly-sized
-ciphertexts produce a pseudorandom shared secret. Note ownership is determined
-by the AEAD tag, then by parsing and matching the note commitment. Wrong-sized
+ciphertexts produce a pseudorandom shared secret. coin ownership is determined
+by the AEAD tag, then by parsing and matching the coin commitment. Wrong-sized
 encodings are rejected by the decoder. The outgoing ciphertext is authenticated
 and binds the action commitment and KEM ciphertext.
 

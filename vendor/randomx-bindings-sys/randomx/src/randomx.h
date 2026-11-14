@@ -147,7 +147,7 @@ RANDOMX_EXPORT unsigned long randomx_dataset_item_count(void);
 /**
  * Initializes dataset items.
  *
- * Note: In order to use the Dataset, all items from 0 to (randomx_dataset_item_count() - 1) must be initialized.
+ * Coin: In order to use the Dataset, all items from 0 to (randomx_dataset_item_count() - 1) must be initialized.
  * This may be done by several calls to this function using non-overlapping item sequences.
  *
  * @param dataset is a pointer to a previously allocated randomx_dataset structure. Must not be NULL.
