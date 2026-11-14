@@ -4,19 +4,17 @@ use chain::difficulty::{next_target, Sample};
 use chain::params::ChainParams;
 use chain::pow::RandomXPow;
 use chain::target::Target;
-use crypto::commitment::ValueCommitTrapdoor;
-use crypto::signature::BindingSigningKey;
 use protocol::address::RhombusAddress;
 use protocol::amount::RawCoin;
 use protocol::block::{empty_header, tx_root, Block, BlockHash, BlockHeader, PowSolution};
 use protocol::builder::{Builder, OutputInfo};
-use protocol::consensus::{next_height, subsidy, BLOCK_VERSION};
-use protocol::fee::FeeOpening;
+use protocol::consensus::{next_height, BLOCK_VERSION};
+use protocol::fee::block_mint;
 use protocol::transaction::Transaction;
 use protocol::tree_order::tree_transactions;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use systemcall_proof::ProvingKey;
+use transaction_proof::ProvingKey;
 
 use rand_core::{CryptoRng, RngCore};
 use storage::tree::CommitmentTree;
@@ -43,8 +41,6 @@ pub struct Template {
     pub tree: CommitmentTree,
     /// Transactions to include after the coinbase.
     pub transactions: Vec<Transaction>,
-    /// Relay openings corresponding to `transactions`, in the same order.
-    pub fee_openings: Vec<FeeOpening>,
     /// Network parameters.
     pub params: ChainParams,
     /// Wall-clock time.
@@ -63,30 +59,12 @@ impl Template {
         miner: &RhombusAddress,
         pk: &ProvingKey,
         rng: &mut (impl RngCore + CryptoRng),
-    ) -> Result<(
-        BlockHeader,
-        Vec<Transaction>,
-        crypto::signature::BindingSignature,
-    )> {
+    ) -> Result<(BlockHeader, Vec<Transaction>)> {
         let height = next_height(self.parent.height)?;
-        let credit = self.credit()?;
+        let mint = self.mint()?;
         let mut coinbase = Builder::new(self.parent.commitment_root);
-        coinbase.add_output(OutputInfo::new(miner.clone(), credit, None))?;
-        let (coinbase, coinbase_blinding) =
-            coinbase.build_coinbase_with_opening(pk, credit, self.params.branch_at(height), rng)?;
-
-        if self.fee_openings.len() != self.transactions.len() {
-            return Err(Error::Argument(
-                "template fee openings do not match transactions".into(),
-            ));
-        }
-        let mut block_blindings: Vec<ValueCommitTrapdoor> = self
-            .fee_openings
-            .iter()
-            .map(|opening| ValueCommitTrapdoor::from_scalar(opening.blinding()))
-            .collect();
-        block_blindings.push(coinbase_blinding);
-        let binding_key = BindingSigningKey::from_trapdoors(block_blindings.iter())?;
+        coinbase.add_output(OutputInfo::new(miner.clone(), mint, None))?;
+        let coinbase = coinbase.build_coinbase(pk, mint, self.params.branch_at(height), rng)?;
 
         let mut transactions = vec![coinbase];
         transactions.extend(self.transactions.iter().cloned());
@@ -114,20 +92,15 @@ impl Template {
             nonce: [0; 32],
             solution: PowSolution::empty(),
         };
-        let message = Block::binding_message(&header);
-        let signature = binding_key.sign(rng, &message);
-        Ok((header, transactions, signature))
+        Ok((header, transactions))
     }
 
-    /// The scheduled subsidy plus fee amounts from selected relay openings.
-    ///
-    pub fn credit(&self) -> Result<RawCoin> {
-        let height = next_height(self.parent.height)?;
-        let mut credit = subsidy(height);
-        for tx in &self.transactions {
-            credit = credit.checked_add(tx.fee())?;
-        }
-        Ok(credit)
+    /// The coinbase mint: subsidy plus included transfer fees.
+    pub fn mint(&self) -> Result<RawCoin> {
+        Ok(block_mint(
+            next_height(self.parent.height)?,
+            self.transactions.iter().map(Transaction::fee),
+        )?)
     }
 
     /// The target the next block must meet.
@@ -169,13 +142,9 @@ impl Template {
         if !keep_going() {
             return Ok(None);
         }
-        let (mut header, transactions, binding_signature) = self.assemble(miner, pk, rng)?;
+        let (mut header, transactions) = self.assemble(miner, pk, rng)?;
         if pow.mine_while(&mut header, NONCES_PER_TEMPLATE, rng, keep_going)? {
-            Ok(Some(Block::new_with_binding_signature(
-                header,
-                transactions,
-                binding_signature,
-            )))
+            Ok(Some(Block::new(header, transactions)))
         } else {
             Ok(None)
         }

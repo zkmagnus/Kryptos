@@ -15,17 +15,16 @@ use crypto::keys::{
 use crypto::merkle::{MerklePath, EMPTY_LEAF, MERKLE_DEPTH};
 use crypto::signature::{BindingSigningKey, RandomizedSigningKey, SpendAuthRandomizer};
 use rand_core::{CryptoRng, RngCore};
-use systemcall_circuit::{ActionWitness, CoinWitness, SpendWitness};
-use systemcall_proof::{PrivateTransactionProofV2, ProvingKey};
+use transaction_circuit::{ActionWitness, CoinWitness, SpendWitness};
+use transaction_proof::{PrivateTransactionProofV2, ProvingKey};
 
 use crate::action::{Action, ActionBody};
 use crate::address::RhombusAddress;
 use crate::amount::{RawCoin, ValueSum};
 use crate::coin::{Coin, RandomSeed, Rho};
 use crate::consensus::action_class_for;
-use crate::consensus::{BranchId, COINBASE_ENTRYPOINT, TRANSFER_ENTRYPOINT};
+use crate::consensus::{BranchId, COINBASE_KIND, TRANSFER_KIND};
 use crate::encryption::encrypt_coin;
-use crate::fee::FeeOpening;
 use crate::transaction::{sighash_of, Anchor, Transaction};
 use crate::{Error, Result};
 
@@ -183,23 +182,14 @@ impl Builder {
         branch: BranchId,
         rng: &mut (impl RngCore + CryptoRng),
     ) -> Result<Transaction> {
-        self.build_with_fee_opening(fee, pk, branch, rng)
-            .map(|(transaction, _)| transaction)
-    }
-
-    /// Builds a transfer and returns its fee opening as out-of-band relay
-    /// metadata. The opening must not be added to the transaction or block.
-    pub fn build_with_fee_opening(
-        self,
-        fee: RawCoin,
-        pk: &ProvingKey,
-        branch: BranchId,
-        rng: &mut (impl RngCore + CryptoRng),
-    ) -> Result<(Transaction, FeeOpening)> {
-        let balance = fee.to_i64()?;
-        let (transaction, blinding) =
-            self.build_v2_with_balance(fee, pk, branch, ValueSum::ZERO.plus(fee), balance, rng)?;
-        Ok((transaction, FeeOpening::new(fee, blinding)))
+        self.build_v2_with_balance(
+            fee,
+            pk,
+            branch,
+            ValueSum::ZERO.plus(fee),
+            fee.to_i64()?,
+            rng,
+        )
     }
 
     fn build_v2_with_balance(
@@ -210,7 +200,7 @@ impl Builder {
         spent_minus_created: ValueSum,
         balance: i64,
         rng: &mut (impl RngCore + CryptoRng),
-    ) -> Result<(Transaction, ValueCommitTrapdoor)> {
+    ) -> Result<Transaction> {
         let class = self.class()?;
         self.check_balance(spent_minus_created)?;
         self.pad(class, rng)?;
@@ -225,13 +215,14 @@ impl Builder {
             .collect::<Result<Vec<_>>>()?;
 
         let bodies: Vec<&ActionBody> = prepared.iter().map(|p| &p.body).collect();
-        let entrypoint = if balance < 0 {
-            COINBASE_ENTRYPOINT
+        let kind = if balance < 0 {
+            COINBASE_KIND
         } else {
-            TRANSFER_ENTRYPOINT
+            TRANSFER_KIND
         };
-        let sighash = sighash_of(&self.anchor, &bodies, entrypoint, branch);
-        let fee_blinding = ValueCommitTrapdoor::sum(prepared.iter().map(|p| &p.rcv));
+        let sighash = sighash_of(&self.anchor, &bodies, kind, fee, branch);
+        let fee_blinding =
+            crypto::commitment::ValueCommitTrapdoor::sum(prepared.iter().map(|p| &p.rcv));
         let aggregate_commitment = ValueCommitment::sum(bodies.iter().map(|body| body.cv_net()));
         let net_sign = if balance < 0 {
             -crypto::pallas::Base::one()
@@ -271,22 +262,16 @@ impl Builder {
             })
             .collect();
 
-        let opening = FeeOpening::new(fee, fee_blinding.clone());
         let transaction = if balance < 0 {
             Transaction::new_coinbase(self.anchor, actions, proof, binding_signature)?
         } else {
             Transaction::new(self.anchor, fee, actions, proof, binding_signature)?
         };
-        let transaction = if balance >= 0 {
-            transaction.with_fee_opening(&opening)?
-        } else {
-            transaction
-        };
-        Ok((transaction, fee_blinding))
+        Ok(transaction)
     }
 
     /// Builds a V2 coinbase: no spends, outputs worth exactly `credit`, the
-    /// scheduled subsidy plus private transaction fees assigned by the block producer.
+    /// scheduled subsidy plus public transaction fees.
     ///
     /// # Errors
     /// Returns [`Error::InvalidTransaction`] if spends were added,
@@ -299,19 +284,6 @@ impl Builder {
         branch: BranchId,
         rng: &mut (impl RngCore + CryptoRng),
     ) -> Result<Transaction> {
-        self.build_coinbase_with_opening(pk, credit, branch, rng)
-            .map(|(transaction, _)| transaction)
-    }
-
-    /// Builds a coinbase and returns its aggregate commitment opening for
-    /// block-level value conservation.
-    pub fn build_coinbase_with_opening(
-        self,
-        pk: &ProvingKey,
-        credit: RawCoin,
-        branch: BranchId,
-        rng: &mut (impl RngCore + CryptoRng),
-    ) -> Result<(Transaction, ValueCommitTrapdoor)> {
         if !self.spends.is_empty() {
             return Err(Error::InvalidTransaction("coinbase cannot spend"));
         }
@@ -455,7 +427,7 @@ mod tests {
     use crypto::merkle::MerkleTree;
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
-    use systemcall_circuit::PublicInputs;
+    use transaction_circuit::PublicInputs;
 
     use super::*;
     use crate::encryption::{decrypt_coin_with_ivk, decrypt_coin_with_ovk};
@@ -465,14 +437,21 @@ mod tests {
     struct Wallet {
         sk: SpendingKey,
         fvk: FullViewingKey,
+        receiver_key: crypto::encryption::ReceiverKey,
         address: Address,
     }
 
     fn wallet(rng: &mut ChaCha20Rng) -> Wallet {
         let sk = SpendingKey::random(rng);
         let fvk = FullViewingKey::derive(&sk).unwrap();
+        let (receiver_key, _) = fvk.receiver_key();
         let address = Address::derive(&fvk, Diversifier::random(rng)).unwrap();
-        Wallet { sk, fvk, address }
+        Wallet {
+            sk,
+            fvk,
+            receiver_key,
+            address,
+        }
     }
 
     /// A tree of coin commitments standing in for the chain.
@@ -485,7 +464,8 @@ mod tests {
         /// Creates a coin for `w` worth `value` and records it in the tree.
         fn fund(&mut self, rng: &mut ChaCha20Rng, w: &Wallet, value: u64) -> SpendInfo {
             let coin = Coin::new(
-                w.address,
+                *w.address.diversifier(),
+                *w.address.pk_d(),
                 amount(value),
                 Rho::random(rng),
                 RandomSeed::random(rng),
@@ -506,10 +486,10 @@ mod tests {
     fn verify_regular(
         tx: &Transaction,
         branch: BranchId,
-        vk: &systemcall_proof::VerifyingKey,
+        vk: &transaction_proof::VerifyingKey,
         rng: &mut ChaCha20Rng,
     ) -> Result<()> {
-        validate::verify_with_balance(tx, 0, branch, vk, rng)
+        validate::verify_transfer(tx, branch, vk, rng)
     }
 
     /// Alice pays Bob `3_000` from a `100_000` coin, keeping the change.
@@ -518,22 +498,25 @@ mod tests {
         let (alice, bob) = (wallet(&mut rng), wallet(&mut rng));
         let mut ledger = Ledger::default();
         let spend = ledger.fund(&mut rng, &alice, 100_000);
-        let change = 100_000 - 3_000;
+        let fee = Transaction::default_fee_for_actions(2).unwrap();
+        let change = 100_000 - 3_000 - fee.raw();
         let mut b = Builder::new(ledger.anchor());
         b.add_spend(spend).unwrap();
         b.add_output(OutputInfo::new(
-            bob.address,
+            bob.address.clone(),
             amount(3_000),
             Some(alice.fvk.outgoing_viewing_key()),
         ))
         .unwrap();
         b.add_output(OutputInfo::new(
-            alice.address,
+            alice.address.clone(),
             amount(change),
             Some(alice.fvk.outgoing_viewing_key()),
         ))
         .unwrap();
-        let tx = b.build(test_keys::proving_key(), BRANCH, &mut rng).unwrap();
+        let tx = b
+            .build_with_fee(fee, test_keys::proving_key(), BRANCH, &mut rng)
+            .unwrap();
         (rng, alice, bob, tx)
     }
 
@@ -561,13 +544,17 @@ mod tests {
         for action in tx.actions() {
             let body = action.body();
             let rho = Rho::from_nullifier(body.nullifier()).unwrap();
-            if let Ok(coin) =
-                decrypt_coin_with_ivk(&bob_ivk, body.encrypted_coin(), rho, body.cmx())
-            {
+            if let Ok(coin) = decrypt_coin_with_ivk(
+                &bob_ivk,
+                &bob.receiver_key,
+                body.encrypted_coin(),
+                rho,
+                body.cmx(),
+            ) {
                 assert_eq!(coin.value(), amount(3_000));
                 bob_found += 1;
             }
-            if let Ok((coin, _)) = decrypt_coin_with_ovk(
+            if let Ok(coin) = decrypt_coin_with_ovk(
                 &alice_ovk,
                 body.encrypted_coin(),
                 body.cv_net(),
@@ -579,7 +566,7 @@ mod tests {
         }
         assert_eq!(bob_found, 1);
         alice_found.sort_unstable();
-        assert_eq!(alice_found, vec![3_000, 100_000 - 3_000]);
+        assert_eq!(alice_found, vec![3_000, 100_000 - 3_000 - tx.fee().raw()]);
     }
 
     #[test]
@@ -587,14 +574,22 @@ mod tests {
         let mut rng = ChaCha20Rng::seed_from_u64(3);
         let alice = wallet(&mut rng);
         let mut ledger = Ledger::default();
-        let spend = ledger.fund(&mut rng, &alice, 30_000);
+        let spend = ledger.fund(&mut rng, &alice, 100_000);
         let mut b = Builder::new(ledger.anchor());
         b.add_spend(spend).unwrap();
-        for _ in 0..3 {
-            b.add_output(OutputInfo::new(alice.address, amount(10_000), None))
+        let fee = Transaction::default_fee_for_actions(4).unwrap();
+        for index in 0..3 {
+            let value = if index == 2 {
+                80_000 - fee.raw()
+            } else {
+                10_000
+            };
+            b.add_output(OutputInfo::new(alice.address.clone(), amount(value), None))
                 .unwrap();
         }
-        let tx = b.build(test_keys::proving_key(), BRANCH, &mut rng).unwrap();
+        let tx = b
+            .build_with_fee(fee, test_keys::proving_key(), BRANCH, &mut rng)
+            .unwrap();
         assert_eq!(tx.actions().len(), 4);
         assert!(verify_regular(&tx, BRANCH, test_keys::verifying_key(), &mut rng).is_ok());
     }
@@ -604,17 +599,24 @@ mod tests {
         let mut rng = ChaCha20Rng::seed_from_u64(4);
         let alice = wallet(&mut rng);
         let mut ledger = Ledger::default();
-        let spend = ledger.fund(&mut rng, &alice, 10_000);
+        let spend = ledger.fund(&mut rng, &alice, 100_000);
         let mut b = Builder::new(Anchor::from_base(crypto::pallas::Base::from(99u64)));
         b.add_spend(spend).unwrap();
-        b.add_output(OutputInfo::new(alice.address, amount(10_000), None))
-            .unwrap();
+        let fee = Transaction::default_fee_for_actions(2).unwrap();
+        b.add_output(OutputInfo::new(
+            alice.address.clone(),
+            amount(100_000 - fee.raw()),
+            None,
+        ))
+        .unwrap();
         // The prover does not check constraints; the proof it emits for a
         // path that does not reach the anchor simply fails to verify.
-        let tx = b.build(test_keys::proving_key(), BRANCH, &mut rng).unwrap();
+        let tx = b
+            .build_with_fee(fee, test_keys::proving_key(), BRANCH, &mut rng)
+            .unwrap();
         assert_eq!(
             verify_regular(&tx, BRANCH, test_keys::verifying_key(), &mut rng),
-            Err(Error::Circuit(systemcall_proof::Error::InvalidProof))
+            Err(Error::Circuit(transaction_proof::Error::InvalidProof))
         );
     }
 
@@ -634,10 +636,9 @@ mod tests {
             .build_coinbase(test_keys::proving_key(), credit, BRANCH, &mut rng)
             .unwrap();
         assert_eq!(tx.actions().len(), 2);
-        let balance = validate::coinbase_balance(credit).unwrap();
-        assert!(validate::verify_coinbase_with_balance(
+        assert!(validate::verify_coinbase(
             &tx,
-            balance,
+            credit,
             BRANCH,
             test_keys::verifying_key(),
             &mut rng
@@ -645,8 +646,8 @@ mod tests {
         .is_ok());
         // Claiming a different credit, or treating it as a regular
         // transaction, fails the binding signature.
-        let other = validate::coinbase_balance(amount(1)).unwrap();
-        assert!(validate::verify_coinbase_with_balance(
+        let other = amount(1);
+        assert!(validate::verify_coinbase(
             &tx,
             other,
             BRANCH,

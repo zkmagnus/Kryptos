@@ -4,7 +4,7 @@
 //!
 //! Every method dispatches to the same [`Request`] enum the line protocol
 //! uses, so both interfaces have one behaviour. Method names follow
-//! Bitcoin's where the meaning is the same. RawCoins are strings in the
+//! Bitcoin's where the meaning is the same. Rhombuss are strings in the
 //! smallest unit; hashes, ids and encoded objects are lowercase hex;
 //! heights are numbers. See `docs/rpc.md`.
 
@@ -31,9 +31,9 @@ use protocol::transaction::{Transaction, TxId};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Value};
-use systemcall_proof::ProvingKey;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
+use transaction_proof::ProvingKey;
 
 use crate::config::{Network, MEMPOOL_CAPACITY};
 use crate::http::{read_request, respond_with, Request as HttpRequest};
@@ -153,9 +153,7 @@ impl From<wallet::Error> for RpcError {
     fn from(error: wallet::Error) -> Self {
         match error {
             wallet::Error::NoOperation(_) => Self::not_found("operation"),
-            wallet::Error::InsufficientFunds { .. } | wallet::Error::TooManyRecipients(_) => {
-                Self::new(REJECTED, error.to_string())
-            }
+            wallet::Error::InsufficientFunds { .. } => Self::new(REJECTED, error.to_string()),
             wallet::Error::Protocol(_) | wallet::Error::Crypto(_) => {
                 Self::invalid_params(error.to_string())
             }
@@ -183,7 +181,6 @@ struct CachedTemplate {
     payout: RhombusAddress,
     header: BlockHeader,
     transactions: Vec<Transaction>,
-    binding_signature: protocol::block::BindingSignature,
     created_at: u64,
 }
 
@@ -322,7 +319,7 @@ impl Context {
         }
         let pk = self.proving_key().await?;
         let payout_clone = payout.clone();
-        let (header, transactions, binding_signature) = tokio::task::spawn_blocking(move || {
+        let (header, transactions) = tokio::task::spawn_blocking(move || {
             template.assemble(&payout_clone, pk.as_ref(), &mut rand::rngs::OsRng)
         })
         .await
@@ -335,7 +332,6 @@ impl Context {
             payout,
             header,
             transactions,
-            binding_signature,
             created_at: ready,
         };
         let id = lock(&self.templates)?.insert(cached.clone(), ready);
@@ -466,6 +462,15 @@ async fn handle<D: Dispatch>(stream: &mut TcpStream, dispatcher: &D, token: &Tok
             return respond_json(stream, "400 Bad Request", &body).await;
         }
     };
+    if request.method == "GET" && matches!(request.path.as_str(), "/" | "/explorer") {
+        return respond_with(
+            stream,
+            "200 OK",
+            "text/html; charset=utf-8",
+            include_bytes!("explorer.html"),
+        )
+        .await;
+    }
     if request.method != "POST" {
         let body = envelope_error(&RpcError::new(INVALID_REQUEST, "POST only"), &Value::Null);
         return respond_json(stream, "405 Method Not Allowed", &body).await;
@@ -677,11 +682,7 @@ async fn mining_methods(
                 header.timestamp = params.get(1, "timestamp")?;
                 header.nonce = parse_nonce(&params.get::<String>(2, "nonce")?)?;
                 header.solution = parse_solution(&params.get::<String>(3, "solution")?)?;
-                Block::new_with_binding_signature(
-                    header,
-                    cached.transactions,
-                    cached.binding_signature,
-                )
+                Block::new(header, cached.transactions)
             } else {
                 let hex: String = params.get(0, "block")?;
                 Block::from_slice(&from_hex(&hex)?)?
@@ -854,14 +855,7 @@ async fn other_methods(
         "sendrawtransaction" => {
             let hex: String = params.get(0, "hex")?;
             let tx = Transaction::from_slice(&from_hex(&hex)?)?;
-            let opening: Option<String> = params.opt(1, "fee_opening")?;
-            let request = match opening {
-                Some(opening) => Request::SubmitWithFee(
-                    Box::new(tx),
-                    protocol::fee::FeeOpening::from_slice(&from_hex(&opening)?)?,
-                ),
-                None => Request::Submit(Box::new(tx)),
-            };
+            let request = Request::Submit(Box::new(tx));
             match context.ask(request).await? {
                 Response::Submitted(txid) => Ok(json!(txid.to_string())),
                 other => Err(unexpected(&other)),
@@ -964,6 +958,7 @@ async fn blockchain_info(context: &Context) -> core::result::Result<Value, RpcEr
             "initial": BLOCK_EMISSION_START.to_string(),
             "tail": TAIL_BLOCK_EMISSION.to_string(),
             "interval": EMISSION_INTERVAL,
+            "halvings_until_tail": protocol::consensus::EMISSION_HALVINGS_TO_TAIL,
         },
     }))
 }
@@ -1145,8 +1140,8 @@ fn transaction_json(tx: &Transaction, location: Option<(u32, u32)>, tip: u32) ->
     object.insert("txid".into(), json!(tx.txid().to_string()));
     object.insert("version".into(), json!(tx.version()));
     object.insert("anchor".into(), json!(to_hex(&tx.anchor().to_bytes())));
-    object.insert("fee".into(), Value::Null);
-    object.insert("fee_private".into(), json!(true));
+    object.insert("fee".into(), json!(tx.fee().raw().to_string()));
+    object.insert("fee_private".into(), json!(false));
     object.insert("action_count".into(), json!(tx.actions().len()));
     object.insert("actions".into(), Value::Array(actions));
     object.insert("size".into(), json!(tx.to_vec().len()));
@@ -1268,7 +1263,6 @@ mod tests {
             payout,
             header,
             transactions: Vec::new(),
-            binding_signature: protocol::block::BindingSignature::from_bytes([0; 64]),
             created_at,
         }
     }
@@ -1288,7 +1282,7 @@ mod tests {
         let mut cache = TemplateCache::default();
         let parent = BlockHash::from_bytes([1; 32]);
         let a = payout(1);
-        let id = cache.insert(cached(a, parent, 100), 100);
+        let id = cache.insert(cached(a.clone(), parent, 100), 100);
         assert_eq!(
             cache.find(&a, parent, 104).map(|(i, _)| i),
             Some(id.clone())

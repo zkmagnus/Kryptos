@@ -17,7 +17,7 @@ pub enum Error {
     Protocol(#[from] protocol::Error),
     /// Proving or key generation failed.
     #[error(transparent)]
-    Circuit(#[from] systemcall_proof::Error),
+    Circuit(#[from] transaction_proof::Error),
     /// A key or encoding error.
     #[error(transparent)]
     Crypto(#[from] crypto::Error),

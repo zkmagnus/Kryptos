@@ -4,10 +4,8 @@ exclude = ["fuzz"]
 members = [
     "crates/crypto",
     "crates/circuit",
-    "crates/systemcall-circuit",
-    "crates/systemcall-proof",
-    "crates/systemcall",
-    "crates/program-vm",
+    "crates/transaction-circuit",
+    "crates/transaction-proof",
     "crates/protocol",
     "crates/chain",
     "crates/storage",
@@ -29,9 +27,8 @@ license = "GPL-3.0-or-later"
 # internal
 crypto = { path = "crates/crypto" }
 circuit = { path = "crates/circuit" }
-systemcall-circuit = { path = "crates/systemcall-circuit" }
-systemcall-proof = { path = "crates/systemcall-proof" }
-systemcall = { path = "crates/systemcall" }
+transaction-circuit = { path = "crates/transaction-circuit" }
+transaction-proof = { path = "crates/transaction-proof" }
 protocol = { path = "crates/protocol" }
 chain = { path = "crates/chain" }
 storage = { path = "crates/storage" }

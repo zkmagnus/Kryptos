@@ -128,6 +128,12 @@ mod tests {
     }
 
     #[test]
+    fn negative_and_over_64_bit_values_fail() {
+        assert!(!satisfied(-Fp::one()));
+        assert!(!satisfied(Fp::from(u64::MAX) + Fp::one()));
+    }
+
+    #[test]
     fn values_at_or_above_two_to_the_64_fail() {
         assert!(!satisfied(Fp::from_u128(1u128 << 64)));
         assert!(!satisfied(Fp::from_u128((1u128 << 64) + 5)));

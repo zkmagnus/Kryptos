@@ -646,7 +646,7 @@ impl Wallet {
     /// Fails on a database error.
     pub fn add_operation(
         &self,
-        recipients: Vec<Payment>,
+        payment: Option<Payment>,
         min_confirmations: u32,
         created_at: u64,
     ) -> Result<Operation> {
@@ -659,7 +659,7 @@ impl Wallet {
                 .map(|v| decode_u64(v.value()))
                 .transpose()?
                 .unwrap_or(1);
-            operation = Operation::new(id, created_at, recipients, min_confirmations);
+            operation = Operation::new(id, created_at, payment, min_confirmations);
             tx.open_table(OPERATIONS)?
                 .insert(id, self.seal_operation(&operation)?.as_slice())?;
             meta.insert(
@@ -810,13 +810,14 @@ mod tests {
     use std::sync::OnceLock;
 
     use crypto::pallas;
+    use protocol::amount::RawCoin;
     use protocol::block::{empty_header, BlockHeader};
     use protocol::builder::{Builder, OutputInfo, SpendInfo};
-    use protocol::coin::Rhombus as RawCoin;
     use protocol::consensus::BranchId;
+    use protocol::transaction::Transaction;
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
-    use systemcall_proof::ProvingKey;
+    use transaction_proof::ProvingKey;
 
     use super::*;
 
@@ -947,15 +948,16 @@ mod tests {
             None,
         ))
         .unwrap();
-        let change = 1_000_000_000 - 1_000;
+        let fee = Transaction::default_fee_for_actions(2).unwrap();
+        let change = 1_000_000_000 - 1_000 - fee.raw();
         b.add_output(OutputInfo::new(
             owner.default_address().unwrap(),
             RawCoin::from_raw(change).unwrap(),
             None,
         ))
         .unwrap();
-        let spend = b.build(pk(), BRANCH, &mut rng).unwrap();
-        let mut operation = wallet.add_operation(Vec::new(), 1, 0).unwrap();
+        let spend = b.build_with_fee(fee, pk(), BRANCH, &mut rng).unwrap();
+        let mut operation = wallet.add_operation(None, 1, 0).unwrap();
         operation.status = OperationStatus::Confirmed {
             txid: spend.txid(),
             height: 2,
@@ -963,7 +965,7 @@ mod tests {
         operation.locked = vec![coin.position];
         operation.transaction = Some(spend.to_vec());
         wallet.put_operation(&operation).unwrap();
-        let mut retained = wallet.add_operation(Vec::new(), 1, 0).unwrap();
+        let mut retained = wallet.add_operation(None, 1, 0).unwrap();
         retained.status = OperationStatus::Confirmed {
             txid: b1.transactions()[0].txid(),
             height: 1,
@@ -1110,7 +1112,7 @@ mod tests {
         assert_eq!(listed.len(), 3, "default plus two");
         assert_eq!(listed[0].0, 0);
         assert_eq!(listed[1], (1, a, "alice".to_string()));
-        assert_eq!(listed[2], (2, b, "bob".to_string()));
+        assert_eq!(listed[2], (2, b.clone(), "bob".to_string()));
         assert_eq!(wallet.address_index_of(&b), Some(2));
         assert_eq!(
             wallet.address_index_of(&wallet.keys().default_address().unwrap()),
@@ -1132,10 +1134,10 @@ mod tests {
             amount: RawCoin::from_raw(5).unwrap(),
         };
         let mut op = wallet
-            .add_operation(vec![payment.clone()], 3, 1_000)
+            .add_operation(Some(payment.clone()), 3, 1_000)
             .unwrap();
         assert_eq!(op.id, 1);
-        assert_eq!(wallet.add_operation(vec![payment], 3, 1_001).unwrap().id, 2);
+        assert_eq!(wallet.add_operation(Some(payment), 3, 1_001).unwrap().id, 2);
         op.locked = vec![4, 9];
         op.status = crate::operations::OperationStatus::Proving;
         wallet.put_operation(&op).unwrap();
@@ -1152,7 +1154,7 @@ mod tests {
     fn operation_updates_cannot_overwrite_a_cancellation_or_a_prover_claim() {
         let mut rng = ChaCha20Rng::seed_from_u64(16);
         let (_dir, wallet) = temp_wallet(&sk(16), BlockHash::ZERO, &mut rng);
-        let queued = wallet.add_operation(Vec::new(), 1, 0).unwrap();
+        let queued = wallet.add_operation(None, 1, 0).unwrap();
         let mut cancelled = queued.clone();
         cancelled.status = OperationStatus::Cancelled;
         let mut building = queued.clone();

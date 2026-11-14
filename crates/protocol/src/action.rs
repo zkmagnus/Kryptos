@@ -7,7 +7,7 @@
 use crypto::commitment::ValueCommitment;
 use crypto::encoding::ENCODED_LEN;
 use crypto::signature::{RandomizedVerificationKey, SpendAuthSignature, SIGNATURE_LEN};
-use systemcall_circuit::PublicInputs;
+use transaction_circuit::PublicInputs;
 
 use crate::bytes::{Encodable, Reader, Writer};
 use crate::coin::ExtractedCoinCommitment;
@@ -166,7 +166,7 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::address::RhombusAddress as Address;
-    use crate::amount::Rhombus as RawCoin;
+    use crate::amount::RawCoin;
     use crate::coin::{Coin, RandomSeed, Rho};
     use crate::encryption::encrypt_coin;
 
@@ -176,14 +176,15 @@ pub(crate) mod tests {
         let fvk = FullViewingKey::derive(&sk).unwrap();
         let address = Address::derive(&fvk, crypto::keys::Diversifier::random(rng)).unwrap();
         let coin = Coin::new(
-            address,
+            *address.diversifier(),
+            *address.pk_d(),
             RawCoin::from_raw(5).unwrap(),
             Rho::random(rng),
             RandomSeed::random(rng),
         );
         let nullifier = coin.nullifier(fvk.nk()).unwrap();
         let cv = ValueCommitment::commit(0, &ValueCommitTrapdoor::random(rng));
-        let encrypted = encrypt_coin(&coin, None, &cv, rng).unwrap();
+        let encrypted = encrypt_coin(&coin, address.kem_key(), None, &cv, rng).unwrap();
         let rsk = RandomizedSigningKey::new(
             &SpendAuthorizingKey::derive(&sk).unwrap(),
             &SpendAuthRandomizer::random(rng),

@@ -16,25 +16,23 @@ use chain::params::ChainParams;
 use chain::target::Target;
 use chain::validate::{header_lookback, recent_headers};
 use chain::Error;
-use crypto::commitment::ValueCommitTrapdoor;
 use crypto::encryption::TransmissionKey;
 use crypto::keys::{Diversifier, FullViewingKey, SpendingKey};
 use crypto::merkle::MerkleTree;
-use crypto::signature::BindingSigningKey;
 use protocol::address::RhombusAddress;
+use protocol::amount::RawCoin as Rhombus;
 use protocol::block::{empty_header, Block, BlockHeader, PowSolution};
 use protocol::builder::{Builder, OutputInfo, SpendInfo};
-use protocol::coin::Rhombus;
 use protocol::coin::{Coin, Rho};
-use protocol::coin_encryption::decrypt_coin_with_ivk;
 use protocol::consensus::{subsidy, BranchId, BLOCK_VERSION};
+use protocol::encryption::decrypt_coin_with_ivk;
 use protocol::transaction::Transaction;
 use protocol::tree_order::tree_transactions;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 use storage::store::Store;
 use storage::tree::CommitmentTree;
-use systemcall_proof::ProvingKey;
+use transaction_proof::ProvingKey;
 
 static PK: OnceLock<ProvingKey> = OnceLock::new();
 
@@ -80,10 +78,9 @@ impl Wallet {
                 let body = action.body();
                 let position = self.tree.append(*body.cmx().inner()).unwrap();
                 let rho = Rho::from_nullifier(body.nullifier()).unwrap();
-                if let Ok((coin, _)) = decrypt_coin_with_ivk(
+                if let Ok(coin) = decrypt_coin_with_ivk(
                     &ivk,
                     &self.receiver_key,
-                    &self.transmission_key,
                     body.encrypted_coin(),
                     rho,
                     body.cmx(),
@@ -105,7 +102,7 @@ impl Wallet {
             fvk: FullViewingKey::derive(&self.sk).unwrap(),
             receiver_key: self.fvk.receiver_key().0,
             transmission_key: self.fvk.receiver_key().1,
-            address: self.address,
+            address: self.address.clone(),
             tree: self.tree.clone(),
             coins,
         }
@@ -189,18 +186,12 @@ impl Harness {
         let credit = subsidy(height).checked_add(fees).unwrap();
         let anchor = parent.commitment_root;
         let mut b = Builder::new(anchor);
-        b.add_output(OutputInfo::new(self.miner.address, credit, None))
+        b.add_output(OutputInfo::new(self.miner.address.clone(), credit, None))
             .unwrap();
         let branch = self.chain.params().branch_at(height);
-        let (coinbase, coinbase_blinding) = b
-            .build_coinbase_with_opening(proving_key(), credit, branch, &mut self.rng)
+        let coinbase = b
+            .build_coinbase(proving_key(), credit, branch, &mut self.rng)
             .unwrap();
-        let mut block_blindings = txs
-            .iter()
-            .map(|tx| ValueCommitTrapdoor::from_scalar(tx.fee_opening().unwrap().blinding()))
-            .collect::<Vec<_>>();
-        block_blindings.push(coinbase_blinding);
-        let binding_key = BindingSigningKey::from_trapdoors(block_blindings.iter()).unwrap();
         let mut transactions = vec![coinbase];
         transactions.extend(txs);
         let params = *self.chain.params();
@@ -245,11 +236,7 @@ impl Harness {
                 .unwrap(),
             "mining failed"
         );
-        let binding_signature = binding_key.sign(&mut self.rng, &Block::binding_message(&header));
-        (
-            Block::new_with_binding_signature(header, transactions, binding_signature),
-            tree,
-        )
+        (Block::new(header, transactions), tree)
     }
 
     pub fn tip_header(&self) -> BlockHeader {
@@ -308,28 +295,35 @@ pub fn spend_first_coin_for(
     let (coin, position) = wallet.coins[0].clone();
     let path = wallet.tree.path(position).unwrap();
     let parent = h.tip_header();
-    let change = coin.value().raw() - pay;
+    let fee = Transaction::default_fee_for_actions(2).unwrap().raw();
+    let change = coin.value().raw() - pay - fee;
     let mut b = Builder::new(parent.commitment_root);
     b.add_spend(SpendInfo::new(wallet.sk.clone(), coin, path))
         .unwrap();
     b.add_output(OutputInfo::new(
-        *recipient,
+        recipient.clone(),
         Rhombus::from_raw(pay).unwrap(),
         None,
     ))
     .unwrap();
     if change > 0 {
         b.add_output(OutputInfo::new(
-            wallet.address,
+            wallet.address.clone(),
             Rhombus::from_raw(change).unwrap(),
             None,
         ))
         .unwrap();
     }
-    b.build(proving_key(), branch, &mut h.rng).unwrap()
+    b.build_with_fee(
+        Rhombus::from_raw(fee).unwrap(),
+        proving_key(),
+        branch,
+        &mut h.rng,
+    )
+    .unwrap()
 }
 
-/// A regular transaction with a nonzero private fee opening.
+/// A regular transaction with a nonzero public fee.
 pub fn spend_first_coin_with_fee(
     h: &mut Harness,
     wallet: &Wallet,
@@ -346,25 +340,24 @@ pub fn spend_first_coin_with_fee(
     b.add_spend(SpendInfo::new(wallet.sk.clone(), coin, path))
         .unwrap();
     b.add_output(OutputInfo::new(
-        *recipient,
+        recipient.clone(),
         Rhombus::from_raw(pay).unwrap(),
         None,
     ))
     .unwrap();
     if change > 0 {
         b.add_output(OutputInfo::new(
-            wallet.address,
+            wallet.address.clone(),
             Rhombus::from_raw(change).unwrap(),
             None,
         ))
         .unwrap();
     }
-    b.build_with_fee_opening(
+    b.build_with_fee(
         Rhombus::from_raw(fee).unwrap(),
         proving_key(),
         branch,
         &mut h.rng,
     )
     .unwrap()
-    .0
 }

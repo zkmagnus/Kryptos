@@ -8,8 +8,8 @@ license.workspace = true
 
 [dependencies]
 crypto.workspace = true
-systemcall-circuit.workspace = true
-systemcall-proof.workspace = true
+transaction-circuit.workspace = true
+transaction-proof.workspace = true
 protocol.workspace = true
 redb.workspace = true
 zeroize.workspace = true

@@ -324,6 +324,7 @@ mod tests {
         assert_eq!(ValueCommitment::identity() + cv, cv);
         assert_eq!(ValueCommitment::sum([&cv, &cv]), cv + cv);
         assert_eq!(cv.minus(&cv), ValueCommitment::identity());
+        assert_eq!(cv - cv, ValueCommitment::identity());
     }
 
     fn inputs<'a>(

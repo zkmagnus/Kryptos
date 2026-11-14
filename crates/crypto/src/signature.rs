@@ -448,6 +448,22 @@ mod tests {
     }
 
     #[test]
+    fn public_fee_balance_matches_direct_commitment_balance() {
+        let mut rng = ChaCha20Rng::seed_from_u64(51);
+        for fee in [0i64, 1, 17, 1_000, 1_000_000] {
+            let rcv = ValueCommitTrapdoor::random(&mut rng);
+            let cv = ValueCommitment::commit(fee, &rcv);
+            let from_direct_balance = BindingVerificationKey::from_commitments([&cv], fee).unwrap();
+            assert_eq!(
+                from_direct_balance,
+                BindingSigningKey::from_trapdoors([&rcv])
+                    .unwrap()
+                    .verification_key()
+            );
+        }
+    }
+
+    #[test]
     fn batch_verifies_mixed_signatures_and_rejects_one_bad() {
         let mut s = signer(6);
         let alpha = SpendAuthRandomizer::random(&mut s.rng);

@@ -1,4 +1,4 @@
-//! The `RawCoin` command line.
+//! The `Rhombus` command line.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -13,10 +13,10 @@ use protocol::block::{Block, BlockHash};
 use protocol::bytes::Encodable;
 use protocol::compact::CompactBlock;
 use protocol::consensus::{next_height, BranchId};
-use systemcall_proof::ProvingKey;
+use transaction_proof::ProvingKey;
 use wallet::keys::WalletKeys;
 use wallet::seed::SeedPhrase;
-use wallet::spend::{build_payments, build_payments_with_fee, Payment, MAX_RECIPIENTS};
+use wallet::spend::{build_payment, Payment};
 use wallet::wallet::Wallet;
 
 use crate::config::{Config, Network};
@@ -36,7 +36,7 @@ const PHRASE_ENV: &str = "SEED_PHRASE";
 
 /// The node daemon and wallet tools.
 #[derive(Parser, Debug)]
-#[command(name = "RawCoin", version)]
+#[command(name = "Rhombus", version)]
 pub struct Cli {
     /// What to do.
     #[command(subcommand)]
@@ -238,31 +238,9 @@ pub enum Command {
         /// Recipient address.
         #[arg(long)]
         to: String,
-        /// RawCoin in smallest units.
+        /// Rhombus in smallest units.
         #[arg(long)]
         amount: u64,
-        /// Private fee amount in raw units (default: 1 raw unit per encoded byte).
-        #[arg(long)]
-        fee: Option<u64>,
-        /// The node.
-        #[command(flatten)]
-        rpc: RpcArgs,
-        /// Scan compact blocks instead of full ones.
-        #[arg(long)]
-        light: bool,
-    },
-    /// Pay several addresses in one transaction and one proof.
-    #[command(name = "batchtransfer")]
-    BatchTransfer {
-        /// The wallet.
-        #[command(flatten)]
-        wallet: WalletArgs,
-        /// Recipient in ADDRESS=RAW_AMOUNT form; repeat for each recipient.
-        #[arg(long = "payment", required = true, value_name = "ADDRESS=RAW_AMOUNT")]
-        payments: Vec<String>,
-        /// Private fee amount in raw units (default: 1 raw unit per encoded byte).
-        #[arg(long)]
-        fee: Option<u64>,
         /// The node.
         #[command(flatten)]
         rpc: RpcArgs,
@@ -340,95 +318,10 @@ pub async fn run(cli: Cli) -> Result<()> {
             wallet,
             to,
             amount,
-            fee,
             rpc,
             light,
-        } => send(&wallet, &to, amount, fee, &rpc, light).await,
-        Command::BatchTransfer {
-            wallet,
-            payments,
-            fee,
-            rpc,
-            light,
-        } => batch_transfer(&wallet, &payments, fee, &rpc, light).await,
+        } => send(&wallet, &to, amount, &rpc, light).await,
     }
-}
-
-async fn batch_transfer(
-    wallet_args: &WalletArgs,
-    payment_args: &[String],
-    fee: Option<u64>,
-    rpc: &RpcArgs,
-    light: bool,
-) -> Result<()> {
-    if payment_args.is_empty() || payment_args.len() > MAX_RECIPIENTS {
-        return Err(Error::Argument(format!(
-            "batchtransfer accepts 1 to {MAX_RECIPIENTS} payments"
-        )));
-    }
-    let mut client = rpc.connect().await?;
-    let genesis = fetch_genesis(&mut client).await?;
-    let network = network_of(&genesis)?;
-    let mut payments = Vec::with_capacity(payment_args.len());
-    for specification in payment_args {
-        let (address, amount) = specification
-            .split_once('=')
-            .ok_or_else(|| Error::Argument("payment must use ADDRESS=RAW_AMOUNT".into()))?;
-        if address.is_empty() || amount.is_empty() {
-            return Err(Error::Argument(
-                "payment must use ADDRESS=RAW_AMOUNT".into(),
-            ));
-        }
-        let recipient = RhombusAddress::decode(address, network.address_prefix())?;
-        let amount = amount
-            .parse::<u64>()
-            .map_err(|_| Error::Argument("payment amount must be an unsigned integer".into()))?;
-        payments.push(Payment {
-            recipient,
-            amount: RawCoin::from_raw(amount)?,
-        });
-    }
-    let wallet = open_wallet(wallet_args, genesis)?;
-    let params = network.params();
-    let scanned = sync_wallet(&mut client, &wallet, light).await?;
-    let branch = params.branch_at(next_height(scanned)?);
-    let pk = tokio::task::spawn_blocking(ProvingKey::build)
-        .await
-        .map_err(|_| Error::Stopped)??;
-    let built = match fee {
-        Some(raw) => build_payments_with_fee(
-            &wallet,
-            &payments,
-            RawCoin::from_raw(raw)?,
-            &pk,
-            branch,
-            &[],
-            u32::MAX,
-            &mut rand::rngs::OsRng,
-        )?,
-        None => build_payments(
-            &wallet,
-            &payments,
-            &pk,
-            branch,
-            &[],
-            u32::MAX,
-            &mut rand::rngs::OsRng,
-        )?,
-    };
-    let actual_fee = built.transaction.fee().raw();
-    let txid = client
-        .call(&format!(
-            "submit {} {}",
-            to_hex(&built.transaction.to_vec()),
-            to_hex(&built.fee_opening.to_vec())
-        ))
-        .await?;
-    println!(
-        "submitted {txid} ({} recipients, fee {actual_fee} raw units)",
-        payments.len()
-    );
-    Ok(())
 }
 
 async fn balance(wallet: &WalletArgs, rpc: &RpcArgs, light: bool) -> Result<()> {
@@ -454,7 +347,6 @@ async fn send(
     wallet: &WalletArgs,
     to: &str,
     amount: u64,
-    fee: Option<u64>,
     rpc: &RpcArgs,
     light: bool,
 ) -> Result<()> {
@@ -471,40 +363,16 @@ async fn send(
         .await
         .map_err(|_| Error::Stopped)??;
     let payment = Payment { recipient, amount };
-    let built = match fee {
-        Some(raw) => build_payments_with_fee(
-            &wallet,
-            &[payment],
-            RawCoin::from_raw(raw)?,
-            &pk,
-            branch,
-            &[],
-            u32::MAX,
-            &mut rand::rngs::OsRng,
-        )?,
-        None => build_payments(
-            &wallet,
-            &[payment],
-            &pk,
-            branch,
-            &[],
-            u32::MAX,
-            &mut rand::rngs::OsRng,
-        )?,
-    };
-    let actual_fee = built.fee_opening.fee().raw();
+    let transaction = build_payment(&wallet, payment, &pk, branch, &mut rand::rngs::OsRng)?;
+    let actual_fee = transaction.fee().raw();
     let txid = client
-        .call(&format!(
-            "submit {} {}",
-            to_hex(&built.transaction.to_vec()),
-            to_hex(&built.fee_opening.to_vec())
-        ))
+        .call(&format!("submit {}", to_hex(&transaction.to_vec())))
         .await?;
     println!("submitted {txid} (fee {actual_fee} raw units)");
     Ok(())
 }
 
-/// The chain directory for `RawCoin run`: the given one, the per-user
+/// The chain directory for `Rhombus run`: the given one, the per-user
 /// default. Directories are created owner-only.
 fn node_datadir(datadir: Option<PathBuf>, network: Network) -> Result<PathBuf> {
     let dir = match datadir {
@@ -517,7 +385,7 @@ fn node_datadir(datadir: Option<PathBuf>, network: Network) -> Result<PathBuf> {
 
 /// Starts a node and runs it until interrupted.
 #[allow(clippy::too_many_arguments)] // mirrors the command line options
-/// The options `RawCoin run` was given.
+/// The options `Rhombus run` was given.
 struct RunOptions {
     network: Network,
     datadir: PathBuf,
@@ -580,7 +448,7 @@ async fn run_node(opts: RunOptions) -> Result<()> {
     let shutdown = Shutdown::listen()?;
     let handle = crate::node::spawn(config).await?;
     let log = crate::node::log;
-    log(&format!("RawCoin up on the {network} network"));
+    log(&format!("Rhombus up on the {network} network"));
     match handle.listen_addr {
         Some(addr) => log(&format!("peers      listening on {addr}")),
         None => log("peers      outbound only"),
@@ -618,26 +486,12 @@ pub async fn pay(
     pk: &ProvingKey,
     recipient: RhombusAddress,
     amount: RawCoin,
-    fee: u64,
     branch: BranchId,
 ) -> Result<String> {
     let payment = Payment { recipient, amount };
-    let built = build_payments_with_fee(
-        wallet,
-        &[payment],
-        RawCoin::from_raw(fee)?,
-        pk,
-        branch,
-        &[],
-        u32::MAX,
-        &mut rand::rngs::OsRng,
-    )?;
+    let transaction = build_payment(wallet, payment, pk, branch, &mut rand::rngs::OsRng)?;
     client
-        .call(&format!(
-            "submit {} {}",
-            to_hex(&built.transaction.to_vec()),
-            to_hex(&built.fee_opening.to_vec())
-        ))
+        .call(&format!("submit {}", to_hex(&transaction.to_vec())))
         .await
 }
 
@@ -852,7 +706,7 @@ mod tests {
 
     #[test]
     fn advertising_requires_a_listener_and_conflicts_with_a_proxy() {
-        let base = ["RawCoin", "run", "--advertise", "8.8.8.8:19000"];
+        let base = ["Rhombus", "run", "--advertise", "8.8.8.8:19000"];
         assert!(Cli::try_parse_from(base).is_err());
         let listener = ["--listen", "0.0.0.0:19000"];
         assert!(Cli::try_parse_from(base.into_iter().chain(listener)).is_ok());
@@ -880,10 +734,10 @@ mod tests {
     #[test]
     fn every_command_defaults_to_the_main_network() {
         for argv in [
-            &["RawCoin", "run"][..],
-            &["RawCoin", "keygen"],
-            &["RawCoin", "create", "--wallet", "w"],
-            &["RawCoin", "address", "--wallet", "w"],
+            &["Rhombus", "run"][..],
+            &["Rhombus", "keygen"],
+            &["Rhombus", "create", "--wallet", "w"],
+            &["Rhombus", "address", "--wallet", "w"],
         ] {
             let cli = Cli::try_parse_from(argv).unwrap();
             assert_eq!(
@@ -892,7 +746,7 @@ mod tests {
                 "{argv:?}"
             );
         }
-        let explicit = Cli::try_parse_from(["RawCoin", "keygen", "--network", "test"]).unwrap();
+        let explicit = Cli::try_parse_from(["Rhombus", "keygen", "--network", "test"]).unwrap();
         assert_eq!(network_of_command(&explicit.command), Some(Network::Test));
     }
 }

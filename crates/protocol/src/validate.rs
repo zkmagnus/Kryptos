@@ -8,19 +8,22 @@ use std::collections::BTreeSet;
 
 use crypto::signature::{BatchVerifier, BindingVerificationKey};
 use rand_core::{CryptoRng, RngCore};
-use systemcall_proof::{ProofBatch, VerifyingKey};
+use transaction_proof::{ProofBatch, VerifyingKey};
 
-use crate::consensus::{is_action_class, proof_len, BranchId, TX_VERSION};
+use crate::consensus::{
+    is_action_class, proof_len, BranchId, COINBASE_KIND, TRANSFER_KIND, TX_VERSION,
+};
 use crate::transaction::Transaction;
 use crate::{Error, Result};
 
-/// Checks shape rules: version, action class, proof length, and unique
-/// nullifiers.
+/// Checks shape rules: version, action class, proof length, unique nullifiers,
+/// and the exact encoded-size fee.
 ///
 /// # Errors
 /// Returns [`Error::InvalidTransaction`] naming the first violated rule.
 pub fn check_structure(tx: &Transaction) -> Result<()> {
-    check_shape_and_program(tx, crate::consensus::TRANSFER_ENTRYPOINT)?;
+    check_shape_and_kind(tx, TRANSFER_KIND)?;
+    tx.check_fee()?;
     Ok(())
 }
 
@@ -29,18 +32,17 @@ pub fn check_structure(tx: &Transaction) -> Result<()> {
 /// This must only be called after the chain kernel has classified the
 /// transaction as a coinbase and computed its public balance.
 pub fn check_coinbase_structure(tx: &Transaction) -> Result<()> {
-    check_shape_and_program(tx, crate::consensus::COINBASE_ENTRYPOINT)
+    check_shape_and_kind(tx, COINBASE_KIND)?;
+    tx.check_fee()
 }
 
-fn check_shape_and_program(tx: &Transaction, entrypoint: u16) -> Result<()> {
+fn check_shape_and_kind(tx: &Transaction, kind: u8) -> Result<()> {
     if tx.version() != TX_VERSION {
         return Err(Error::InvalidTransaction("unknown version"));
     }
-    if tx.entrypoint() != entrypoint {
-        return Err(Error::InvalidTransaction("unknown SystemCall target"));
+    if tx.kind() != kind {
+        return Err(Error::InvalidTransaction("wrong native transaction kind"));
     }
-    program_vm::decode(tx.opcode(), &[])
-        .map_err(|_| Error::InvalidTransaction("unknown SystemCall opcode"))?;
     if tx.private_proof_v2().is_none() {
         return Err(Error::InvalidTransaction("V2 proof envelope is missing"));
     }
@@ -62,7 +64,7 @@ fn check_shape_and_program(tx: &Transaction, entrypoint: u16) -> Result<()> {
 }
 
 /// The public value balance of a coinbase paying `credit` (subsidy plus
-/// the block-producer outputs of other transactions): it creates value.
+/// the fees paid by transfers): it creates value.
 ///
 /// # Errors
 /// If `credit` does not fit an `i64`.
@@ -80,36 +82,84 @@ pub fn coinbase_balance(credit: crate::amount::RawCoin) -> Result<i64> {
 ///
 /// # Errors
 /// Fails if the binding verification key cannot be derived.
-pub fn queue_signatures(
+fn queue_signatures(
     tx: &Transaction,
     balance: i64,
     branch: BranchId,
     batch: &mut BatchVerifier,
 ) -> Result<()> {
     let sighash = tx.sighash(branch);
-    queue_spend_auth_signatures(tx, branch, batch);
+    for action in tx.actions() {
+        batch.queue_spend_auth(action.body().rk(), action.spend_auth_sig(), &sighash);
+    }
     let bvk = BindingVerificationKey::from_commitments(tx.value_commitments(), balance)?;
     batch.queue_binding(&bvk, tx.binding_signature(), &sighash);
     Ok(())
 }
 
-/// Queues only the per-action spend authorization signatures. This is used
-/// for block validation, where value conservation is proven once by the
-/// block-wide binding signature rather than by public per-transaction fees.
-pub fn queue_spend_auth_signatures(tx: &Transaction, branch: BranchId, batch: &mut BatchVerifier) {
-    let sighash = tx.sighash(branch);
-    for action in tx.actions() {
-        batch.queue_spend_auth(action.body().rk(), action.spend_auth_sig(), &sighash);
-    }
-}
-
-/// Queues signatures for an ordinary transfer using its attached relay fee.
+/// Queues both signature classes for a transfer using its declared public fee.
 pub fn queue_transfer_signatures(
     tx: &Transaction,
     branch: BranchId,
     batch: &mut BatchVerifier,
 ) -> Result<()> {
+    check_structure(tx)?;
     queue_signatures(tx, tx.fee().to_i64()?, branch, batch)
+}
+
+/// Queues signatures for a call classified as a coinbase by consensus.
+pub fn queue_coinbase_signatures(
+    tx: &Transaction,
+    mint: crate::amount::RawCoin,
+    branch: BranchId,
+    batch: &mut BatchVerifier,
+) -> Result<()> {
+    check_coinbase_structure(tx)?;
+    queue_signatures(tx, coinbase_balance(mint)?, branch, batch)
+}
+
+/// Queues a transfer's signatures against its declared fee, then its proof.
+pub fn queue_transfer(
+    tx: &Transaction,
+    branch: BranchId,
+    signatures: &mut BatchVerifier,
+    proofs: &mut ProofBatch,
+) -> Result<()> {
+    check_structure(tx)?;
+    queue_spend_auth_and_binding(tx, tx.fee().to_i64()?, branch, signatures)?;
+    queue_proof(tx, proofs)
+}
+
+/// Queues spend-auth and binding signatures after the caller has checked shape.
+pub fn queue_checked_signatures(
+    tx: &Transaction,
+    balance: i64,
+    branch: BranchId,
+    signatures: &mut BatchVerifier,
+) -> Result<()> {
+    queue_spend_auth_and_binding(tx, balance, branch, signatures)
+}
+
+fn queue_spend_auth_and_binding(
+    tx: &Transaction,
+    balance: i64,
+    branch: BranchId,
+    signatures: &mut BatchVerifier,
+) -> Result<()> {
+    queue_signatures(tx, balance, branch, signatures)
+}
+
+/// Queues signatures and proof for coinbase against validator-computed mint.
+pub fn queue_coinbase(
+    tx: &Transaction,
+    mint: crate::amount::RawCoin,
+    branch: BranchId,
+    signatures: &mut BatchVerifier,
+    proofs: &mut ProofBatch,
+) -> Result<()> {
+    check_coinbase_structure(tx)?;
+    queue_spend_auth_and_binding(tx, coinbase_balance(mint)?, branch, signatures)?;
+    queue_coinbase_proof(tx, proofs)
 }
 
 /// Queues the proof of `tx` into `batch` for later verification.
@@ -117,49 +167,57 @@ pub fn queue_transfer_signatures(
 /// # Errors
 /// Fails if an action carries a non-canonical point.
 pub fn queue_proof(tx: &Transaction, batch: &mut ProofBatch) -> Result<()> {
+    queue_proof_with_kind(tx, false, batch)
+}
+
+/// Queues a block-position-classified coinbase proof.
+pub fn queue_coinbase_proof(tx: &Transaction, batch: &mut ProofBatch) -> Result<()> {
+    queue_proof_with_kind(tx, true, batch)
+}
+
+fn queue_proof_with_kind(tx: &Transaction, coinbase: bool, batch: &mut ProofBatch) -> Result<()> {
     if tx.private_proof_v2().is_none() {
         return Err(Error::InvalidTransaction("V2 proof envelope is missing"));
     }
-    Ok(batch.add(tx.proof(), &tx.public_inputs()?)?)
+    Ok(batch.add(tx.proof(), &tx.public_inputs(coinbase)?)?)
 }
 
 /// Verifies the V2 proof of one transaction on its own.
 ///
 /// # Errors
-/// Returns [`systemcall_proof::Error::InvalidProof`] if the proof is wrong.
+/// Returns [`transaction_proof::Error::InvalidProof`] if the proof is wrong.
 pub fn verify_proof(tx: &Transaction, vk: &VerifyingKey) -> Result<()> {
     tx.private_proof_v2()
         .ok_or(Error::InvalidTransaction("V2 proof envelope is missing"))?
-        .verify(vk, &tx.public_inputs()?)?;
+        .verify(vk, &tx.public_inputs(tx.kind() == COINBASE_KIND)?)?;
     Ok(())
 }
 
-/// Verifies using the public balance computed by the calling SystemCall or
-/// consensus-created operation.
+/// Verifies using the public balance computed by native transaction or
+/// block consensus rules.
 ///
 /// # Errors
 /// Returns the first violation found.
-pub fn verify_with_balance(
+pub fn verify_transfer(
     tx: &Transaction,
-    balance: i64,
     branch: BranchId,
     vk: &VerifyingKey,
     rng: &mut (impl RngCore + CryptoRng),
 ) -> Result<()> {
     check_structure(tx)?;
-    verify_authorization_and_proof(tx, balance, branch, vk, rng)
+    verify_authorization_and_proof(tx, tx.fee().to_i64()?, branch, vk, rng)
 }
 
-/// Verifies a kernel-classified coinbase with its kernel-chosen balance.
-pub fn verify_coinbase_with_balance(
+/// Verifies a coinbase against the validator-computed mint.
+pub fn verify_coinbase(
     tx: &Transaction,
-    balance: i64,
+    mint: crate::amount::RawCoin,
     branch: BranchId,
     vk: &VerifyingKey,
     rng: &mut (impl RngCore + CryptoRng),
 ) -> Result<()> {
     check_coinbase_structure(tx)?;
-    verify_authorization_and_proof(tx, balance, branch, vk, rng)
+    verify_authorization_and_proof(tx, coinbase_balance(mint)?, branch, vk, rng)
 }
 
 fn verify_authorization_and_proof(
@@ -180,7 +238,7 @@ mod tests {
     use crypto::signature::BindingSignature;
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
-    use systemcall_proof::PrivateTransactionProofV2;
+    use transaction_proof::PrivateTransactionProofV2;
 
     use super::*;
     use crate::action::tests::sample_action;
@@ -198,9 +256,13 @@ mod tests {
             dummy_proof(count)
         };
         let v2_proof = PrivateTransactionProofV2::new(&action_proof).unwrap();
+        let fee = crate::consensus::proof_len(count)
+            .and_then(|_| Transaction::encoded_len_for_actions(count))
+            .and_then(crate::fee::fee_for_len)
+            .unwrap_or(crate::amount::RawCoin::ZERO);
         Transaction::new(
             sample_anchor(),
-            crate::amount::RawCoin::ZERO,
+            fee,
             actions,
             v2_proof,
             BindingSignature::from_bytes([0; 64]),
@@ -259,7 +321,7 @@ mod tests {
     fn structure_rejects_duplicate_nullifiers() {
         let tx = unsigned_tx(4, 2);
         let mut bytes = tx.to_vec();
-        let first = 1 + 1 + 2 + 32 + 1;
+        let first = 1 + 1 + 32 + 8 + 1;
         let second = first + ACTION_BODY_LEN;
         let nf: Vec<u8> = bytes[first..first + 32].to_vec();
         bytes[second..second + 32].copy_from_slice(&nf);
@@ -271,22 +333,38 @@ mod tests {
     }
 
     #[test]
+    fn structure_enforces_exact_fee_and_native_transfer_kind() {
+        let tx = unsigned_tx(41, 2);
+        assert!(check_structure(&tx).is_ok());
+
+        let mut bytes = tx.to_vec();
+        let fee_offset = 1 + 1 + 32;
+        let original = tx.fee().raw();
+        bytes[fee_offset..fee_offset + 8].copy_from_slice(&(original + 1).to_le_bytes());
+        let wrong_fee = Transaction::from_slice(&bytes).unwrap();
+        assert!(matches!(
+            check_structure(&wrong_fee),
+            Err(Error::InvalidTransaction(
+                "fee does not match transaction size"
+            ))
+        ));
+
+        let mut bytes = tx.to_vec();
+        bytes[1] = COINBASE_KIND;
+        let wrong_kind = Transaction::from_slice(&bytes).unwrap();
+        assert!(matches!(
+            check_structure(&wrong_kind),
+            Err(Error::InvalidTransaction("wrong native transaction kind"))
+        ));
+    }
+
+    #[test]
     fn signatures_over_the_wrong_message_fail() {
         // sample_action signs "x", not the real sighash.
         let tx = unsigned_tx(5, 2);
         let mut rng = ChaCha20Rng::seed_from_u64(6);
-        let balance = crate::amount::RawCoin::from_raw(20_000)
-            .unwrap()
-            .to_i64()
-            .unwrap();
         assert!(matches!(
-            verify_with_balance(
-                &tx,
-                balance,
-                BranchId::new(1),
-                test_keys::verifying_key(),
-                &mut rng
-            ),
+            verify_transfer(&tx, BranchId::new(1), test_keys::verifying_key(), &mut rng),
             Err(Error::Crypto(crypto::Error::InvalidSignature))
         ));
     }
@@ -296,7 +374,7 @@ mod tests {
         let tx = unsigned_tx(7, 2);
         assert!(matches!(
             verify_proof(&tx, test_keys::verifying_key()),
-            Err(Error::Circuit(systemcall_proof::Error::InvalidProof))
+            Err(Error::Circuit(transaction_proof::Error::InvalidProof))
         ));
         let mut batch = ProofBatch::new();
         queue_proof(&tx, &mut batch).unwrap();

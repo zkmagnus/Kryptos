@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>Rhombus Explorer</title>
+  <style>
+    :root { color-scheme: dark; --bg:#101411; --panel:#181f1a; --line:#303b32; --text:#e8eee8; --muted:#9eaca0; --accent:#9dd6a5; --warn:#f1c779; }
+    * { box-sizing:border-box } body { margin:0; background:radial-gradient(ellipse at 15% 0%,#233126 0,transparent 45%),var(--bg); color:var(--text); font:15px/1.55 ui-sans-serif,system-ui,sans-serif }
+    main { width:min(980px,calc(100% - 32px)); margin:48px auto 80px } header { margin-bottom:28px } .eyebrow { color:var(--accent); text-transform:uppercase; letter-spacing:.16em; font-size:12px; font-weight:700 } h1 { margin:5px 0; font-size:clamp(32px,6vw,52px); letter-spacing:-.04em } p { color:var(--muted) }
+    .panel { background:color-mix(in srgb,var(--panel) 94%,transparent); border:1px solid var(--line); border-radius:16px; padding:22px; margin:16px 0; box-shadow:0 12px 40px #0002 } .row { display:flex; flex-wrap:wrap; gap:10px; align-items:end } label { display:block; color:var(--muted); font-size:13px; margin-bottom:6px } .field { flex:1; min-width:210px } input,button { border:1px solid var(--line); border-radius:9px; padding:11px 13px; font:inherit; color:var(--text); background:#0e130f } input { width:100% } button { cursor:pointer; color:#0c170e; background:var(--accent); border-color:var(--accent); font-weight:700 } button.secondary { background:transparent;color:var(--text) } button:hover { filter:brightness(1.08) } .tabs { display:flex; gap:8px; margin:18px 0 10px } .tabs button[aria-pressed="true"] { outline:2px solid var(--accent); outline-offset:1px }
+    #result { min-height:30px; overflow-wrap:anywhere } .status { color:var(--muted); margin:12px 0 0 } .error { color:#ff9b91 } .notice { border-left:3px solid var(--warn); padding:10px 14px; background:#f1c77912; color:#e8d8b4; border-radius:4px } pre { white-space:pre-wrap; overflow-wrap:anywhere; background:#0d110e; border:1px solid var(--line); border-radius:10px; padding:16px; max-height:65vh; overflow:auto; font:13px/1.5 ui-monospace,monospace } .stats { display:flex; flex-wrap:wrap; gap:12px } .stat { background:#111713; border:1px solid var(--line); border-radius:10px; padding:12px 15px; min-width:150px } .stat b { display:block; font-size:20px; color:var(--accent) } small { color:var(--muted) } a { color:var(--accent); cursor:pointer }
+    @media(max-width:560px){ main{margin-top:28px}.panel{padding:16px} }
+  </style>
+</head>
+<body>
+<main>
+  <header><div class="eyebrow">Shielded chain explorer</div><h1>Rhombus Explorer</h1><p>Browse the tip, blocks, and transactions on a Rhombus node.</p></header>
+  <section class="panel">
+    <div class="row">
+      <div class="field"><label for="endpoint">JSON-RPC endpoint</label><input id="endpoint" value="" placeholder="http://127.0.0.1:RPC_PORT/"></div>
+      <div class="field"><label for="token">Node RPC token</label><input id="token" type="password" autocomplete="off" placeholder="Copy from the node's rpc.token file"></div>
+      <button id="connect">Connect</button>
+    </div>
+    <p class="status" id="connection">The token stays in this tab and is sent to the endpoint you choose.</p>
+    <div id="tip" class="stats"></div>
+  </section>
+  <section class="panel">
+    <div class="tabs" role="group" aria-label="Jenis pencarian">
+      <button class="secondary" data-mode="block" aria-pressed="true">Block</button>
+      <button class="secondary" data-mode="tx" aria-pressed="false">Tx hash</button>
+      <button class="secondary" data-mode="address" aria-pressed="false">Address</button>
+    </div>
+    <form id="search" class="row">
+      <div class="field"><label id="query-label" for="query">Block height or hash</label><input id="query" autocomplete="off" placeholder="Block height or hash"></div>
+      <button type="submit">Search</button>
+    </form>
+    <p class="status" id="hint">Enter a block height or hash.</p>
+  </section>
+  <section class="panel" id="output" hidden><div id="result"></div></section>
+  <footer><small>Public chain data does not reveal shielded note recipients or balances. See the address lookup note below.</small></footer>
+</main>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const endpoint = $('endpoint'), token = $('token'), connection = $('connection');
+  const output = $('output'), result = $('result'), tip = $('tip');
+  let mode = 'block', requestId = 0;
+  endpoint.value = location.origin;
+  function showError(error) { output.hidden = false; result.replaceChildren(); const p=document.createElement('p'); p.className='error'; p.textContent=String(error); result.append(p); }
+  async function rpc(method, params=[]) {
+    const url = endpoint.value.trim();
+    if (!url) throw new Error('Isi endpoint JSON-RPC.');
+    const response = await fetch(url, {method:'POST', headers:{'content-type':'application/json','authorization':'Bearer '+token.value}, body:JSON.stringify({jsonrpc:'2.0',id:++requestId,method,params})});
+    const body = await response.json();
+    if (body.error) throw new Error(body.error.message || 'RPC error');
+    return body.result;
+  }
+  function renderJson(value) {
+    output.hidden=false; result.replaceChildren();
+    const pre=document.createElement('pre'); pre.textContent=JSON.stringify(value,null,2); result.append(pre);
+    result.querySelectorAll('pre').forEach((node) => {
+      const text=node.textContent;
+      // Tx ids in a block view become convenient lookup links.
+      node.replaceChildren();
+      const lines=text.split('\n');
+      for (const line of lines) {
+        const match=line.match(/^([\s ]*"(?:txid|[0-9]+)"\s*:\s*)"([0-9a-f]{64})"(,?)$/);
+        if (match) { node.append(document.createTextNode(match[1])); const a=document.createElement('a'); a.href='#'; a.textContent='"'+match[2]+'"'; a.addEventListener('click',(e)=>{e.preventDefault();mode='tx';updateMode();$('query').value=match[2];lookup();}); node.append(a,document.createTextNode(match[3]+'\n')); }
+        else node.append(document.createTextNode(line+'\n'));
+      }
+    });
+  }
+  function updateMode() {
+    for (const b of document.querySelectorAll('[data-mode]')) b.setAttribute('aria-pressed',String(b.dataset.mode===mode));
+    $('query-label').textContent=mode==='block'?'Block height or hash':mode==='tx'?'Transaction hash':'Rhombus address';
+    $('query').placeholder=mode==='block'?'Block height or hash':mode==='tx'?'64-character transaction hash':'Rhombus address';
+    $('hint').textContent=mode==='block'?'Enter a block height or hash.':mode==='tx'?'Enter a txid to view its status and public transaction data.':'Address activity cannot be searched in public data: note recipients and values are encrypted. Sync a wallet with the corresponding viewing key to see its notes.';
+  }
+  async function lookup() {
+    const q=$('query').value.trim(); if (!q) return;
+    if (mode==='address') { output.hidden=false; result.replaceChildren(); const p=document.createElement('p'); p.className='notice'; p.textContent='Shielded addresses have no public activity index. Notes are encrypted with ML-KEM, and only a wallet holding the corresponding viewing key can identify its incoming notes. Use that wallet to view this address activity.'; result.append(p); return; }
+    try { connection.textContent='Loading from node…'; const data= mode==='block' ? await rpc('getblock',[/^\d+$/.test(q)?Number(q):q,2]) : await rpc('getrawtransaction',[q,true]); renderJson(data); connection.textContent='Connected · '+endpoint.value.trim(); }
+    catch(e) { showError(e.message); connection.textContent='Could not load data from the node.'; }
+  }
+  $('search').addEventListener('submit',(e)=>{e.preventDefault();lookup();});
+  for (const b of document.querySelectorAll('[data-mode]')) b.addEventListener('click',()=>{mode=b.dataset.mode;updateMode();$('query').focus();});
+    $('connect').addEventListener('click',async()=>{try { const info=await rpc('getblockchaininfo'); tip.replaceChildren(); for (const [label,value] of [['Height',info.height],['Tip hash',info.best_block_hash],['Network',info.network]]) { const box=document.createElement('div'); box.className='stat'; const small=document.createElement('small'); small.textContent=label; const b=document.createElement('b'); b.textContent=String(value ?? '—'); box.append(small,b); tip.append(box); } connection.textContent='Connected · '+endpoint.value.trim(); } catch(e) { tip.replaceChildren(); connection.textContent='Could not connect to node: '+e.message; }});
+})();
+</script>
+</body>
+</html>

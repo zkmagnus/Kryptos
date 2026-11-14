@@ -22,9 +22,6 @@ pub enum Error {
     /// The requested operation does not exist.
     #[error("no operation {0}")]
     NoOperation(u64),
-    /// More recipients than a transaction can carry.
-    #[error("too many recipients: at most {0}")]
-    TooManyRecipients(usize),
     /// The operating system's random source failed.
     #[error("system randomness unavailable")]
     Entropy,

@@ -16,6 +16,7 @@ use chain::params::{ChainParams, Upgrade};
 use chain::target::Target;
 use chain::Error;
 use common::{proving_key, spend_first_coin_for, spend_first_coin_with_fee, Harness, Wallet};
+use protocol::amount::RawCoin;
 use protocol::block::{empty_header, Block, PowSolution};
 use protocol::builder::{Builder, OutputInfo, SpendInfo};
 use protocol::bytes::Encodable;
@@ -46,33 +47,51 @@ fn mining_extends_the_chain_and_pays_the_miner() {
 }
 
 #[test]
-fn private_fee_is_relay_metadata_and_is_paid_into_the_private_coinbase() {
+fn public_fee_is_encoded_and_paid_into_the_coinbase() {
     let mut h = Harness::new(101);
     h.extend(Vec::new());
     let parent = h.tip_header();
     let recipient = Wallet::new(&mut ChaCha20Rng::seed_from_u64(102));
-    let fee = 17;
+    let fee = protocol::transaction::Transaction::encoded_len_for_actions(2).unwrap() as u64;
     let spending_wallet = h.miner.clone_for_test(0);
     let tx = spend_first_coin_with_fee(&mut h, &spending_wallet, &recipient.address, 1_000, fee);
     assert_eq!(tx.fee().raw(), fee);
-    assert!(tx.fee_opening().is_some());
 
     let decoded_tx = Transaction::from_slice(&tx.to_vec()).unwrap();
     assert_eq!(decoded_tx.txid(), tx.txid());
-    assert_eq!(decoded_tx.fee(), protocol::coin::Rhombus::ZERO);
-    assert!(decoded_tx.fee_opening().is_none());
+    assert_eq!(decoded_tx.fee(), tx.fee());
 
     let block = h.make_block(&parent, vec![tx]);
     let decoded_block = Block::from_slice(&block.to_vec()).unwrap();
-    assert!(decoded_block.binding_signature().is_some());
-    assert!(decoded_block.transactions()[1].fee_opening().is_none());
     assert_eq!(h.import(&decoded_block).unwrap(), Import::Extended);
     h.scan(&decoded_block);
 
     let reward = protocol::consensus::subsidy(decoded_block.header().height)
-        .checked_add(protocol::coin::Rhombus::from_raw(fee).unwrap())
+        .checked_add(RawCoin::from_raw(fee).unwrap())
         .unwrap();
     assert!(h.miner.coins.iter().any(|(coin, _)| coin.value() == reward));
+}
+
+#[test]
+fn block_rejects_transfer_with_incorrect_declared_fee() {
+    let mut h = Harness::new(104);
+    h.extend(Vec::new());
+    let parent = h.tip_header();
+    let recipient = Wallet::new(&mut ChaCha20Rng::seed_from_u64(105));
+    let fee = protocol::transaction::Transaction::encoded_len_for_actions(2).unwrap() as u64;
+    let spending_wallet = h.miner.clone_for_test(0);
+    let tx = spend_first_coin_with_fee(&mut h, &spending_wallet, &recipient.address, 1_000, fee);
+    let mut bytes = tx.to_vec();
+    let fee_offset = 1 + 1 + 32;
+    bytes[fee_offset..fee_offset + 8].copy_from_slice(&(fee + 1).to_le_bytes());
+    let tampered = Transaction::from_slice(&bytes).unwrap();
+    let block = h.make_block(&parent, vec![tampered]);
+    assert!(matches!(
+        h.import(&block),
+        Err(Error::Protocol(protocol::Error::InvalidTransaction(
+            "fee does not match transaction size"
+        )))
+    ));
 }
 
 #[test]
@@ -86,18 +105,20 @@ fn a_coinbase_output_can_be_spent_once() {
 
     let mut rng = ChaCha20Rng::seed_from_u64(99);
     let recipient = Wallet::new(&mut rng);
-    let pay = coin.value().raw();
+    let fee = Transaction::default_fee_for_actions(2).unwrap();
+    let pay = coin.value().raw() - fee.raw();
     let mut b = Builder::new(parent.commitment_root);
     b.add_spend(SpendInfo::new(h.miner.sk.clone(), coin, path))
         .unwrap();
     b.add_output(OutputInfo::new(
         recipient.address,
-        protocol::coin::Rhombus::from_raw(pay).unwrap(),
+        RawCoin::from_raw(pay).unwrap(),
         None,
     ))
     .unwrap();
     let tx = b
-        .build(
+        .build_with_fee(
+            fee,
             proving_key(),
             h.chain.params().branch_at(parent.height + 1),
             &mut h.rng,
@@ -145,11 +166,7 @@ fn bad_blocks_are_rejected() {
         .pow()
         .mine(&mut wrong_root, 256, &mut h.rng)
         .unwrap());
-    let bad = Block::new_with_binding_signature(
-        wrong_root,
-        good.transactions().to_vec(),
-        good.binding_signature().unwrap().clone(),
-    );
+    let bad = Block::new(wrong_root, good.transactions().to_vec());
     assert!(matches!(
         h.import(&bad),
         Err(Error::InvalidHeader("commitment root mismatch"))
@@ -211,11 +228,7 @@ fn with_corrupted_proof(block: &Block) -> Block {
     assert_eq!(bad.txid(), tx.txid(), "the txid excludes the proof");
     let mut txs = block.transactions().to_vec();
     txs[0] = bad;
-    Block::new_with_binding_signature(
-        block.header().clone(),
-        txs,
-        block.binding_signature().unwrap().clone(),
-    )
+    Block::new(block.header().clone(), txs)
 }
 
 #[test]
@@ -338,7 +351,7 @@ fn coinbase_for(
 ) -> protocol::transaction::Transaction {
     let credit = subsidy(parent.height + 1);
     let mut b = Builder::new(parent.commitment_root);
-    b.add_output(OutputInfo::new(h.miner.address, credit, None))
+    b.add_output(OutputInfo::new(h.miner.address.clone(), credit, None))
         .unwrap();
     b.build_coinbase(proving_key(), credit, branch, &mut h.rng)
         .unwrap()
@@ -386,11 +399,7 @@ fn block_over(
         solution: PowSolution::empty(),
     };
     assert!(h.chain.pow().mine(&mut header, 256, &mut h.rng).unwrap());
-    Block::new_with_binding_signature(
-        header,
-        transactions,
-        protocol::block::BindingSignature::from_bytes([0; 64]),
-    )
+    Block::new(header, transactions)
 }
 
 #[test]
@@ -400,9 +409,9 @@ fn a_coinbase_claiming_the_wrong_credit_is_rejected() {
     let parent = h.tip_header();
     let height = parent.height + 1;
     for wrong in [subsidy(height).raw() + 1, subsidy(height).raw() - 1] {
-        let credit = protocol::coin::Rhombus::from_raw(wrong).unwrap();
+        let credit = RawCoin::from_raw(wrong).unwrap();
         let mut b = Builder::new(parent.commitment_root);
-        b.add_output(OutputInfo::new(h.miner.address, credit, None))
+        b.add_output(OutputInfo::new(h.miner.address.clone(), credit, None))
             .unwrap();
         let coinbase = b
             .build_coinbase(
@@ -424,6 +433,37 @@ fn a_coinbase_claiming_the_wrong_credit_is_rejected() {
 }
 
 #[test]
+fn coinbase_with_nonzero_fee_is_rejected_before_binding_verification() {
+    let mut h = Harness::new(601);
+    h.extend(Vec::new());
+    let parent = h.tip_header();
+    let credit = subsidy(parent.height + 1);
+    let mut builder = Builder::new(parent.commitment_root);
+    builder
+        .add_output(OutputInfo::new(h.miner.address.clone(), credit, None))
+        .unwrap();
+    let coinbase = builder
+        .build_coinbase(
+            proving_key(),
+            credit,
+            h.chain.params().branch_at(parent.height + 1),
+            &mut h.rng,
+        )
+        .unwrap();
+    let mut encoded = coinbase.to_vec();
+    // version + native kind + anchor = offset 34; fee is 8 bytes.
+    encoded[36] = 1;
+    let malformed = Transaction::from_slice(&encoded).unwrap();
+    let block = block_over(&mut h, &parent, vec![malformed]);
+    assert!(matches!(
+        h.import(&block),
+        Err(Error::Protocol(protocol::Error::InvalidTransaction(
+            "fee does not match transaction size",
+        )))
+    ));
+}
+
+#[test]
 fn only_the_first_transaction_may_create_value() {
     let mut h = Harness::new(7);
     h.extend(Vec::new());
@@ -431,7 +471,7 @@ fn only_the_first_transaction_may_create_value() {
     let credit = subsidy(parent.height + 1);
     let mut first = Builder::new(parent.commitment_root);
     first
-        .add_output(OutputInfo::new(h.miner.address, credit, None))
+        .add_output(OutputInfo::new(h.miner.address.clone(), credit, None))
         .unwrap();
     let coinbase = first
         .build_coinbase(
@@ -443,7 +483,7 @@ fn only_the_first_transaction_may_create_value() {
         .unwrap();
     let mut second = Builder::new(parent.commitment_root);
     second
-        .add_output(OutputInfo::new(h.miner.address, credit, None))
+        .add_output(OutputInfo::new(h.miner.address.clone(), credit, None))
         .unwrap();
     let extra = second
         .build_coinbase(

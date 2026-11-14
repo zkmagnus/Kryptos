@@ -572,7 +572,7 @@ fn constrain_point(
 #[cfg(test)]
 mod tests {
     use crypto::keys::{FullViewingKey, SpendingKey};
-    use crypto::merkle::MerkleTree;
+    use crypto::merkle::{MerklePath, MerkleTree, EMPTY_LEAF, MERKLE_DEPTH};
     use crypto::signature::{RandomizedVerificationKey, SpendAuthRandomizer};
     use ff::Field;
     use halo2_proofs::dev::{MockProver, VerifyFailure};
@@ -691,6 +691,19 @@ mod tests {
             ..f.public
         };
         assert_eq!(prove(&f, &public), Ok(()));
+    }
+
+    #[test]
+    fn dummy_spend_cannot_claim_nonzero_old_value() {
+        let mut f = fixture(404, 0);
+        f.witness.spend.path = MerklePath::new(0, [EMPTY_LEAF; MERKLE_DEPTH]);
+        f.witness.spend.coin.value = 1;
+        f.witness.output.rho = f.witness.spend.nullifier();
+        f.witness.transaction_net = 1;
+        f.witness.transaction_rcv = f.witness.rcv;
+        f.witness.transaction_negative = false;
+        let public = PublicInputs::from_witness(Fp::from(7), &f.witness).unwrap();
+        assert!(fails(&f, &public));
     }
 
     #[test]

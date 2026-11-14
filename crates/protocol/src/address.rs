@@ -289,7 +289,10 @@ mod tests {
             .chars()
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         assert_ne!(main, test);
-        assert_eq!(RhombusAddress::decode(&main, AddressPrefix::Main), Ok(addr));
+        assert_eq!(
+            RhombusAddress::decode(&main, AddressPrefix::Main),
+            Ok(addr.clone())
+        );
         assert_eq!(RhombusAddress::decode(&test, AddressPrefix::Test), Ok(addr));
     }
 

@@ -8,7 +8,7 @@
 //! block <height>         -> ok <hex> | err not found
 //! compact <height>       -> ok <hex> | err not found
 //! hash <height>          -> ok <hex> | err not found
-//! submit <hex tx> [hex fee opening] -> ok <txid hex> | err <reason>
+//! submit <hex tx> -> ok <txid hex> | err <reason>
 //! txstatus <hex txid>    -> ok unknown | ok pooled | ok confirmed <height> <index>
 //! spent <hex nullifier>  -> ok true | ok false
 //! ```
@@ -246,13 +246,7 @@ pub fn parse(line: &str) -> Result<Request> {
         "submit" => {
             let bytes = from_hex(argument)?;
             let tx = Box::new(Transaction::from_slice(&bytes)?);
-            match words.next() {
-                Some(opening) => Ok(Request::SubmitWithFee(
-                    tx,
-                    protocol::fee::FeeOpening::from_slice(&from_hex(opening)?)?,
-                )),
-                None => Ok(Request::Submit(tx)),
-            }
+            Ok(Request::Submit(tx))
         }
         "txstatus" => {
             let bytes = from_hex(argument)?

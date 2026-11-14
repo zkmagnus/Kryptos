@@ -142,7 +142,7 @@ impl ChainParams {
             block_interval: 10,
             // Seven days at a 30-second target block interval.
             difficulty_window: 20_160,
-            // Transfer-opcode transaction v3 genesis; distinct from earlier networks.
+            // Native transaction v3 genesis; distinct from earlier networks.
             genesis_timestamp: 1_793_700_000,
             anchor_max_age: 100,
             max_future_seconds: 2 * 60 * 60,
@@ -169,7 +169,7 @@ impl ChainParams {
             // and the miner that started first wins every block.
             block_interval: 5,
             difficulty_window: 6,
-            // Transfer-opcode transaction v3 genesis; distinct from earlier networks.
+            // Native transaction v3 genesis; distinct from earlier networks.
             genesis_timestamp: 1_793_700_001,
             anchor_max_age: 100,
             max_future_seconds: 2 * 60 * 60,

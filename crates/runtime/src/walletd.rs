@@ -1,4 +1,4 @@
-//! The wallet daemon `RawCoin-wallet-rpc`: a long-running process that
+//! The wallet daemon `Rhombus-wallet-rpc`: a long-running process that
 //! holds one wallet file, keeps it synced from a node, serves the wallet
 //! methods over JSON-RPC, and carries send operations from request to
 //! confirmation, rebuilding them if their transaction is not mined.
@@ -23,12 +23,12 @@ use protocol::bytes::Encodable;
 use protocol::consensus::next_height;
 use protocol::transaction::{Transaction, TxId};
 use serde_json::{json, Value};
-use systemcall_proof::ProvingKey;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
+use transaction_proof::ProvingKey;
 use wallet::operations::{Operation, OperationStatus};
 use wallet::scan::OwnedCoin;
-use wallet::spend::{build_payments, quote_payments, Built, Payment, MAX_RECIPIENTS};
+use wallet::spend::{build_payment_with_options, Built, Payment};
 use wallet::wallet::Wallet;
 
 use crate::cli::sync_wallet;
@@ -62,23 +62,22 @@ pub const METHODS: &[&str] = &[
     "listunspent",
     "listreceived",
     "gettransaction",
-    "sendmany",
+    "send",
     "getoperationstatus",
     "listoperations",
     "canceloperation",
-    "quotepayment",
     "rescan",
     "help",
 ];
 
-/// Command line of `RawCoin-wallet-rpc`.
+/// Command line of `Rhombus-wallet-rpc`.
 #[derive(Parser, Debug)]
 #[command(
-    name = "RawCoin-wallet-rpc",
+    name = "Rhombus-wallet-rpc",
     about = "Wallet daemon: sync, addresses, sends, JSON-RPC"
 )]
 pub struct Args {
-    /// Wallet file, created with `RawCoin create` or the desktop app;
+    /// Wallet file, created with `Rhombus create` or the desktop app;
     /// defaults to `<user data>/<network>/wallet.redb`.
     #[arg(long)]
     pub wallet: Option<PathBuf>,
@@ -97,7 +96,7 @@ pub struct Args {
     )]
     pub node_token: Option<String>,
     /// File holding the node's token; defaults to the `rpc.token` a
-    /// default `RawCoin run` writes, `<user data>/<network>/chain/rpc.token`.
+    /// default `Rhombus run` writes, `<user data>/<network>/chain/rpc.token`.
     #[arg(long)]
     pub node_token_file: Option<PathBuf>,
     /// Address to serve the wallet's JSON-RPC on.
@@ -264,7 +263,7 @@ fn node_token(text: Option<String>, file: Option<PathBuf>, network: Network) -> 
     }
 }
 
-/// Runs the `RawCoin-wallet-rpc` command line: opens the wallet, starts the
+/// Runs the `Rhombus-wallet-rpc` command line: opens the wallet, starts the
 /// daemon and waits for a stop request.
 ///
 /// # Errors
@@ -283,7 +282,7 @@ pub async fn main(args: Args) -> Result<()> {
     // an empty file behind a mistyped or missing path.
     if !wallet_path.try_exists()? {
         return Err(Error::Argument(format!(
-            "no wallet at {}; create one with the desktop app or `RawCoin create --wallet <file>`",
+            "no wallet at {}; create one with the desktop app or `Rhombus create --wallet <file>`",
             wallet_path.display()
         )));
     }
@@ -312,7 +311,7 @@ pub async fn main(args: Args) -> Result<()> {
     })
     .await?;
     logging::info(&format!(
-        "RawCoin-wallet-rpc up on the {} network, json-rpc http://{}/",
+        "Rhombus-wallet-rpc up on the {} network, json-rpc http://{}/",
         args.network, handle.addr
     ));
     shutdown.requested().await;
@@ -540,6 +539,13 @@ impl WalletDaemon {
                 format!("gave up after {MAX_ATTEMPTS} attempts"),
             );
         }
+        if op.recipients.len() != 1 {
+            return self.build_failed(
+                &previous,
+                tip,
+                "wallet operations must contain exactly one recipient".into(),
+            );
+        }
         op.status = OperationStatus::Building;
         op.attempts = op.attempts.saturating_add(1);
         if !self.0.wallet.compare_and_swap_operation(&previous, &op)? {
@@ -554,11 +560,14 @@ impl WalletDaemon {
         let excluded = self.excluded_positions(&op)?;
         let pk = self.proving_key().await?;
         let daemon = self.clone();
-        let recipients = op.recipients.clone();
+        let payment =
+            op.recipients.first().cloned().ok_or_else(|| {
+                Error::Wallet(wallet::Error::Corrupt("operation has no recipient"))
+            })?;
         let built = tokio::task::spawn_blocking(move || {
-            build_payments(
+            build_payment_with_options(
                 &daemon.0.wallet,
-                &recipients,
+                payment,
                 pk.as_ref(),
                 branch,
                 &excluded,
@@ -643,7 +652,6 @@ impl WalletDaemon {
         op.locked.sort_unstable();
         op.locked.dedup();
         op.record_transaction(built.transaction.to_vec());
-        op.fee_opening = Some(built.fee_opening.clone());
         if self.0.wallet.compare_and_swap_operation(&previous, &op)? {
             // The commit above must succeed before the node can see any bytes.
             // Any reply failure leaves the exact transaction and locks intact.
@@ -657,17 +665,7 @@ impl WalletDaemon {
             .transaction
             .as_ref()
             .ok_or_else(|| Error::Wallet(wallet::Error::Corrupt("pending transaction missing")))?;
-        let opening = op
-            .fee_opening
-            .as_ref()
-            .ok_or_else(|| Error::Wallet(wallet::Error::Corrupt("pending fee opening missing")))?;
-        client
-            .call(&format!(
-                "submit {} {}",
-                to_hex(bytes),
-                to_hex(&opening.to_vec())
-            ))
-            .await?;
+        client.call(&format!("submit {}", to_hex(bytes))).await?;
         Ok(())
     }
 
@@ -753,30 +751,16 @@ impl WalletDaemon {
         Ok(RhombusAddress::decode(text, self.0.params.address_prefix)?)
     }
 
-    fn recipients(&self, value: &Value) -> core::result::Result<Vec<Payment>, RpcError> {
-        let items = value
-            .as_array()
-            .ok_or_else(|| RpcError::invalid_params("recipients must be an array"))?;
-        if items.is_empty() || items.len() > MAX_RECIPIENTS {
-            return Err(RpcError::invalid_params(format!(
-                "between 1 and {MAX_RECIPIENTS} recipients"
-            )));
-        }
-        items
-            .iter()
-            .map(|item| {
-                let address = item
-                    .get("address")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| RpcError::invalid_params("recipient address"))?;
-                let amount = parse_amount(item.get("amount"))?;
-
-                Ok(Payment {
-                    recipient: self.parse_address(address)?,
-                    amount,
-                })
-            })
-            .collect()
+    fn payment(&self, value: &Value) -> core::result::Result<Payment, RpcError> {
+        let address = value
+            .get("address")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::invalid_params("recipient address"))?;
+        let amount = parse_amount(value.get("amount"))?;
+        Ok(Payment {
+            recipient: self.parse_address(address)?,
+            amount,
+        })
     }
 
     fn operation_json(&self, op: &Operation) -> Value {
@@ -938,17 +922,12 @@ impl WalletDaemon {
                 let txid = parse_txid(&params.get::<String>(0, "txid")?)?;
                 self.transaction_json(txid)
             }
-            "sendmany" => {
-                let recipients = self.recipients(&params.get::<Value>(0, "recipients")?)?;
+            "send" => {
+                let recipient = self.payment(&params.get::<Value>(0, "payment")?)?;
                 let min: u32 = params.opt(1, "min_confirmations")?.unwrap_or(1);
-                let op = wallet.add_operation(recipients, min, now())?;
+                let op = wallet.add_operation(Some(recipient), min, now())?;
                 self.0.wake.notify_one();
                 Ok(json!({ "operation_id": op.id, "status": op.status.name() }))
-            }
-            "quotepayment" => {
-                let recipients = self.recipients(&params.get::<Value>(0, "recipients")?)?;
-                let min: u32 = params.opt(1, "min_confirmations")?.unwrap_or(1);
-                self.quote_json(&recipients, min)
             }
             "getoperationstatus" => {
                 let id: u64 = params.get(0, "operation_id")?;
@@ -991,38 +970,6 @@ impl WalletDaemon {
 }
 
 impl WalletDaemon {
-    /// Unspent value split by what a send may use now.
-    /// The exact total `recipients` would send if queued now, selecting coins
-    /// as the payment worker would at the wallet's scanned height.
-    fn quote_json(
-        &self,
-        recipients: &[Payment],
-        min_confirmations: u32,
-    ) -> core::result::Result<Value, RpcError> {
-        let tip = self.scanned_height()?.unwrap_or(0);
-        // A coin at height h has tip - h + 1 confirmations.
-        let max_coin_height = tip
-            .saturating_add(1)
-            .saturating_sub(min_confirmations.max(1));
-        let excluded = self.pending_locks(None)?;
-        let quote = quote_payments(&self.0.wallet, recipients, &excluded, max_coin_height)
-            .map_err(|error| match error {
-                wallet::Error::InsufficientFunds { .. } => {
-                    RpcError::new(REJECTED, error.to_string())
-                }
-                other => RpcError::from(Error::from(other)),
-            })?;
-        let sent = recipients
-            .iter()
-            .try_fold(RawCoin::ZERO, |acc, p| acc.checked_add(p.amount))
-            .map_err(|e| RpcError::from(Error::from(e)))?;
-        Ok(json!({
-            "total": sent.raw().to_string(),
-            "spends": quote.spends,
-            "actions": quote.actions,
-        }))
-    }
-
     fn balance_json(&self, min_confirmations: u64) -> core::result::Result<Value, RpcError> {
         let locked = self.0.wallet.locked_positions()?;
         let mut confirmed = 0u64;
@@ -1094,17 +1041,22 @@ fn parse_txid(text: &str) -> core::result::Result<TxId, RpcError> {
 mod tests {
     use std::collections::VecDeque;
 
-    use crypto::commitment::ValueCommitTrapdoor;
+    use chain::pow::RandomXPow;
     use crypto::keys::SpendingKey;
+    use protocol::block::{empty_header, Block, BlockHash};
+    use protocol::builder::{Builder, OutputInfo};
+    use protocol::transaction::Anchor;
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
     use wallet::keys::WalletKeys;
 
     use super::*;
+    use crate::miner::Template;
+    use crate::node::{Handle, Request, Response, Submission};
 
     #[test]
     fn the_wallet_daemon_defaults_to_the_main_network() {
-        let args = Args::try_parse_from(["RawCoin-wallet-rpc"]).unwrap();
+        let args = Args::try_parse_from(["Rhombus-wallet-rpc"]).unwrap();
         assert_eq!(args.network, Network::Main);
     }
 
@@ -1120,6 +1072,74 @@ mod tests {
         )
         .unwrap();
         (dir, wallet)
+    }
+
+    fn funded_block(wallet: &Wallet) -> Block {
+        let mut rng = ChaCha20Rng::seed_from_u64(75);
+        let mint = RawCoin::from_raw(1_000_000_000).unwrap();
+        let mut builder = Builder::new(Anchor::from_base(crypto::pallas::Base::from(0u64)));
+        builder
+            .add_output(OutputInfo::new(
+                wallet.keys().default_address().unwrap(),
+                mint,
+                None,
+            ))
+            .unwrap();
+        let coinbase = builder
+            .build_coinbase(
+                &ProvingKey::build().unwrap(),
+                mint,
+                Network::Test.params().genesis_branch,
+                &mut rng,
+            )
+            .unwrap();
+        Block::new(
+            empty_header(
+                0,
+                BlockHash::ZERO,
+                Anchor::from_base(crypto::pallas::Base::from(1u64)),
+            ),
+            vec![coinbase],
+        )
+    }
+
+    async fn fund_on_node(node: &Handle, wallet: &Wallet) {
+        let Response::Block(Some(genesis)) = node.request(Request::Block(0)).await.unwrap() else {
+            panic!("missing genesis block");
+        };
+        wallet.scan(&genesis).unwrap();
+        let params = Network::Test.params();
+        let mut rng = ChaCha20Rng::seed_from_u64(76);
+        let template = Template {
+            parent: genesis.header().clone(),
+            recent: vec![genesis.header().clone()],
+            tree: storage::tree::CommitmentTree::default(),
+            transactions: Vec::new(),
+            params,
+            now: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        };
+        let (mut header, transactions) = template
+            .assemble(
+                &wallet.keys().default_address().unwrap(),
+                &ProvingKey::build().unwrap(),
+                &mut rng,
+            )
+            .unwrap();
+        RandomXPow::new(params.randomx_key)
+            .unwrap()
+            .mine(&mut header, 100_000, &mut rng)
+            .unwrap();
+        let block = Block::new(header, transactions);
+        assert!(matches!(
+            node.request(Request::SubmitBlock(Box::new(block.clone())))
+                .await
+                .unwrap(),
+            Response::BlockSubmitted(Submission::Accepted)
+        ));
+        wallet.scan(&block).unwrap();
     }
 
     fn reopen(dir: &tempfile::TempDir) -> Wallet {
@@ -1147,10 +1167,10 @@ mod tests {
     fn payment(wallet: &Wallet) -> Operation {
         wallet
             .add_operation(
-                vec![Payment {
+                Some(Payment {
                     recipient: wallet.keys().address(1u64.into()).unwrap(),
                     amount: RawCoin::from_raw(1_000).unwrap(),
-                }],
+                }),
                 1,
                 0,
             )
@@ -1158,7 +1178,11 @@ mod tests {
     }
 
     fn dummy_coinbase() -> protocol::transaction::Transaction {
-        let mut rng = ChaCha20Rng::seed_from_u64(74);
+        dummy_coinbase_with_seed(74)
+    }
+
+    fn dummy_coinbase_with_seed(seed: u64) -> protocol::transaction::Transaction {
+        let mut rng = ChaCha20Rng::seed_from_u64(seed);
         let keys = WalletKeys::from_spending_key(SpendingKey::from_bytes([74; 32])).unwrap();
         let mut builder = protocol::builder::Builder::new(
             protocol::transaction::Anchor::from_base(crypto::pallas::Base::from(0u64)),
@@ -1188,10 +1212,6 @@ mod tests {
             built_at: 0,
         };
         op.transaction = Some(tx.to_vec());
-        op.fee_opening = Some(protocol::fee::FeeOpening::new(
-            RawCoin::ZERO,
-            ValueCommitTrapdoor::zero(),
-        ));
         op.locked = vec![0];
         op.attempts = 1;
         wallet.put_operation(&op).unwrap();
@@ -1232,11 +1252,7 @@ mod tests {
             assert_eq!(saved.locked, vec![0]);
             assert_eq!(
                 line,
-                format!(
-                    "submit {} {}",
-                    to_hex(saved.transaction.as_ref().unwrap()),
-                    to_hex(&saved.fee_opening.as_ref().unwrap().to_vec())
-                )
+                format!("submit {}", to_hex(saved.transaction.as_ref().unwrap()))
             );
             // None simulates termination while waiting for a network response.
             match self.reply.take() {
@@ -1278,10 +1294,6 @@ mod tests {
                     Built {
                         transaction: tx.clone(),
                         spent: vec![0],
-                        fee_opening: protocol::fee::FeeOpening::new(
-                            RawCoin::ZERO,
-                            ValueCommitTrapdoor::zero(),
-                        ),
                     },
                     0,
                 ),
@@ -1363,11 +1375,7 @@ mod tests {
         daemon.follow(&mut client, pending, 10, 0).await.unwrap();
         assert_eq!(
             client.calls[1],
-            format!(
-                "submit {} {}",
-                to_hex(op.transaction.as_ref().unwrap()),
-                to_hex(&op.fee_opening.as_ref().unwrap().to_vec())
-            )
+            format!("submit {}", to_hex(op.transaction.as_ref().unwrap()))
         );
         daemon.reconcile_operations(&mut client, 3).await.unwrap();
         let confirmed = daemon.wallet().operation(op.id).unwrap();
@@ -1412,7 +1420,7 @@ mod tests {
     async fn an_older_attempt_mined_after_a_reorg_is_recognized_and_retained() {
         let (dir, wallet) = wallet_file();
         let mut op = recorded_payment(&wallet);
-        let original = dummy_coinbase();
+        let original = dummy_coinbase_with_seed(75);
         op.previous_transactions.push(original.to_vec());
         wallet.put_operation(&op).unwrap();
         drop(wallet);
@@ -1453,7 +1461,7 @@ mod tests {
     #[tokio::test]
     async fn failed_replacements_keep_pending_transactions_and_retry_limits_keep_locks() {
         let (_dir, wallet) = wallet_file();
-        wallet.scan(&genesis(&Network::Test.params())).unwrap();
+        wallet.scan(&funded_block(&wallet)).unwrap();
         let mut op = recorded_payment(&wallet);
         op.status = OperationStatus::Queued;
         op.attempts = MAX_ATTEMPTS;
@@ -1533,16 +1541,16 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_restarted_prover_and_a_lost_acceptance_reply_preserve_one_real_payment() {
         let (dir, wallet) = wallet_file();
-        wallet.scan(&genesis(&Network::Test.params())).unwrap();
+        let node = crate::node::spawn(crate::config::Config::test())
+            .await
+            .unwrap();
+        fund_on_node(&node, &wallet).await;
         assert!(wallet.balance().unwrap() > 0);
         let mut op = payment(&wallet);
         op.status = OperationStatus::Building;
         op.attempts = 1;
         wallet.put_operation(&op).unwrap();
         drop(wallet);
-        let node = crate::node::spawn(crate::config::Config::test())
-            .await
-            .unwrap();
         let source = Source::Embedded(node.events());
         let daemon = daemon(reopen(&dir), source.clone());
         daemon.recover_interrupted_operations().unwrap();
@@ -1550,7 +1558,7 @@ mod tests {
         assert_eq!(queued.status, OperationStatus::Queued);
         let mut client = LoseSubmissionReply(source.connect().await.unwrap());
         assert!(daemon
-            .build_and_submit(&mut client, queued, 0)
+            .build_and_submit(&mut client, queued, 1)
             .await
             .is_err());
         let submitted = daemon.wallet().operation(op.id).unwrap();
@@ -1605,24 +1613,35 @@ mod tests {
     }
 
     #[test]
-    fn quotes_reject_unfunded_payments_and_malformed_recipients() {
+    fn send_accepts_one_recipient_and_batch_methods_are_removed() {
         let (_dir, wallet) = wallet_file();
-        let address = wallet
+        let _address = wallet
             .keys()
             .address(1u64.into())
             .unwrap()
             .encode(Network::Test.address_prefix());
         let daemon = offline_daemon(wallet);
-        let quote = |params: Value| daemon.coin_methods("quotepayment", &Params::new(params));
-        let unfunded = quote(json!([[{ "address": address, "amount": "1000" }]])).unwrap_err();
-        assert_eq!(unfunded.code, REJECTED);
-        assert!(unfunded.message.contains("insufficient funds"));
-        for bad in [
-            json!([[]]),
-            json!([[{ "address": "nonsense", "amount": "1" }]]),
-        ] {
-            assert_eq!(quote(bad).unwrap_err().code, crate::jsonrpc::INVALID_PARAMS);
-        }
+        let send = |params: Value| daemon.coin_methods("send", &Params::new(params));
+        assert_eq!(
+            send(json!([{"address": "nonsense", "amount": "1"}]))
+                .unwrap_err()
+                .code,
+            crate::jsonrpc::INVALID_PARAMS
+        );
+        assert_eq!(
+            daemon
+                .coin_methods("sendmany", &Params::new(json!([])))
+                .unwrap_err()
+                .code,
+            crate::jsonrpc::METHOD_NOT_FOUND
+        );
+        assert_eq!(
+            daemon
+                .coin_methods("quotepayment", &Params::new(json!([])))
+                .unwrap_err()
+                .code,
+            crate::jsonrpc::METHOD_NOT_FOUND
+        );
     }
 
     #[test]

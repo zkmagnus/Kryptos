@@ -50,7 +50,7 @@ pub type Result<T> = core::result::Result<T, Error>;
 pub(crate) mod test_keys {
     use std::sync::OnceLock;
 
-    use systemcall_proof::{ProvingKey, VerifyingKey};
+    use transaction_proof::{ProvingKey, VerifyingKey};
 
     static PROVING: OnceLock<ProvingKey> = OnceLock::new();
     static VERIFYING: OnceLock<VerifyingKey> = OnceLock::new();

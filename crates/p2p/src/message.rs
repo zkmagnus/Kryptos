@@ -3,18 +3,17 @@
 //! a per-list limit. There is no user agent and no optional field: every
 //! node speaks exactly the same bytes.
 
-use protocol::block::{BindingSignature, Block, BlockHash, BlockHeader};
+use protocol::block::{Block, BlockHash, BlockHeader};
 use protocol::bytes::{Encodable, Reader, Writer};
 use protocol::consensus::MAX_BLOCK_TRANSACTIONS;
-use protocol::fee::FeeOpening;
 use protocol::transaction::{Transaction, TxId};
 
 use crate::{Error, Result};
 
 /// The only protocol version.
-pub const PROTOCOL_VERSION: u32 = 2;
-/// Upper bound on one encoded message, comfortably above a full block.
-pub const MAX_MESSAGE_LEN: usize = 40 * 1024 * 1024;
+pub const PROTOCOL_VERSION: u32 = 1;
+/// Upper bound on one encoded message, large enough for a maximum-size block.
+pub const MAX_MESSAGE_LEN: usize = 50 * 1024 * 1024;
 /// Most inventory items in one message.
 pub const MAX_INVENTORY: usize = 50_000;
 /// Most headers in one message.
@@ -132,10 +131,6 @@ pub enum Message {
     Tx(Box<Transaction>),
     /// A transaction in the stem phase, to be relayed to one peer.
     StemTx(Box<Transaction>),
-    /// Transaction plus fee opening, sent only over the encrypted peer relay.
-    TxWithFee(Box<Transaction>, FeeOpening),
-    /// Stem-phase form of [`Message::TxWithFee`].
-    StemTxWithFee(Box<Transaction>, FeeOpening),
     /// A new block as its header, its coinbase, and the ids of the other
     /// transactions, which the receiver usually already has.
     CompactBlock(Box<CompactBlock>),
@@ -162,8 +157,6 @@ pub struct CompactBlock {
     pub header: BlockHeader,
     /// The coinbase, which no mempool holds.
     pub coinbase: Transaction,
-    /// Block-wide value-conservation signature.
-    pub binding_signature: Option<BindingSignature>,
     /// Ids of the remaining transactions, in block order.
     pub txids: Vec<TxId>,
 }
@@ -180,7 +173,6 @@ impl CompactBlock {
         Ok(Self {
             header: block.header().clone(),
             coinbase: coinbase.clone(),
-            binding_signature: block.binding_signature().cloned(),
             txids: rest.iter().map(Transaction::txid).collect(),
         })
     }
@@ -209,8 +201,6 @@ mod tag {
     pub const COMPACT_BLOCK: u8 = 15;
     pub const GET_BLOCK_TXN: u8 = 16;
     pub const BLOCK_TXN: u8 = 17;
-    pub const TX_WITH_FEE: u8 = 18;
-    pub const STEM_TX_WITH_FEE: u8 = 19;
 }
 
 impl Message {
@@ -231,8 +221,6 @@ impl Message {
             Self::Block(_) => tag::BLOCK,
             Self::Tx(_) => tag::TX,
             Self::StemTx(_) => tag::STEM_TX,
-            Self::TxWithFee(_, _) => tag::TX_WITH_FEE,
-            Self::StemTxWithFee(_, _) => tag::STEM_TX_WITH_FEE,
             Self::CompactBlock(_) => tag::COMPACT_BLOCK,
             Self::GetBlockTxn { .. } => tag::GET_BLOCK_TXN,
             Self::BlockTxn { .. } => tag::BLOCK_TXN,
@@ -289,21 +277,9 @@ impl Message {
             }
             Self::Block(b) => b.write(&mut w),
             Self::Tx(t) | Self::StemTx(t) => t.write(&mut w),
-            Self::TxWithFee(t, opening) | Self::StemTxWithFee(t, opening) => {
-                t.write(&mut w);
-                opening.write(&mut w);
-            }
             Self::CompactBlock(c) => {
                 c.header.write(&mut w);
                 c.coinbase.write(&mut w);
-                match &c.binding_signature {
-                    Some(signature) => {
-                        w.put_u8(1).put(&signature.to_bytes());
-                    }
-                    None => {
-                        w.put_u8(0);
-                    }
-                }
                 put_count(&mut w, c.txids.len());
                 for id in &c.txids {
                     w.put(id.as_bytes());
@@ -384,26 +360,9 @@ impl Message {
             tag::BLOCK => Self::Block(Box::new(Block::read(&mut r)?)),
             tag::TX => Self::Tx(Box::new(Transaction::read(&mut r)?)),
             tag::STEM_TX => Self::StemTx(Box::new(Transaction::read(&mut r)?)),
-            tag::TX_WITH_FEE => Self::TxWithFee(
-                Box::new(Transaction::read(&mut r)?),
-                FeeOpening::read(&mut r)?,
-            ),
-            tag::STEM_TX_WITH_FEE => Self::StemTxWithFee(
-                Box::new(Transaction::read(&mut r)?),
-                FeeOpening::read(&mut r)?,
-            ),
             tag::COMPACT_BLOCK => {
                 let header = BlockHeader::read(&mut r)?;
                 let coinbase = Transaction::read(&mut r)?;
-                let binding_signature = match r.take_u8()? {
-                    0 => None,
-                    1 => Some(BindingSignature::from_bytes(r.take_array()?)),
-                    _ => {
-                        return Err(Error::Protocol(protocol::Error::Malformed(
-                            "compact block binding signature flag",
-                        )))
-                    }
-                };
                 let count = take_count(&mut r, MAX_BLOCK_TRANSACTIONS, "txids")?;
                 let txids = (0..count)
                     .map(|_| Ok(TxId::from_bytes(r.take_array()?)))
@@ -411,7 +370,6 @@ impl Message {
                 Self::CompactBlock(Box::new(CompactBlock {
                     header,
                     coinbase,
-                    binding_signature,
                     txids,
                 }))
             }

@@ -30,8 +30,14 @@ async fn a_miner_started_at_runtime_mines_and_stops_cleanly() {
 
     let tip = node.tip();
     let genesis = *tip.borrow();
-    let running = miner::start(payout, Network::Test.params(), 2, node.events(), node.tip());
-    assert_eq!((running.payout, running.threads), (payout, 2));
+    let running = miner::start(
+        payout.clone(),
+        Network::Test.params(),
+        2,
+        node.events(),
+        node.tip(),
+    );
+    assert_eq!((&running.payout, running.threads), (&payout, 2));
     tokio::time::timeout(Duration::from_secs(300), async {
         while mined(&node).await.1 == 0 {
             tokio::time::sleep(Duration::from_millis(200)).await;

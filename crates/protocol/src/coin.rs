@@ -305,7 +305,8 @@ mod tests {
         let recipient = Address::derive(&fvk, Diversifier::random(&mut rng)).unwrap();
         let rho = Rho::from_base(pallas::Base::from(seed));
         let coin = Coin::new(
-            recipient,
+            *recipient.diversifier(),
+            *recipient.pk_d(),
             RawCoin::from_raw(1_000).unwrap(),
             rho,
             RandomSeed::random(&mut rng),
@@ -326,7 +327,8 @@ mod tests {
         let mut rng = ChaCha20Rng::seed_from_u64(99);
 
         let other_value = Coin::new(
-            f.coin.recipient,
+            f.coin.diversifier,
+            f.coin.pk_d,
             RawCoin::from_raw(1_001).unwrap(),
             f.coin.rho,
             f.coin.rseed.clone(),
@@ -334,7 +336,8 @@ mod tests {
         assert_ne!(base, other_value.commitment().unwrap(), "value");
 
         let other_rho = Coin::new(
-            f.coin.recipient,
+            f.coin.diversifier,
+            f.coin.pk_d,
             f.coin.value,
             Rho::from_base(pallas::Base::from(7u64)),
             f.coin.rseed.clone(),
@@ -342,7 +345,8 @@ mod tests {
         assert_ne!(base, other_rho.commitment().unwrap(), "rho");
 
         let other_seed = Coin::new(
-            f.coin.recipient,
+            f.coin.diversifier,
+            f.coin.pk_d,
             f.coin.value,
             f.coin.rho,
             RandomSeed::random(&mut rng),
@@ -350,7 +354,8 @@ mod tests {
         assert_ne!(base, other_seed.commitment().unwrap(), "rseed");
 
         let other_recipient = Coin::new(
-            fixture(3).coin.recipient,
+            fixture(3).coin.diversifier,
+            fixture(3).coin.pk_d,
             f.coin.value,
             f.coin.rho,
             f.coin.rseed.clone(),
@@ -394,7 +399,8 @@ mod tests {
         assert_ne!(seed.psi(&r1), seed.psi(&r2));
         let coin = |rho| {
             Coin::new(
-                fixture(9).coin.recipient,
+                fixture(9).coin.diversifier,
+                fixture(9).coin.pk_d,
                 RawCoin::ZERO,
                 rho,
                 RandomSeed::from_bytes([9; 32]),
@@ -440,7 +446,8 @@ mod tests {
     fn coin_encoding_roundtrips_and_preserves_the_commitment() {
         let f = fixture(13);
         let decoded = Coin::from_slice(&f.coin.to_vec()).unwrap();
-        assert_eq!(decoded.recipient(), f.coin.recipient());
+        assert_eq!(decoded.diversifier(), f.coin.diversifier());
+        assert_eq!(decoded.pk_d(), f.coin.pk_d());
         assert_eq!(decoded.value(), f.coin.value());
         assert_eq!(decoded.rho(), f.coin.rho());
         assert_eq!(decoded.cmx().unwrap(), f.coin.cmx().unwrap());

@@ -380,10 +380,9 @@ dependencies = [
  "rand_core 0.6.4",
  "randomx-bindings",
  "storage",
- "systemcall",
- "systemcall-proof",
  "tempfile",
  "thiserror",
+ "transaction-proof",
  "uint 0.10.2",
 ]
 
@@ -1341,10 +1340,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "program-vm"
-version = "0.1.0"
-
-[[package]]
 name = "proptest"
 version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1370,13 +1365,12 @@ version = "0.1.0"
 dependencies = [
  "crypto",
  "ff",
- "program-vm",
  "rand 0.8.8",
  "rand_chacha",
  "rand_core 0.6.4",
- "systemcall-circuit",
- "systemcall-proof",
  "thiserror",
+ "transaction-circuit",
+ "transaction-proof",
  "zeroize",
 ]
 
@@ -1594,11 +1588,10 @@ dependencies = [
  "socket2",
  "storage",
  "subtle",
- "systemcall",
- "systemcall-proof",
  "tempfile",
  "thiserror",
  "tokio",
+ "transaction-proof",
  "wallet",
  "zeroize",
 ]
@@ -1877,36 +1870,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "systemcall"
-version = "0.1.0"
-dependencies = [
- "crypto",
- "program-vm",
- "protocol",
- "rand 0.8.8",
- "rand_chacha",
- "rand_core 0.6.4",
- "serde_json",
- "systemcall-circuit",
- "systemcall-proof",
-]
-
-[[package]]
-name = "systemcall-circuit"
-version = "0.1.0"
-dependencies = [
- "circuit",
-]
-
-[[package]]
-name = "systemcall-proof"
-version = "0.1.0"
-dependencies = [
- "circuit",
- "systemcall-circuit",
-]
-
-[[package]]
 name = "tap"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2058,6 +2021,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "transaction-circuit"
+version = "0.1.0"
+dependencies = [
+ "circuit",
+]
+
+[[package]]
+name = "transaction-proof"
+version = "0.1.0"
+dependencies = [
+ "circuit",
+ "transaction-circuit",
+]
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2182,10 +2160,10 @@ dependencies = [
  "redb",
  "serde_json",
  "shardtree",
- "systemcall-circuit",
- "systemcall-proof",
  "tempfile",
  "thiserror",
+ "transaction-circuit",
+ "transaction-proof",
  "zeroize",
 ]
 

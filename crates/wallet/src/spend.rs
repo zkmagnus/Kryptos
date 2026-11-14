@@ -4,19 +4,14 @@ use protocol::address::RhombusAddress;
 use protocol::amount::RawCoin;
 use protocol::builder::{Builder, OutputInfo, SpendInfo};
 use protocol::consensus::action_class_for;
-use protocol::consensus::{BranchId, MAX_ACTIONS};
-use protocol::fee::FeeOpening;
+use protocol::consensus::BranchId;
 use protocol::transaction::Transaction;
 use rand_core::{CryptoRng, RngCore};
-use systemcall_proof::ProvingKey;
+use transaction_proof::ProvingKey;
 
 use crate::scan::OwnedCoin;
 use crate::wallet::Wallet;
 use crate::{Error, Result};
-
-/// Most recipients one transaction can pay: one action is kept for the
-/// change output.
-pub const MAX_RECIPIENTS: usize = MAX_ACTIONS - 1;
 
 /// Picks the fewest largest coins covering `amount` for a transaction with
 /// `outputs` outputs (recipients plus change).
@@ -56,84 +51,35 @@ fn action_class(spends: usize, outputs: usize) -> Result<usize> {
     Ok(action_class_for(spends.max(outputs).max(2))?)
 }
 
-/// The sum paid to every recipient.
-///
-/// # Errors
-/// Returns a protocol error if the sum overflows the money range.
-fn total(payments: &[Payment]) -> Result<RawCoin> {
-    Ok(payments
-        .iter()
-        .try_fold(RawCoin::ZERO, |acc, p| acc.checked_add(p.amount))?)
-}
-
-/// Transaction shape and input count for a payment, without proving it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Quote {
-    /// Coins the payment would spend.
-    pub spends: usize,
-    /// Actions in the transaction, after padding to a class.
-    pub actions: usize,
-}
-
-/// The coins `payments` would spend from `unspent`, skipping `excluded`
-/// positions and coins above `max_coin_height`. Change adds
-/// one output. [`build_payments`] and [`quote_payments`] both use this, so
-/// a quote matches the transaction built from the same coins.
-///
-/// # Errors
-/// [`Error::TooManyRecipients`] past the limit, and
-/// [`Error::InsufficientFunds`] when the free coins cannot cover it.
+/// Selects inputs for one payment, excluding locked or insufficiently
+/// confirmed coins.
 fn plan<'a>(
     unspent: &'a [OwnedCoin],
-    payments: &[Payment],
+    payment: &Payment,
     fee: RawCoin,
     excluded: &[u64],
     max_coin_height: u32,
 ) -> Result<Vec<&'a OwnedCoin>> {
-    if payments.is_empty() || payments.len() > MAX_RECIPIENTS {
-        return Err(Error::TooManyRecipients(MAX_RECIPIENTS));
-    }
     let refs: Vec<&OwnedCoin> = unspent
         .iter()
         .filter(|n| !excluded.contains(&n.position) && n.height <= max_coin_height)
         .collect();
-    let needed = total(payments)?.checked_add(fee)?;
-    select_coins(&refs, needed, payments.len().saturating_add(1))
-}
-
-/// The shape `payments` would have if built now from the
-/// wallet's unspent coins, with the same selection as [`build_payments`].
-/// Coins can arrive or be set aside before the payment is built, so this
-/// is exact for the wallet's current state only.
-///
-/// # Errors
-/// As [`build_payments`], except that it needs no spending key.
-pub fn quote_payments(
-    wallet: &Wallet,
-    payments: &[Payment],
-    excluded: &[u64],
-    max_coin_height: u32,
-) -> Result<Quote> {
-    let unspent = wallet.unspent()?;
-    let (chosen, _) = plan_with_default_fee(&unspent, payments, excluded, max_coin_height)?;
-    Ok(Quote {
-        spends: chosen.len(),
-        actions: action_class(chosen.len(), payments.len().saturating_add(1))?,
-    })
+    let needed = payment.amount.checked_add(fee)?;
+    select_coins(&refs, needed, 2)
 }
 
 /// Finds a stable coin selection and fee, accounting for fee bytes possibly
 /// requiring one more input and therefore a larger action class.
 fn plan_with_default_fee<'a>(
     unspent: &'a [OwnedCoin],
-    payments: &[Payment],
+    payment: &Payment,
     excluded: &[u64],
     max_coin_height: u32,
 ) -> Result<(Vec<&'a OwnedCoin>, RawCoin)> {
     let mut fee = RawCoin::ZERO;
     for _ in 0..=protocol::consensus::ACTION_CLASSES.len() {
-        let chosen = plan(unspent, payments, fee, excluded, max_coin_height)?;
-        let actions = action_class(chosen.len(), payments.len().saturating_add(1))?;
+        let chosen = plan(unspent, payment, fee, excluded, max_coin_height)?;
+        let actions = action_class(chosen.len(), 2)?;
         let required = Transaction::default_fee_for_actions(actions)?;
         if required == fee {
             return Ok((chosen, fee));
@@ -143,20 +89,6 @@ fn plan_with_default_fee<'a>(
     Err(Error::Protocol(protocol::Error::InvalidTransaction(
         "default fee selection did not converge",
     )))
-}
-
-#[cfg(test)]
-fn quote_from(
-    unspent: &[OwnedCoin],
-    payments: &[Payment],
-    excluded: &[u64],
-    max_coin_height: u32,
-) -> Result<Quote> {
-    let (chosen, _) = plan_with_default_fee(unspent, payments, excluded, max_coin_height)?;
-    Ok(Quote {
-        spends: chosen.len(),
-        actions: action_class(chosen.len(), payments.len().saturating_add(1))?,
-    })
 }
 
 /// What to pay, to whom
@@ -173,8 +105,6 @@ pub struct Payment {
 pub struct Built {
     /// The transaction, proved and signed.
     pub transaction: Transaction,
-    /// Fee opening to send as node-only relay metadata.
-    pub fee_opening: FeeOpening,
     /// Positions of the coins it spends, to set aside until it is mined.
     pub spent: Vec<u64>,
 }
@@ -192,37 +122,13 @@ pub fn build_payment(
     branch: BranchId,
     rng: &mut (impl RngCore + CryptoRng),
 ) -> Result<Transaction> {
-    Ok(build_payments(wallet, &[payment], pk, branch, &[], u32::MAX, rng)?.transaction)
+    Ok(build_payment_with_options(wallet, payment, pk, branch, &[], u32::MAX, rng)?.transaction)
 }
 
-/// Builds a payment with an explicit private fee amount.
-pub fn build_payment_with_fee(
+/// Builds one payment while respecting operation locks and confirmation age.
+pub fn build_payment_with_options(
     wallet: &Wallet,
     payment: Payment,
-    fee: RawCoin,
-    pk: &ProvingKey,
-    branch: BranchId,
-    rng: &mut (impl RngCore + CryptoRng),
-) -> Result<Transaction> {
-    Ok(
-        build_payments_with_fee(wallet, &[payment], fee, pk, branch, &[], u32::MAX, rng)?
-            .transaction,
-    )
-}
-
-/// Builds one transaction paying every recipient in `payments`, at most
-/// [`MAX_RECIPIENTS`], from the wallet's unspent coins other than those
-/// at `excluded` positions (coins set aside for pending operations) and
-/// those received above `max_coin_height` (too few confirmations).
-/// Change goes to the wallet's default address. The default fee is one raw
-/// unit per encoded transaction byte.
-///
-/// # Errors
-/// Returns [`Error::TooManyRecipients`] past the limit and
-/// [`Error::InsufficientFunds`] when the free coins cannot cover it.
-pub fn build_payments(
-    wallet: &Wallet,
-    payments: &[Payment],
     pk: &ProvingKey,
     branch: BranchId,
     excluded: &[u64],
@@ -230,25 +136,8 @@ pub fn build_payments(
     rng: &mut (impl RngCore + CryptoRng),
 ) -> Result<Built> {
     let unspent = spendable_coins(wallet)?;
-    let (chosen, fee) = plan_with_default_fee(&unspent, payments, excluded, max_coin_height)?;
-    build_selected(wallet, payments, fee, &chosen, pk, branch, rng)
-}
-
-/// Builds a batched payment and returns change after subtracting the private
-/// fee amount. The fee opening is returned in relay metadata.
-pub fn build_payments_with_fee(
-    wallet: &Wallet,
-    payments: &[Payment],
-    fee: RawCoin,
-    pk: &ProvingKey,
-    branch: BranchId,
-    excluded: &[u64],
-    max_coin_height: u32,
-    rng: &mut (impl RngCore + CryptoRng),
-) -> Result<Built> {
-    let unspent = spendable_coins(wallet)?;
-    let chosen = plan(&unspent, payments, fee, excluded, max_coin_height)?;
-    build_selected(wallet, payments, fee, &chosen, pk, branch, rng)
+    let (chosen, fee) = plan_with_default_fee(&unspent, &payment, excluded, max_coin_height)?;
+    build_selected(wallet, payment, fee, &chosen, pk, branch, rng)
 }
 
 fn spendable_coins(wallet: &Wallet) -> Result<Vec<OwnedCoin>> {
@@ -257,7 +146,7 @@ fn spendable_coins(wallet: &Wallet) -> Result<Vec<OwnedCoin>> {
 
 fn build_selected(
     wallet: &Wallet,
-    payments: &[Payment],
+    payment: Payment,
     fee: RawCoin,
     chosen: &[&OwnedCoin],
     pk: &ProvingKey,
@@ -266,7 +155,7 @@ fn build_selected(
 ) -> Result<Built> {
     let keys = wallet.keys();
     let sk = keys.spending_key();
-    let amount = total(payments)?;
+    let amount = payment.amount;
     let positions: Vec<u64> = chosen.iter().map(|n| n.position).collect();
     let (paths, anchor) = wallet.witnesses(&positions)?;
     let mut builder = Builder::new(anchor);
@@ -276,13 +165,11 @@ fn build_selected(
         total = total.saturating_add(owned.coin.value().raw());
     }
     let ovk = Some(keys.outgoing_viewing_key().clone());
-    for payment in payments {
-        builder.add_output(OutputInfo::new(
-            payment.recipient.clone(),
-            payment.amount,
-            ovk.clone(),
-        ))?;
-    }
+    builder.add_output(OutputInfo::new(
+        payment.recipient,
+        payment.amount,
+        ovk.clone(),
+    ))?;
     let change = total
         .checked_sub(amount.raw())
         .and_then(|value| value.checked_sub(fee.raw()))
@@ -294,10 +181,9 @@ fn build_selected(
             ovk,
         ))?;
     }
-    let (transaction, fee_opening) = builder.build_with_fee_opening(fee, pk, branch, rng)?;
+    let transaction = builder.build_with_fee(fee, pk, branch, rng)?;
     Ok(Built {
         transaction,
-        fee_opening,
         spent: positions,
     })
 }
@@ -317,7 +203,8 @@ mod tests {
 
     fn owned(rng: &mut ChaCha20Rng, keys: &WalletKeys, value: u64, position: u32) -> OwnedCoin {
         let coin = Coin::new(
-            keys.default_address().unwrap(),
+            *keys.default_address().unwrap().diversifier(),
+            *keys.default_address().unwrap().pk_d(),
             RawCoin::from_raw(value).unwrap(),
             Rho::random(rng),
             RandomSeed::random(rng),
@@ -368,47 +255,30 @@ mod tests {
     }
 
     #[test]
-    fn quotes_follow_the_coins_selection_would_spend() {
+    fn single_payment_selection_uses_fewest_largest_coins() {
         let mut rng = ChaCha20Rng::seed_from_u64(2);
         let keys = WalletKeys::from_spending_key(SpendingKey::random(&mut rng)).unwrap();
         let coins: Vec<OwnedCoin> = (0..6)
             .map(|i| owned(&mut rng, &keys, 1_000_000, i))
             .collect();
 
-        let one = quote_from(&coins, &[pay(&keys, 500_000)], &[], u32::MAX).unwrap();
-        assert_eq!((one.spends, one.actions), (1, 2));
-
-        // Five small coins outgrow the two-action class the recipient
-        // count alone suggests, but add no monetary fee.
-        let many = quote_from(&coins, &[pay(&keys, 4_500_000)], &[], u32::MAX).unwrap();
-        assert_eq!((many.spends, many.actions), (5, 8));
+        let one = plan(&coins, &pay(&keys, 500_000), RawCoin::ZERO, &[], u32::MAX).unwrap();
+        assert_eq!(one.len(), 1);
     }
 
     #[test]
-    fn quotes_skip_excluded_and_unconfirmed_coins() {
+    fn selection_skips_excluded_and_unconfirmed_coins() {
         let mut rng = ChaCha20Rng::seed_from_u64(3);
         let keys = WalletKeys::from_spending_key(SpendingKey::random(&mut rng)).unwrap();
         let mut coins: Vec<OwnedCoin> = (0..2)
             .map(|i| owned(&mut rng, &keys, 1_000_000, i))
             .collect();
         coins[1].height = 10;
-        let payment = [pay(&keys, 1_500_000)];
-        assert!(quote_from(&coins, &payment, &[], u32::MAX).is_ok());
+        let payment = pay(&keys, 1_500_000);
+        assert!(plan(&coins, &payment, RawCoin::ZERO, &[], u32::MAX).is_ok());
         for (excluded, max_height) in [(&[0][..], u32::MAX), (&[][..], 9)] {
-            let err = quote_from(&coins, &payment, excluded, max_height).unwrap_err();
+            let err = plan(&coins, &payment, RawCoin::ZERO, excluded, max_height).unwrap_err();
             assert!(matches!(err, Error::InsufficientFunds { .. }));
-        }
-    }
-
-    #[test]
-    fn quotes_reject_empty_and_oversized_recipient_lists() {
-        let mut rng = ChaCha20Rng::seed_from_u64(4);
-        let keys = WalletKeys::from_spending_key(SpendingKey::random(&mut rng)).unwrap();
-        let coins = [owned(&mut rng, &keys, 1_000_000, 0)];
-        let too_many = vec![pay(&keys, 1); MAX_RECIPIENTS + 1];
-        for payments in [&[][..], &too_many[..]] {
-            let err = quote_from(&coins, payments, &[], u32::MAX).unwrap_err();
-            assert!(matches!(err, Error::TooManyRecipients(_)));
         }
     }
 }

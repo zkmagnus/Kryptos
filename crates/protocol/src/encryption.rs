@@ -119,15 +119,27 @@ pub fn encrypt_coin(
     cv: &ValueCommitment,
     rng: &mut (impl RngCore + CryptoRng),
 ) -> Result<EncryptedCoin> {
-    let cmx = coin.cmx()?.to_bytes();
     let (kem_ciphertext, shared_secret) = ek.encapsulate(rng)?;
+    encrypt_coin_with_kem(coin, ek, kem_ciphertext, &shared_secret, ovk, cv, rng)
+}
+
+fn encrypt_coin_with_kem(
+    coin: &Coin,
+    ek: &TransmissionKey,
+    kem_ciphertext: KemCiphertext,
+    shared_secret: &KemSharedSecret,
+    ovk: Option<&OutgoingViewingKey>,
+    cv: &ValueCommitment,
+    rng: &mut (impl RngCore + CryptoRng),
+) -> Result<EncryptedCoin> {
+    let cmx = coin.cmx()?.to_bytes();
     let key = shared_secret.coin_key(&kem_ciphertext, &cmx);
     let enc_ciphertext = fixed(key.encrypt(&CoinPlaintext::from_coin(coin).encode()))?;
 
     let (ock, out_plaintext) = match ovk {
         Some(ovk) => (
             SymmetricKey::outgoing_kem(ovk, &cv.to_bytes(), &cmx, &kem_ciphertext),
-            out_plaintext(coin.pk_d(), ek, &shared_secret),
+            out_plaintext(coin.pk_d(), ek, shared_secret),
         ),
         None => (SymmetricKey::random(rng), random_out_plaintext(rng)),
     };
@@ -384,6 +396,7 @@ mod tests {
     use crate::address::RhombusAddress as Address;
     use crate::amount::RawCoin;
     use crypto::commitment::ValueCommitTrapdoor;
+    use crypto::encryption::ReceiverKey;
     use crypto::keys::{FullViewingKey, SpendingKey};
     use crypto::pallas;
     use rand::SeedableRng;
@@ -393,6 +406,7 @@ mod tests {
 
     struct Party {
         ivk: IncomingViewingKey,
+        receiver_key: ReceiverKey,
         ovk: OutgoingViewingKey,
         address: Address,
     }
@@ -400,9 +414,11 @@ mod tests {
     fn party(rng: &mut ChaCha20Rng) -> Party {
         let fvk = FullViewingKey::derive(&SpendingKey::random(rng)).unwrap();
         let ivk = fvk.incoming_viewing_key().unwrap();
-        let address = Address::derive(&ivk, Diversifier::random(rng)).unwrap();
+        let (receiver_key, _) = fvk.receiver_key();
+        let address = Address::derive(&fvk, Diversifier::random(rng)).unwrap();
         Party {
             ivk,
+            receiver_key,
             ovk: fvk.outgoing_viewing_key(),
             address,
         }
@@ -410,6 +426,7 @@ mod tests {
 
     struct Scenario {
         rng: ChaCha20Rng,
+        shared_secret: KemSharedSecret,
         sender: Party,
         receiver: Party,
         coin: Coin,
@@ -424,7 +441,8 @@ mod tests {
         let receiver = party(&mut rng);
         let rho = Rho::from_base(pallas::Base::from(seed));
         let coin = Coin::new(
-            receiver.address,
+            *receiver.address.diversifier(),
+            *receiver.address.pk_d(),
             RawCoin::from_raw(4_200).unwrap(),
             rho,
             RandomSeed::random(&mut rng),
@@ -432,9 +450,21 @@ mod tests {
         let cv = ValueCommitment::commit(-4_200, &ValueCommitTrapdoor::random(&mut rng));
         let cmx = coin.cmx().unwrap();
         let ovk = with_ovk.then_some(&sender.ovk);
-        let encrypted = encrypt_coin(&coin, ovk, &cv, &mut rng).unwrap();
+        let (kem_ciphertext, shared_secret) =
+            receiver.address.kem_key().encapsulate(&mut rng).unwrap();
+        let encrypted = encrypt_coin_with_kem(
+            &coin,
+            receiver.address.kem_key(),
+            kem_ciphertext,
+            &shared_secret,
+            ovk,
+            &cv,
+            &mut rng,
+        )
+        .unwrap();
         Scenario {
             rng,
+            shared_secret,
             sender,
             receiver,
             coin,
@@ -445,7 +475,8 @@ mod tests {
     }
 
     fn assert_same_coin(a: &Coin, b: &Coin) {
-        assert_eq!(a.recipient(), b.recipient());
+        assert_eq!(a.diversifier(), b.diversifier());
+        assert_eq!(a.pk_d(), b.pk_d());
         assert_eq!(a.value(), b.value());
         assert_eq!(a.rho(), b.rho());
         assert_eq!(a.rseed().as_bytes(), b.rseed().as_bytes());
@@ -463,17 +494,22 @@ mod tests {
     #[test]
     fn receiver_decrypts_with_ivk() {
         let s = scenario(1, true);
-        let (coin) =
-            decrypt_coin_with_ivk(&s.receiver.ivk, &s.encrypted, *s.coin.rho(), &s.cmx).unwrap();
+        let coin = decrypt_coin_with_ivk(
+            &s.receiver.ivk,
+            &s.receiver.receiver_key,
+            &s.encrypted,
+            *s.coin.rho(),
+            &s.cmx,
+        )
+        .unwrap();
         assert_same_coin(&coin, &s.coin);
     }
 
     #[test]
     fn sender_decrypts_with_ovk() {
         let s = scenario(2, true);
-        let (coin) =
-            decrypt_coin_with_ovk(&s.sender.ovk, &s.encrypted, &s.cv, *s.coin.rho(), &s.cmx)
-                .unwrap();
+        let coin = decrypt_coin_with_ovk(&s.sender.ovk, &s.encrypted, &s.cv, *s.coin.rho(), &s.cmx)
+            .unwrap();
         assert_same_coin(&coin, &s.coin);
     }
 
@@ -481,7 +517,16 @@ mod tests {
     fn wrong_keys_fail_to_decrypt() {
         let mut s = scenario(3, true);
         let stranger = party(&mut s.rng);
-        let ivk_result = decrypt_coin_with_ivk(&stranger.ivk, &s.encrypted, *s.coin.rho(), &s.cmx);
+        let (stranger_receiver, _) = FullViewingKey::derive(&SpendingKey::random(&mut s.rng))
+            .unwrap()
+            .receiver_key();
+        let ivk_result = decrypt_coin_with_ivk(
+            &stranger.ivk,
+            &stranger_receiver,
+            &s.encrypted,
+            *s.coin.rho(),
+            &s.cmx,
+        );
         assert_eq!(
             ivk_result.unwrap_err(),
             Error::Crypto(crypto::Error::DecryptionFailed)
@@ -502,30 +547,50 @@ mod tests {
                 .is_err()
         );
         // The receiver is unaffected.
-        assert!(
-            decrypt_coin_with_ivk(&s.receiver.ivk, &s.encrypted, *s.coin.rho(), &s.cmx).is_ok()
-        );
+        assert!(decrypt_coin_with_ivk(
+            &s.receiver.ivk,
+            &s.receiver.receiver_key,
+            &s.encrypted,
+            *s.coin.rho(),
+            &s.cmx
+        )
+        .is_ok());
     }
 
     #[test]
     fn tampered_ciphertext_is_rejected() {
         let s = scenario(5, true);
         let mut enc = *s.encrypted.enc_ciphertext();
-        enc[100] ^= 1;
-        let tampered =
-            EncryptedCoin::from_parts(*s.encrypted.epk(), enc, *s.encrypted.out_ciphertext());
-        assert!(decrypt_coin_with_ivk(&s.receiver.ivk, &tampered, *s.coin.rho(), &s.cmx).is_err());
+        enc[10] ^= 1;
+        let tampered = EncryptedCoin::from_parts(
+            s.encrypted.kem_ciphertext().clone(),
+            enc,
+            *s.encrypted.out_ciphertext(),
+        );
+        assert!(decrypt_coin_with_ivk(
+            &s.receiver.ivk,
+            &s.receiver.receiver_key,
+            &tampered,
+            *s.coin.rho(),
+            &s.cmx
+        )
+        .is_err());
     }
 
     #[test]
     fn mismatched_commitment_is_rejected() {
         let s = scenario(6, true);
         let wrong_cmx = ExtractedCoinCommitment::from_bytes(&[1; 32]).unwrap();
-        let result =
-            decrypt_coin_with_ivk(&s.receiver.ivk, &s.encrypted, *s.coin.rho(), &wrong_cmx);
+        let result = decrypt_coin_with_ivk(
+            &s.receiver.ivk,
+            &s.receiver.receiver_key,
+            &s.encrypted,
+            *s.coin.rho(),
+            &wrong_cmx,
+        );
         assert_eq!(
             result.unwrap_err(),
-            Error::CoinDecryption("commitment mismatch")
+            Error::Crypto(crypto::Error::DecryptionFailed)
         );
     }
 
@@ -534,7 +599,14 @@ mod tests {
         // A different rho changes the commitment, so the cmx check catches it.
         let s = scenario(7, true);
         let other_rho = Rho::from_base(pallas::Base::from(999u64));
-        assert!(decrypt_coin_with_ivk(&s.receiver.ivk, &s.encrypted, other_rho, &s.cmx).is_err());
+        assert!(decrypt_coin_with_ivk(
+            &s.receiver.ivk,
+            &s.receiver.receiver_key,
+            &s.encrypted,
+            other_rho,
+            &s.cmx
+        )
+        .is_err());
     }
 
     #[test]
@@ -571,11 +643,15 @@ mod tests {
     #[test]
     fn out_plaintext_roundtrips() {
         let s = scenario(10, true);
-        let esk = s.coin.esk();
-        let bytes = out_plaintext(s.coin.recipient().pk_d(), &esk);
-        let (pk_d, parsed) = parse_out_plaintext(&bytes).unwrap();
-        assert_eq!(&pk_d, s.coin.recipient().pk_d());
-        assert_eq!(parsed.to_bytes(), esk.to_bytes());
+        let bytes = out_plaintext(
+            s.coin.pk_d(),
+            s.receiver.address.kem_key(),
+            &s.shared_secret,
+        );
+        let (pk_d, ek, shared) = parse_out_plaintext(&bytes).unwrap();
+        assert_eq!(&pk_d, s.coin.pk_d());
+        assert_eq!(ek, *s.receiver.address.kem_key());
+        assert_eq!(shared.as_bytes(), s.shared_secret.as_bytes());
     }
 
     #[test]

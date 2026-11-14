@@ -1,9 +1,9 @@
 //! The transaction: a fixed-shape bundle of actions, a proof
-//! envelope and one binding signature. The wire selector is the transfer
-//! opcode; the action proof remains tagged with `RHV2`.
+//! envelope and one binding signature. Transfers are native chain
+//! transactions; the action proof remains tagged with `RHV2`.
 //!
 //! ```text
-//! effecting data = version || opcode || entrypoint || anchor || n_actions ||
+//! effecting data = version || kind || anchor || fee || n_actions ||
 //!                  action bodies
 //! txid           = BLAKE2b-256_{TXID}(effecting data)
 //! sighash        = BLAKE2b-256_{SIGHASH}(effecting data || branch id)
@@ -15,30 +15,25 @@
 //! [`BranchId`] of the consensus rules the transaction is meant for, so
 //! it is not replayable across a fork or between networks; the branch is
 //! not encoded, validation supplies it. There is no locktime, expiry,
-//! or an action-proof length. Fee openings are carried by transaction relay
-//! metadata and are absent from this encoding.
+//! or an action-proof length.
 
 use crypto::commitment::ValueCommitment;
 use crypto::encoding::{base_from_bytes, base_to_bytes, Encoded};
 use crypto::hash::{blake2b_short, SHORT_OUTPUT_LEN, SIGHASH, TXID};
 use crypto::pallas;
-use systemcall_circuit::PublicInputs;
+use transaction_circuit::PublicInputs;
 
 use crate::consensus::BranchId;
 use crypto::signature::BindingSignature;
 
 use crate::action::{Action, ActionBody, ACTION_BODY_LEN};
 use crate::bytes::{Encodable, Reader, Writer};
-use crate::consensus::{
-    proof_len, COINBASE_ENTRYPOINT, TRANSFER_ENTRYPOINT, TRANSFER_OPCODE, TX_VERSION,
-};
+use crate::consensus::{proof_len, COINBASE_KIND, TRANSFER_KIND, TX_VERSION};
 use crate::nullifier::Nullifier;
 use crate::Result;
 
-/// Fee rate used by wallet convenience methods: one raw unit per encoded byte.
-pub const DEFAULT_FEE_RATE: u64 = 1;
 /// Fixed transaction header length, excluding actions, proof, and signature.
-const TRANSACTION_HEADER_LEN: usize = 37;
+const TRANSACTION_HEADER_LEN: usize = 1 + 1 + 32 + 8 + 1;
 
 /// The root of the coin commitment tree a transaction spends against.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,8 +65,8 @@ impl Encodable for Anchor {
     }
 }
 
-use systemcall_proof::PrivateTransactionProofV2;
-pub use systemcall_proof::Proof;
+use transaction_proof::PrivateTransactionProofV2;
+pub use transaction_proof::Proof;
 
 /// A transaction identifier.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -105,11 +100,9 @@ impl core::fmt::Display for TxId {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Transaction {
     version: u8,
-    opcode: u8,
-    entrypoint: u16,
+    kind: u8,
     anchor: Anchor,
     fee: crate::amount::RawCoin,
-    fee_opening: Option<crate::fee::FeeOpening>,
     actions: Vec<Action>,
     proof: Proof,
     binding_signature: BindingSignature,
@@ -135,14 +128,31 @@ impl Transaction {
             .ok_or(crate::Error::Malformed("transaction size overflow"))
     }
 
-    /// Default wallet fee for this action class: one raw unit per encoded byte.
+    /// Fee rate applied to the exact encoding size for this action class.
+    /// Kept as a convenience for builders that know the final action class.
     pub fn default_fee_for_actions(actions: usize) -> Result<crate::amount::RawCoin> {
-        let bytes = u64::try_from(Self::encoded_len_for_actions(actions)?)
-            .map_err(|_| crate::Error::RawCoinOutOfRange)?;
-        let raw = bytes
-            .checked_mul(DEFAULT_FEE_RATE)
-            .ok_or(crate::Error::RawCoinOutOfRange)?;
-        crate::amount::RawCoin::from_raw(raw)
+        crate::fee::fee_for_len(Self::encoded_len_for_actions(actions)?)
+    }
+
+    /// Exact size of this transaction's canonical encoding.
+    pub fn encoded_len(&self) -> usize {
+        self.to_vec().len()
+    }
+
+    /// Checks that a transfer pays its encoded size and a coinbase pays zero.
+    pub fn check_fee(&self) -> Result<()> {
+        let required = if self.kind == COINBASE_KIND {
+            crate::amount::RawCoin::ZERO
+        } else {
+            crate::fee::fee_for_len(self.encoded_len())?
+        };
+        if self.fee == required {
+            Ok(())
+        } else {
+            Err(crate::Error::InvalidTransaction(
+                "fee does not match transaction size",
+            ))
+        }
     }
 
     /// Assembles a transaction using the current V2 proof envelope.
@@ -153,13 +163,13 @@ impl Transaction {
         proof: PrivateTransactionProofV2,
         binding_signature: BindingSignature,
     ) -> Result<Self> {
-        Self::new_with_entrypoint(
+        Self::new_with_kind(
             anchor,
             fee,
             actions,
             proof,
             binding_signature,
-            TRANSFER_ENTRYPOINT,
+            TRANSFER_KIND,
         )
     }
 
@@ -170,32 +180,30 @@ impl Transaction {
         proof: PrivateTransactionProofV2,
         binding_signature: BindingSignature,
     ) -> Result<Self> {
-        Self::new_with_entrypoint(
+        Self::new_with_kind(
             anchor,
             crate::amount::RawCoin::ZERO,
             actions,
             proof,
             binding_signature,
-            COINBASE_ENTRYPOINT,
+            COINBASE_KIND,
         )
     }
 
-    fn new_with_entrypoint(
+    fn new_with_kind(
         anchor: Anchor,
         fee: crate::amount::RawCoin,
         actions: Vec<Action>,
         proof: PrivateTransactionProofV2,
         binding_signature: BindingSignature,
-        entrypoint: u16,
+        kind: u8,
     ) -> Result<Self> {
         let action_proof = proof.proof()?;
         Ok(Self {
             version: TX_VERSION,
-            opcode: TRANSFER_OPCODE,
-            entrypoint,
+            kind,
             anchor,
             fee,
-            fee_opening: None,
             actions,
             proof: action_proof,
             binding_signature,
@@ -207,19 +215,14 @@ impl Transaction {
         self.version
     }
 
-    /// Program entrypoint selector.
-    pub fn entrypoint(&self) -> u16 {
-        self.entrypoint
+    /// Native chain transaction kind.
+    pub fn kind(&self) -> u8 {
+        self.kind
     }
 
-    /// The SystemCall opcode carried by this transaction.
-    pub fn opcode(&self) -> u8 {
-        self.opcode
-    }
-
-    /// The complete version-2 proof envelope.
+    /// The complete V2 private-proof envelope.
     pub fn private_proof_v2(&self) -> Option<PrivateTransactionProofV2> {
-        (self.opcode == TRANSFER_OPCODE)
+        (self.kind == TRANSFER_KIND || self.kind == COINBASE_KIND)
             .then(|| PrivateTransactionProofV2::new(&self.proof).ok())
             .flatten()
     }
@@ -229,24 +232,9 @@ impl Transaction {
         &self.anchor
     }
 
-    /// The fee amount attached from relay metadata. It is zero for a
-    /// transaction decoded from a block, which contains no fee opening.
+    /// The declared public fee.
     pub fn fee(&self) -> crate::amount::RawCoin {
         self.fee
-    }
-
-    /// The node-only fee opening attached by the builder or relay decoder.
-    pub fn fee_opening(&self) -> Option<&crate::fee::FeeOpening> {
-        self.fee_opening.as_ref()
-    }
-
-    /// Attaches and verifies relay fee metadata in memory. The amount is not
-    /// serialized or included in the transaction identifier.
-    pub fn with_fee_opening(mut self, opening: &crate::fee::FeeOpening) -> Result<Self> {
-        opening.verify(self.value_commitments())?;
-        self.fee = opening.fee();
-        self.fee_opening = Some(opening.clone());
-        Ok(self)
     }
 
     /// The actions.
@@ -282,9 +270,9 @@ impl Transaction {
     ///
     /// # Errors
     /// Fails if an action carries a non-canonical point.
-    pub fn public_inputs(&self) -> Result<Vec<PublicInputs>> {
+    pub fn public_inputs(&self, coinbase: bool) -> Result<Vec<PublicInputs>> {
         let total = ValueCommitment::sum(self.value_commitments());
-        let net_sign = if self.entrypoint == COINBASE_ENTRYPOINT {
+        let net_sign = if coinbase {
             -pallas::Base::one()
         } else {
             pallas::Base::one()
@@ -316,13 +304,7 @@ impl Transaction {
 
     fn effecting_bytes(&self) -> Vec<u8> {
         let bodies: Vec<&ActionBody> = self.actions.iter().map(Action::body).collect();
-        effecting_bytes(
-            self.version,
-            self.opcode,
-            self.entrypoint,
-            &self.anchor,
-            &bodies,
-        )
+        effecting_bytes(self.version, self.kind, &self.anchor, self.fee, &bodies)
     }
 }
 
@@ -331,13 +313,13 @@ impl Transaction {
 /// the sighash before any signature exists.
 fn effecting_bytes(
     version: u8,
-    opcode: u8,
-    entrypoint: u16,
+    kind: u8,
     anchor: &Anchor,
+    fee: crate::amount::RawCoin,
     bodies: &[&ActionBody],
 ) -> Vec<u8> {
     let mut w = Writer::default();
-    write_header(&mut w, version, opcode, entrypoint, anchor, bodies.len());
+    write_header(&mut w, version, kind, anchor, fee, bodies.len());
     for body in bodies {
         body.write(&mut w);
     }
@@ -348,13 +330,14 @@ fn effecting_bytes(
 pub fn sighash_of(
     anchor: &Anchor,
     bodies: &[&ActionBody],
-    entrypoint: u16,
+    kind: u8,
+    fee: crate::amount::RawCoin,
     branch: BranchId,
 ) -> [u8; SHORT_OUTPUT_LEN] {
     blake2b_short(
         SIGHASH,
         &[
-            &effecting_bytes(TX_VERSION, TRANSFER_OPCODE, entrypoint, anchor, bodies),
+            &effecting_bytes(TX_VERSION, kind, anchor, fee, bodies),
             &branch.to_bytes(),
         ],
     )
@@ -363,18 +346,17 @@ pub fn sighash_of(
 fn write_header(
     w: &mut Writer,
     version: u8,
-    opcode: u8,
-    entrypoint: u16,
+    kind: u8,
     anchor: &Anchor,
+    fee: crate::amount::RawCoin,
     actions: usize,
 ) {
     // Bounded by MAX_ACTIONS in valid transactions; the clamp keeps the
     // encoding total for anything else, and validation rejects it.
     let count = u8::try_from(actions).unwrap_or(u8::MAX);
-    w.put_u8(version)
-        .put_u8(opcode)
-        .put(&entrypoint.to_le_bytes());
+    w.put_u8(version).put_u8(kind);
     anchor.write(w);
+    w.put(&fee.to_le_bytes());
     w.put_u8(count);
 }
 
@@ -383,9 +365,9 @@ impl Encodable for Transaction {
         write_header(
             w,
             self.version,
-            self.opcode,
-            self.entrypoint,
+            self.kind,
             &self.anchor,
+            self.fee,
             self.actions.len(),
         );
         for action in &self.actions {
@@ -402,18 +384,13 @@ impl Encodable for Transaction {
 
     fn read(r: &mut Reader<'_>) -> Result<Self> {
         let version = r.take_u8()?;
-        let opcode = r.take_u8()?;
-        let entrypoint = u16::from_le_bytes(r.take_array()?);
-        if version != TX_VERSION
-            || opcode != TRANSFER_OPCODE
-            || (entrypoint != TRANSFER_ENTRYPOINT && entrypoint != COINBASE_ENTRYPOINT)
-        {
-            return Err(crate::Error::Malformed("unsupported SystemCall opcode"));
+        let kind = r.take_u8()?;
+        if version != TX_VERSION || (kind != TRANSFER_KIND && kind != COINBASE_KIND) {
+            return Err(crate::Error::Malformed("unknown transaction kind"));
         }
         let anchor = Anchor::read(r)?;
+        let fee = crate::amount::RawCoin::from_raw(r.take_u64_le()?)?;
         let count = usize::from(r.take_u8()?);
-        // A block or standalone transaction contains no fee opening.
-        let fee = crate::amount::RawCoin::ZERO;
         let bodies = (0..count)
             .map(|_| ActionBody::read(r))
             .collect::<Result<Vec<_>>>()?;
@@ -437,11 +414,9 @@ impl Encodable for Transaction {
         let binding_signature = BindingSignature::from_bytes(r.take_array()?);
         Ok(Self {
             version,
-            opcode,
-            entrypoint,
+            kind,
             anchor,
             fee,
-            fee_opening: None,
             actions,
             proof,
             binding_signature,
@@ -474,7 +449,8 @@ pub(crate) mod tests {
         let actions = (0..count).map(|_| sample_action(&mut rng, b"x")).collect();
         Transaction::new(
             sample_anchor(),
-            crate::amount::RawCoin::ZERO,
+            crate::fee::fee_for_len(Transaction::encoded_len_for_actions(count).unwrap_or(0))
+                .unwrap(),
             actions,
             PrivateTransactionProofV2::new(&dummy_proof(count)).unwrap(),
             BindingSignature::from_bytes([9; 64]),
@@ -488,8 +464,9 @@ pub(crate) mod tests {
         let bytes = tx.to_vec();
         assert_eq!(
             bytes.len(),
-            1 + 1 + 2 + 32 + 1 + 2 * ACTION_BODY_LEN + 2 * 64 + 4 + proof_len(2).unwrap() + 64
+            1 + 1 + 32 + 8 + 1 + 2 * ACTION_BODY_LEN + 2 * 64 + 4 + proof_len(2).unwrap() + 64
         );
+        assert_eq!(tx.encoded_len(), bytes.len());
         assert_eq!(Transaction::from_slice(&bytes), Ok(tx));
     }
 
@@ -502,6 +479,15 @@ pub(crate) mod tests {
                 Transaction::encoded_len_for_actions(actions).unwrap()
             );
         }
+    }
+
+    #[test]
+    fn check_fee_rejects_fee_mismatch() {
+        let tx = sample_transaction(30, 2);
+        assert!(tx.check_fee().is_ok());
+        let mut altered = tx.clone();
+        altered.fee = crate::amount::RawCoin::ZERO;
+        assert!(altered.check_fee().is_err());
     }
 
     #[test]
@@ -531,7 +517,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn parser_rejects_unknown_opcode() {
+    fn parser_rejects_unknown_native_kind() {
         let mut bytes = sample_transaction(11, 2).to_vec();
         bytes[1] = 0xff;
         assert!(Transaction::from_slice(&bytes).is_err());
@@ -553,7 +539,28 @@ pub(crate) mod tests {
         );
         let bodies: Vec<&ActionBody> = tx.actions().iter().map(Action::body).collect();
         assert_eq!(
-            sighash_of(tx.anchor(), &bodies, TRANSFER_ENTRYPOINT, BranchId::new(1),),
+            sighash_of(
+                tx.anchor(),
+                &bodies,
+                crate::consensus::TRANSFER_KIND,
+                tx.fee(),
+                BranchId::new(1)
+            ),
+            tx.sighash(BranchId::new(1))
+        );
+    }
+
+    #[test]
+    fn changing_fee_changes_txid_and_sighash() {
+        let tx = sample_transaction(44, 2);
+        let bytes = tx.to_vec();
+        let mut changed = bytes;
+        // Header: version, native kind, anchor, then 8 byte LE fee.
+        changed[34] ^= 1;
+        let changed = Transaction::from_slice(&changed).unwrap();
+        assert_ne!(changed.txid(), tx.txid());
+        assert_ne!(
+            changed.sighash(BranchId::new(1)),
             tx.sighash(BranchId::new(1))
         );
     }
@@ -581,7 +588,7 @@ pub(crate) mod tests {
     #[test]
     fn public_inputs_follow_actions() {
         let tx = sample_transaction(10, 2);
-        let public = tx.public_inputs().unwrap();
+        let public = tx.public_inputs(false).unwrap();
         assert_eq!(public.len(), 2);
         assert_eq!(public[0].anchor, *tx.anchor().inner());
         assert_eq!(

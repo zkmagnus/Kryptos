@@ -35,5 +35,5 @@ pub enum Error {
     Crypto(#[from] crypto::Error),
     /// A proving or verifying error from the circuit layer.
     #[error(transparent)]
-    Circuit(#[from] systemcall_proof::Error),
+    Circuit(#[from] transaction_proof::Error),
 }

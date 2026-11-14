@@ -12,13 +12,13 @@ mod common;
 use std::time::{Duration, Instant};
 
 use crypto::keys::SpendingKey;
-use protocol::coin::Rhombus as RawCoin;
+use protocol::amount::RawCoin;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 use runtime::config::{Config, Network};
 use runtime::node::{spawn, Handle, Request, Response};
-use systemcall_proof::ProvingKey;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use transaction_proof::ProvingKey;
 use wallet::keys::WalletKeys;
 use wallet::spend::{build_payment, Payment};
 use wallet::wallet::Wallet;
@@ -88,7 +88,7 @@ async fn follower_syncs_from_miner_and_relays_a_payment() {
 
     // The follower catches up with the miner.
     // The first reward is spendable once block 1 is in the tree.
-    let spendable = common::first_spendable_height();
+    let spendable = common::first_spendable_height().max(2);
     wait_for(Duration::from_secs(240), async || {
         height(&follower).await >= spendable
     })
@@ -121,7 +121,7 @@ async fn follower_syncs_from_miner_and_relays_a_payment() {
     };
     // The test network schedules no upgrades, so the genesis branch is in
     // force at every height.
-    let branch = Network::Test.params().genesis_branch;
+    let branch = Network::Test.params().branch_at(height(&miner).await + 1);
     let tx = build_payment(&wallet, payment, &pk, branch, &mut rng).unwrap();
     let nullifier = *tx.actions()[0].body().nullifier();
     let Response::Submitted(_) = follower

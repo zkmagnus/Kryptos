@@ -1,5 +1,5 @@
 //! The wallet daemon against a live mining node: sync, addresses with
-//! labels, balances, a multi-recipient send carried from queued to
+//! labels, balances, a single-recipient send carried from queued to
 //! confirmed, transaction views, and operations.
 #![allow(
     clippy::unwrap_used,
@@ -107,6 +107,7 @@ async fn the_wallet_daemon_serves_an_exchange() {
     let addr = daemon.addr;
     let t = token.expose();
     let prefix = Network::Test.address_prefix();
+    let payment_amount = 15_575u64;
 
     // It syncs and sees the coinbase coins from blocks 1 to 3.
     let three_rewards = 3u64;
@@ -159,15 +160,12 @@ async fn the_wallet_daemon_serves_an_exchange() {
         false
     );
 
-    // A withdrawal to the customer and a deposit to alice in one send.
+    // A single-recipient withdrawal to the customer.
     let sent = call(
         addr,
         t,
-        "sendmany",
-        json!([[
-        {"address": customer_address, "amount": "1000"},
-        {"address": alice_address, "amount": 500},
-    ], 1]),
+        "send",
+        json!([{"address": customer_address, "amount": payment_amount.to_string()}, 1]),
     )
     .await;
     let id = sent["operation_id"].as_u64().unwrap();
@@ -178,39 +176,30 @@ async fn the_wallet_daemon_serves_an_exchange() {
     .await;
     let op = call(addr, t, "getoperationstatus", json!([id])).await;
     let txid = op["txid"].as_str().unwrap().to_string();
-    assert_eq!(op["total"], "1500");
+    assert_eq!(op["total"], payment_amount.to_string());
     assert_eq!(op["attempts"], 1);
     assert!(op["confirmations"].as_u64().unwrap() >= 1);
 
-    // The wallet sees the deposit to alice with her label, the change,
-    // and the spent coinbase coin, all under the one txid.
-    wait_for(Duration::from_secs(30), async || {
-        call(addr, t, "listreceived", json!([1]))
-            .await
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|n| n["label"] == "alice")
-    })
-    .await;
-    let received = call(addr, t, "listreceived", json!([1])).await;
-    let to_alice = received
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|n| n["label"] == "alice")
-        .unwrap();
-    assert_eq!(to_alice["amount"], "500");
-    assert_eq!(to_alice["address_index"], 1);
-    assert_eq!(to_alice["txid"], txid);
     let view = call(addr, t, "gettransaction", json!([txid])).await;
     assert_eq!(
         view["received"].as_array().unwrap().len(),
-        2,
-        "alice's coin and the change"
+        1,
+        "only the change"
     );
     assert_eq!(view["spent"].as_array().unwrap().len(), 1);
-    assert_eq!(view["net"], "-1000", "only the 1000 payment is debited");
+    let fee = view["spent"][0]["amount"]
+        .as_str()
+        .unwrap()
+        .parse::<u64>()
+        .unwrap()
+        - view["received"][0]["amount"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+        - payment_amount;
+    assert!(fee > 0);
+    assert_eq!(view["net"], format!("-{}", payment_amount + fee));
     assert_eq!(view["spent"][0]["spent_by"], json!(txid));
     assert_eq!(
         call_err(addr, t, "gettransaction", json!(["00".repeat(32)])).await,
@@ -224,10 +213,8 @@ async fn the_wallet_daemon_serves_an_exchange() {
     let broke = call(
         addr,
         t,
-        "sendmany",
-        json!([[
-            {"address": customer_address, "amount": "99999999999999"},
-        ]]),
+        "send",
+        json!([{"address": customer_address, "amount": "99999999999999"}]),
     )
     .await;
     let broke_id = broke["operation_id"].as_u64().unwrap();
@@ -253,8 +240,8 @@ async fn the_wallet_daemon_serves_an_exchange() {
         call_err(
             addr,
             t,
-            "sendmany",
-            json!([[{"address": "tnull1junk", "amount": "1"}]])
+            "send",
+            json!([{"address": "tnull1junk", "amount": "1"}])
         )
         .await,
         runtime::jsonrpc::INVALID_PARAMS

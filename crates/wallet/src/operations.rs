@@ -5,7 +5,6 @@
 use protocol::address::RhombusAddress;
 use protocol::amount::RawCoin;
 use protocol::bytes::{Encodable, Reader, Writer};
-use protocol::fee::FeeOpening;
 use protocol::transaction::TxId;
 
 use crate::spend::Payment;
@@ -92,7 +91,6 @@ pub struct Operation {
     /// The built transaction, kept for resubmission.
     pub transaction: Option<Vec<u8>>,
     /// Off-chain opening for the active transaction's fee commitment.
-    pub fee_opening: Option<FeeOpening>,
     /// How many times it was built.
     pub attempts: u32,
     /// Earlier versions of this payment. Kept so a reorganization that mines
@@ -102,16 +100,15 @@ pub struct Operation {
 
 impl Operation {
     /// A fresh, queued operation.
-    pub fn new(id: u64, created_at: u64, recipients: Vec<Payment>, min_confirmations: u32) -> Self {
+    pub fn new(id: u64, created_at: u64, payment: Option<Payment>, min_confirmations: u32) -> Self {
         Self {
             id,
             created_at,
-            recipients,
+            recipients: payment.into_iter().collect(),
             min_confirmations,
             status: OperationStatus::Queued,
             locked: Vec::new(),
             transaction: None,
-            fee_opening: None,
             attempts: 0,
             previous_transactions: Vec::new(),
         }
@@ -253,19 +250,10 @@ impl Encodable for Operation {
         w.put(&self.attempts.to_le_bytes());
         // Empty history retains the original disk layout. A nonempty extension
         // is readable by new wallets and refused by old ones, never ignored.
-        if !self.previous_transactions.is_empty() || self.fee_opening.is_some() {
+        if !self.previous_transactions.is_empty() {
             w.put_u64_le(self.previous_transactions.len() as u64);
             for bytes in &self.previous_transactions {
                 w.put_u64_le(bytes.len() as u64).put(bytes);
-            }
-            match &self.fee_opening {
-                Some(opening) => {
-                    w.put_u8(1);
-                    opening.write(w);
-                }
-                None => {
-                    w.put_u8(0);
-                }
             }
         }
     }
@@ -294,20 +282,12 @@ impl Encodable for Operation {
         };
         let attempts = u32::from_le_bytes(r.take_array()?);
         let mut previous_transactions = Vec::new();
-        let mut fee_opening = None;
         if r.remaining() > 0 {
             let count = r.take_u64_le()?;
             for _ in 0..count {
                 let len = usize::try_from(r.take_u64_le()?)
                     .map_err(|_| protocol::Error::Malformed("transaction length"))?;
                 previous_transactions.push(r.take(len)?.to_vec());
-            }
-            if r.remaining() > 0 {
-                fee_opening = match r.take_u8()? {
-                    0 => None,
-                    1 => Some(FeeOpening::read(r)?),
-                    _ => return Err(protocol::Error::Malformed("fee opening flag")),
-                };
             }
         }
         Ok(Self {
@@ -318,7 +298,6 @@ impl Encodable for Operation {
             status,
             locked,
             transaction,
-            fee_opening,
             attempts,
             previous_transactions,
         })
@@ -342,16 +321,10 @@ mod tests {
         let mut op = Operation::new(
             9,
             1_700_000_000,
-            vec![
-                Payment {
-                    recipient: keys.default_address().unwrap(),
-                    amount: RawCoin::from_raw(1_000).unwrap(),
-                },
-                Payment {
-                    recipient: keys.address(7u64.into()).unwrap(),
-                    amount: RawCoin::from_raw(2_000).unwrap(),
-                },
-            ],
+            Some(Payment {
+                recipient: keys.default_address().unwrap(),
+                amount: RawCoin::from_raw(1_000).unwrap(),
+            }),
             6,
         );
         op.status = status;
@@ -376,7 +349,7 @@ mod tests {
             let op = sample(status);
             let again = Operation::from_slice(&op.to_vec()).unwrap();
             assert_eq!(again, op);
-            assert_eq!(again.total(), 3_000);
+            assert_eq!(again.total(), 1_000);
         }
         assert!(Operation::from_slice(&[0; 8]).is_err());
         let mut bytes = sample(OperationStatus::Queued).to_vec();

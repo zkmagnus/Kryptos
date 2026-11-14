@@ -15,9 +15,11 @@
 
 use std::collections::BTreeSet;
 
-use crypto::signature::{BatchVerifier, BindingVerificationKey};
+use crypto::signature::BatchVerifier;
+use protocol::amount::RawCoin;
 use protocol::block::{Block, BlockHeader};
-use protocol::consensus::{next_height, subsidy, BranchId, BLOCK_VERSION, MAX_BLOCK_TRANSACTIONS};
+use protocol::consensus::{next_height, BranchId, BLOCK_VERSION, MAX_BLOCK_TRANSACTIONS};
+use protocol::fee::block_mint;
 use protocol::nullifier::Nullifier;
 use protocol::transaction::Transaction;
 use protocol::tree_order::tree_transactions;
@@ -25,8 +27,7 @@ use protocol::validate as tx_validate;
 use rand_core::{CryptoRng, RngCore};
 use storage::store::Store;
 use storage::tree::CommitmentTree;
-use systemcall::SystemCall;
-use systemcall_proof::{ProofBatch, VerifyingKey};
+use transaction_proof::{ProofBatch, VerifyingKey};
 
 use crate::difficulty::{next_target, Sample};
 use crate::params::ChainParams;
@@ -197,13 +198,7 @@ impl Validator<'_> {
         block: &Block,
         rng: &mut (impl RngCore + CryptoRng),
     ) -> Result<()> {
-        let branch = self.params.branch_at(block.header().height);
-        let mut batch = AuthorizationBatch::default();
-        for (tx, coinbase_balance) in balances(block)? {
-            batch.queue(tx, coinbase_balance, branch)?;
-        }
-        queue_block_binding(block, &mut batch.signatures)?;
-        batch.verify(self.vk, rng)
+        self.queue_block(block)?.verify(self.vk, rng)
     }
 
     /// Checks every transaction and returns the tree after the outputs the
@@ -214,22 +209,29 @@ impl Validator<'_> {
         block: &Block,
         rng: &mut (impl RngCore + CryptoRng),
     ) -> Result<CommitmentTree> {
-        let branch = self.params.branch_at(block.header().height);
-        let mut batch = AuthorizationBatch::default();
-        for (tx, coinbase_balance) in balances(block)? {
-            batch.queue(tx, coinbase_balance, branch)?;
+        let batch = self.queue_block(block)?;
+        for tx in block.transactions() {
             self.check_chain_state(store, tx)?;
         }
-        queue_block_binding(block, &mut batch.signatures)?;
         batch.verify(self.vk, rng)?;
         let mut tree = store.tree()?;
         for tx in tree_transactions(block)? {
-            let effects = SystemCall::dispatch(tx)?.effects();
-            for commitment in &effects.commitments {
-                tree.append(commitment)?;
+            for action in tx.actions() {
+                tree.append(action.body().cmx())?;
             }
         }
         Ok(tree)
+    }
+
+    fn queue_block(&self, block: &Block) -> Result<AuthorizationBatch> {
+        let (coinbase, transfers, mint) = block_plan(block)?;
+        let branch = self.params.branch_at(block.header().height);
+        let mut batch = AuthorizationBatch::default();
+        batch.queue_coinbase(coinbase, mint, branch)?;
+        for tx in transfers {
+            batch.queue_transfer(tx, branch)?;
+        }
+        Ok(batch)
     }
 
     /// The checks that need the store: anchor age and nullifier freshness
@@ -241,8 +243,7 @@ impl Validator<'_> {
         {
             return Err(Error::InvalidBlock("unknown or stale anchor"));
         }
-        let effects = SystemCall::dispatch(tx)?.effects();
-        for nf in &effects.nullifiers {
+        for nf in tx.nullifiers() {
             if store.contains_nullifier(nf)? {
                 return Err(Error::InvalidBlock("nullifier already spent"));
             }
@@ -251,47 +252,37 @@ impl Validator<'_> {
     }
 }
 
-/// Queues the block-wide Pedersen balance signature. The net value of all
-/// action commitments in a valid block is exactly negative subsidy.
-fn queue_block_binding(block: &Block, batch: &mut BatchVerifier) -> Result<()> {
-    let signature = block
-        .binding_signature()
-        .ok_or(Error::InvalidBlock("missing block value-binding signature"))?;
-    let subsidy = subsidy(block.header().height)
-        .to_i64()?
-        .checked_neg()
-        .ok_or(Error::InvalidBlock("subsidy out of range"))?;
-    let key = BindingVerificationKey::from_commitments(
-        block
-            .transactions()
-            .iter()
-            .flat_map(Transaction::value_commitments),
-        subsidy,
-    )?;
-    let message = Block::binding_message(block.header());
-    batch.queue_binding(&key, signature, &message);
-    Ok(())
-}
-
-/// Every transaction of `block`, with the first item marked as coinbase.
-///
-/// # Errors
-/// Fails if the transaction count is out of range.
-fn balances(block: &Block) -> Result<Vec<(&Transaction, bool)>> {
+/// Splits the block and computes the mint the coinbase must carry.
+fn block_plan(block: &Block) -> Result<(&Transaction, &[Transaction], RawCoin)> {
     let txs = block.transactions();
     if txs.is_empty() || txs.len() > MAX_BLOCK_TRANSACTIONS {
         return Err(Error::InvalidBlock("transaction count out of range"));
     }
     let coinbase = txs.first().ok_or(Error::InvalidBlock("missing coinbase"))?;
+    if coinbase.kind() != protocol::consensus::COINBASE_KIND {
+        return Err(Error::InvalidBlock("first transaction must be coinbase"));
+    }
+    if txs
+        .iter()
+        .skip(1)
+        .any(|tx| tx.kind() != protocol::consensus::TRANSFER_KIND)
+    {
+        return Err(Error::InvalidBlock(
+            "only the first transaction may be coinbase",
+        ));
+    }
+    let transfers = &txs[1..];
+    let mint = block_mint(
+        block.header().height,
+        transfers.iter().map(Transaction::fee),
+    )?;
+    protocol::validate::coinbase_balance(mint)?;
     if coinbase.actions().len() != 2 {
         return Err(Error::InvalidBlock(
             "coinbase must create exactly two states",
         ));
     }
-    txs.iter()
-        .enumerate()
-        .map(|(index, tx)| Ok((tx, index == 0)))
-        .collect()
+    Ok((coinbase, transfers, mint))
 }
 
 /// One block's signatures and proofs, verified together at the end, and
@@ -305,22 +296,32 @@ struct AuthorizationBatch {
 }
 
 impl AuthorizationBatch {
-    /// Checks `tx`'s structure and block-wide nullifier uniqueness and
-    /// queues its signatures, made for `branch`, and its proof.
-    fn queue(&mut self, tx: &Transaction, is_coinbase: bool, branch: BranchId) -> Result<()> {
-        let call = SystemCall::dispatch(tx)?;
-        if is_coinbase {
-            call.check_coinbase_structure()?;
-        } else {
-            call.check_structure()?;
-        }
-        tx_validate::queue_spend_auth_signatures(tx, branch, &mut self.signatures);
-        for nf in call.effects().nullifiers {
+    fn queue_coinbase(&mut self, tx: &Transaction, mint: RawCoin, branch: BranchId) -> Result<()> {
+        tx_validate::check_coinbase_structure(tx)?;
+        self.queue_nullifiers(tx.nullifiers().copied().collect())?;
+        tx_validate::queue_checked_signatures(
+            tx,
+            tx_validate::coinbase_balance(mint)?,
+            branch,
+            &mut self.signatures,
+        )?;
+        tx_validate::queue_coinbase_proof(tx, &mut self.proofs)?;
+        Ok(())
+    }
+
+    fn queue_transfer(&mut self, tx: &Transaction, branch: BranchId) -> Result<()> {
+        tx_validate::check_structure(tx)?;
+        self.queue_nullifiers(tx.nullifiers().copied().collect())?;
+        tx_validate::queue_transfer(tx, branch, &mut self.signatures, &mut self.proofs)?;
+        Ok(())
+    }
+
+    fn queue_nullifiers(&mut self, nullifiers: Vec<Nullifier>) -> Result<()> {
+        for nf in nullifiers {
             if !self.seen.insert(nf) {
                 return Err(Error::InvalidBlock("nullifier already spent"));
             }
         }
-        tx_validate::queue_proof(tx, &mut self.proofs)?;
         Ok(())
     }
 

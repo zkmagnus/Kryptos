@@ -15,9 +15,9 @@ use std::time::{Duration, Instant};
 
 use crypto::encoding::{from_hex, to_hex};
 use crypto::keys::SpendingKey;
+use protocol::amount::RawCoin;
 use protocol::block::Block;
 use protocol::bytes::Encodable;
-use protocol::coin::Rhombus as RawCoin;
 use protocol::compact::CompactBlock;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
@@ -26,9 +26,9 @@ use runtime::jsonrpc::{INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND, NOT_FO
 use runtime::node::{spawn, Handle, Request, Response};
 use runtime::rpc::Token;
 use serde_json::{json, Value};
-use systemcall_proof::ProvingKey;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use transaction_proof::ProvingKey;
 use wallet::keys::WalletKeys;
 use wallet::spend::{build_payment, Payment};
 use wallet::wallet::Wallet;
@@ -116,12 +116,10 @@ async fn json_rpc_serves_the_chain_and_accepts_transactions() {
     .unwrap();
     let addr = node.rpc_http_addr.unwrap();
     let t = token.expose();
-    // The first reward is spendable once block 1 is in the tree.
+    // Wait for two blocks so the following chain queries have a stable tip.
     let spendable = common::first_spendable_height();
-    wait_for(Duration::from_secs(240), async || {
-        height(&node).await >= spendable
-    })
-    .await;
+    wait_for(Duration::from_secs(240), async || height(&node).await >= 2).await;
+    let spendable = spendable.max(2);
 
     // Auth and transport errors.
     let ping = json!({"jsonrpc": "2.0", "method": "getblockcount", "id": 1}).to_string();
@@ -166,7 +164,7 @@ async fn json_rpc_serves_the_chain_and_accepts_transactions() {
     assert_eq!(info["network"], "test");
     assert_eq!(info["genesis_hash"], genesis_hash);
     assert!(info.get("block_producer_output_per_action").is_none());
-    assert_eq!(info["branch"], "0x54455354");
+    assert_eq!(info["branch"], "0x54455331");
     assert_eq!(info["pow_limit"], "207fffff");
     assert!(info["pow_limit_change"].is_null());
     assert_eq!(info["proof_lengths"]["2"], 8736);
@@ -189,7 +187,8 @@ async fn json_rpc_serves_the_chain_and_accepts_transactions() {
         block_1.transactions()[0].txid().to_string()
     );
     let decoded = call(addr, t, "getblock", json!([1, 2])).await;
-    assert_eq!(decoded["tx"][0]["action_count"], 2);
+    let coinbase_action_count = block_1.transactions()[0].actions().len();
+    assert_eq!(decoded["tx"][0]["action_count"], coinbase_action_count);
     assert_eq!(decoded["tx"][0]["height"], 1);
     assert!(decoded["tx"][0].get("sender_debit").is_none());
     let header = call(addr, t, "getblockheader", json!([1])).await;
@@ -210,10 +209,7 @@ async fn json_rpc_serves_the_chain_and_accepts_transactions() {
     );
     let compact = call(addr, t, "getcompactblock", json!([spendable - 1])).await;
     let compact = CompactBlock::from_slice(&from_hex(compact.as_str().unwrap()).unwrap()).unwrap();
-    assert_eq!(
-        compact.actions.len(),
-        block_1.transactions()[0].actions().len()
-    );
+    assert_eq!(compact.actions.len(), 2);
 
     // Transactions by id.
     let coinbase = block_1.transactions()[0].clone();
@@ -223,7 +219,10 @@ async fn json_rpc_serves_the_chain_and_accepts_transactions() {
     let verbose = call(addr, t, "getrawtransaction", json!([coinbase_id, true])).await;
     assert_eq!(verbose["height"], 1);
     assert_eq!(verbose["index"], 0);
-    assert_eq!(verbose["actions"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        verbose["actions"].as_array().unwrap().len(),
+        coinbase_action_count
+    );
     let status = call(addr, t, "gettransactionstatus", json!([coinbase_id])).await;
     assert_eq!(status["status"], "confirmed");
     assert_eq!(status["height"], 1);
@@ -267,7 +266,7 @@ async fn json_rpc_serves_the_chain_and_accepts_transactions() {
         recipient: receiver.default_address().unwrap(),
         amount: RawCoin::from_raw(1_000).unwrap(),
     };
-    let branch = Network::Test.params().genesis_branch;
+    let branch = Network::Test.params().branch_at(height(&node).await + 1);
     let tx = build_payment(&wallet, payment, &pk, branch, &mut rng).unwrap();
     let txid = tx.txid().to_string();
     let submitted = call(addr, t, "sendrawtransaction", json!([to_hex(&tx.to_vec())])).await;

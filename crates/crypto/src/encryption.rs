@@ -90,6 +90,21 @@ impl TransmissionKey {
         let bytes: &[u8; KEM_ENCAPSULATION_KEY_LEN] = bytes
             .try_into()
             .map_err(|_| Error::InvalidDerivation("ML-KEM encapsulation key length"))?;
+        // ML-KEM-768 encodes three 256-coefficient polynomials in the first
+        // 1152 bytes, with each coefficient represented as an unsigned 12-bit
+        // integer. FIPS 203 requires every decoded coefficient to be < q.
+        if bytes[..KEM_ENCAPSULATION_KEY_LEN - KEM_SHARED_SECRET_LEN]
+            .chunks_exact(3)
+            .any(|chunk| {
+                let c0 = u16::from(chunk[0]) | (u16::from(chunk[1] & 0x0f) << 8);
+                let c1 = u16::from(chunk[1] >> 4) | (u16::from(chunk[2]) << 4);
+                c0 >= 3329 || c1 >= 3329
+            })
+        {
+            return Err(Error::InvalidDerivation(
+                "non-canonical ML-KEM encapsulation key",
+            ));
+        }
         Ok(Self(
             ml_kem::kem::EncapsulationKey::<MlKem768Params>::from_bytes(bytes.into()),
         ))
@@ -188,6 +203,23 @@ impl core::fmt::Debug for TransmissionKey {
 impl core::fmt::Debug for ReceiverKey {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("ReceiverKey(<redacted>)")
+    }
+}
+
+#[cfg(test)]
+mod ml_kem_tests {
+    use super::*;
+
+    #[test]
+    fn encapsulation_key_encoding_must_have_canonical_coefficients() {
+        let (_, key) = ReceiverKey::from_seed(&[7; KEM_SEED_LEN]);
+        assert_eq!(TransmissionKey::from_bytes(&key.to_bytes()).unwrap(), key);
+
+        // Encode coefficient q=3329 in the first 12-bit slot.
+        let mut noncanonical = key.to_bytes();
+        noncanonical[0] = 3329u16 as u8;
+        noncanonical[1] = (noncanonical[1] & 0xf0) | ((3329u16 >> 8) as u8);
+        assert!(TransmissionKey::from_bytes(&noncanonical).is_err());
     }
 }
 

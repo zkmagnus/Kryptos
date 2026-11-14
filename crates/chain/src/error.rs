@@ -11,7 +11,7 @@ pub enum Error {
     Protocol(#[from] protocol::Error),
     /// A proof failed to verify.
     #[error(transparent)]
-    Circuit(#[from] systemcall_proof::Error),
+    Circuit(#[from] transaction_proof::Error),
     /// A signature failed to verify.
     #[error(transparent)]
     Crypto(#[from] crypto::Error),

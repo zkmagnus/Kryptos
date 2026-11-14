@@ -20,8 +20,7 @@ path = "src/bin/rhomscan.rs"
 
 [dependencies]
 crypto.workspace = true
-systemcall-proof.workspace = true
-systemcall.workspace = true
+transaction-proof.workspace = true
 protocol.workspace = true
 storage.workspace = true
 chain.workspace = true

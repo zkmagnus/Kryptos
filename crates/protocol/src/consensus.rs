@@ -1,19 +1,16 @@
 //! Consensus constants for transaction shape, issuance and size limits.
-//! Transaction fees are relay metadata and block reward conservation is
-//! checked with the block-wide value-binding signature.
+//! Fees are public, deterministic transaction fields and block reward
+//! conservation is checked by each transaction's value-binding signature.
 
-use crate::amount::RawCoin;
+use crate::amount::{RawCoin, RAWCOIN};
 use crate::{Error, Result};
 
-/// The private-fee transaction format with an explicit SystemCall opcode.
+/// Native chain transaction format with public byte fees.
 pub const TX_VERSION: u8 = 1;
-
-/// The only supported VM operation, also encoded in each transaction.
-pub const TRANSFER_OPCODE: u8 = program_vm::TRANSFER_OPCODE;
-/// Entrypoint selector for a shielded transfer.
-pub const TRANSFER_ENTRYPOINT: u16 = 1;
-/// Entry point for a block's coinbase transfer. Its aggregate net is negative.
-pub const COINBASE_ENTRYPOINT: u16 = 2;
+/// Native transaction kind: shielded transfer.
+pub const TRANSFER_KIND: u8 = 0;
+/// Coinbase kind. Consensus also requires this transaction at block index 0.
+pub const COINBASE_KIND: u8 = 1;
 
 /// The only block version.
 pub const BLOCK_VERSION: u8 = 1;
@@ -45,15 +42,14 @@ pub const POW_SOLUTION_LEN: usize = 32;
 /// Most transactions a block may carry. Provisional.
 pub const MAX_BLOCK_TRANSACTIONS: usize = 512;
 
-/// Initial block emission: 12.5 Rhombs.
-pub const BLOCK_EMISSION_START: u64 = 2_500_000_000;
-/// Permanent tail emission: 0.125 Rhombs.
-pub const TAIL_BLOCK_EMISSION: u64 = 25_000_000;
-/// Number of emission intervals before subsidy reaches the permanent tail.
-pub const EMISSION_HALVINGS_TO_TAIL: u64 = 1;
-/// Length of each emission interval: approximately six months at 30 seconds
-/// per block (365 days per year).
-pub const EMISSION_INTERVAL: u64 = 1_000_000;
+/// Initial block emission: 50 rawcoin.
+pub const BLOCK_EMISSION_START: u64 = 50 * RAWCOIN;
+/// Permanent tail emission: 0.1953125 rawcoin.
+pub const TAIL_BLOCK_EMISSION: u64 = 19_531_250;
+/// Number of 150,000-block intervals until the subsidy enters tail emission.
+pub const EMISSION_HALVINGS_TO_TAIL: u64 = 8;
+/// Blocks per halving interval.
+pub const EMISSION_INTERVAL: u64 = 150_000;
 
 /// The block subsidy at `height`. Genesis pays nothing.
 pub fn subsidy(height: u32) -> RawCoin {
@@ -91,7 +87,7 @@ pub const MAX_ACTIONS: usize = 16;
 /// # Errors
 /// Returns [`Error::InvalidTransaction`] if `actions` is not a class.
 pub fn proof_len(actions: usize) -> Result<usize> {
-    systemcall_proof::proof_len(actions).ok_or(Error::InvalidTransaction(
+    transaction_proof::proof_len(actions).ok_or(Error::InvalidTransaction(
         "action count is not an allowed class",
     ))
 }
@@ -169,10 +165,14 @@ mod tests {
     fn emission_reaches_the_permanent_tail_after_one_interval() {
         assert_eq!(subsidy(0), RawCoin::ZERO);
         assert_eq!(subsidy(1).raw(), BLOCK_EMISSION_START);
-        assert_eq!(subsidy(100_000).raw(), BLOCK_EMISSION_START);
-        assert_eq!(BLOCK_EMISSION_START, 12_500_000);
-        assert_eq!(TAIL_BLOCK_EMISSION, 125_000);
-        assert_eq!(subsidy(1_000_001).raw(), TAIL_BLOCK_EMISSION);
+        assert_eq!(subsidy(150_000).raw(), BLOCK_EMISSION_START);
+        assert_eq!(BLOCK_EMISSION_START, 5_000_000_000);
+        assert_eq!(subsidy(150_001).raw(), 2_500_000_000);
+        assert_eq!(subsidy(1_050_000).raw(), 78_125_000);
+        assert_eq!(subsidy(1_050_001).raw(), 39_062_500);
+        assert_eq!(TAIL_BLOCK_EMISSION, 19_531_250);
+        assert_eq!(subsidy(1_200_000).raw(), 39_062_500);
+        assert_eq!(subsidy(1_200_001).raw(), TAIL_BLOCK_EMISSION);
         assert_eq!(subsidy(u32::MAX).raw(), TAIL_BLOCK_EMISSION);
     }
 }

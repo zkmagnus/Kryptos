@@ -14,8 +14,7 @@
 //! chain crate; the protocol only fixes their layout.
 
 use crypto::encoding::{to_hex, Encoded};
-use crypto::hash::{blake2b_short, BLOCK_HASH, SHORT_OUTPUT_LEN, SIGHASH, TX_ROOT};
-pub use crypto::signature::BindingSignature;
+use crypto::hash::{blake2b_short, BLOCK_HASH, SHORT_OUTPUT_LEN, TX_ROOT};
 
 use crate::bytes::{Encodable, Reader, Writer};
 use crate::consensus::{BLOCK_VERSION, MAX_BLOCK_TRANSACTIONS, POW_SOLUTION_LEN};
@@ -159,7 +158,6 @@ impl Encodable for BlockHeader {
 pub struct Block {
     header: BlockHeader,
     transactions: Vec<Transaction>,
-    binding_signature: Option<BindingSignature>,
 }
 
 impl Block {
@@ -169,20 +167,6 @@ impl Block {
         Self {
             header,
             transactions,
-            binding_signature: None,
-        }
-    }
-
-    /// Assembles a block with its block-wide value-conservation signature.
-    pub fn new_with_binding_signature(
-        header: BlockHeader,
-        transactions: Vec<Transaction>,
-        binding_signature: BindingSignature,
-    ) -> Self {
-        Self {
-            header,
-            transactions,
-            binding_signature: Some(binding_signature),
         }
     }
 
@@ -194,24 +178,6 @@ impl Block {
     /// The transactions.
     pub fn transactions(&self) -> &[Transaction] {
         &self.transactions
-    }
-
-    /// The block-wide binding signature, absent only for genesis or legacy blocks.
-    pub fn binding_signature(&self) -> Option<&BindingSignature> {
-        self.binding_signature.as_ref()
-    }
-
-    /// Message signed by the producer over this height and transaction root.
-    pub fn binding_message(header: &BlockHeader) -> [u8; SHORT_OUTPUT_LEN] {
-        blake2b_short(
-            SIGHASH,
-            &[
-                b"Rhombus:block-value-binding:v2",
-                header.prev_hash.as_bytes(),
-                &header.height.to_le_bytes(),
-                &header.tx_root,
-            ],
-        )
     }
 
     /// The block hash.
@@ -255,14 +221,6 @@ impl Encodable for Block {
         for tx in &self.transactions {
             tx.write(w);
         }
-        match &self.binding_signature {
-            Some(signature) => {
-                w.put_u8(1).put(&signature.to_bytes());
-            }
-            None => {
-                w.put_u8(0);
-            }
-        }
     }
 
     fn read(r: &mut Reader<'_>) -> Result<Self> {
@@ -275,15 +233,9 @@ impl Encodable for Block {
         let transactions = (0..count)
             .map(|_| Transaction::read(r))
             .collect::<Result<Vec<_>>>()?;
-        let binding_signature = match r.take_u8()? {
-            0 => None,
-            1 => Some(BindingSignature::from_bytes(r.take_array()?)),
-            _ => return Err(Error::Malformed("block binding signature flag")),
-        };
         Ok(Self {
             header,
             transactions,
-            binding_signature,
         })
     }
 }

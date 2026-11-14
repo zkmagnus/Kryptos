@@ -8,9 +8,8 @@ license.workspace = true
 
 [dependencies]
 crypto.workspace = true
-systemcall-proof.workspace = true
+transaction-proof.workspace = true
 protocol.workspace = true
-systemcall.workspace = true
 storage.workspace = true
 blake2b_simd.workspace = true
 thiserror.workspace = true

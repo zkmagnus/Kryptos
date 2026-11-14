@@ -6,7 +6,7 @@ use protocol::block::{Block, BlockHash};
 use protocol::bytes::Writer;
 use rand_core::{CryptoRng, RngCore};
 use storage::store::{Store, Tip};
-use systemcall_proof::VerifyingKey;
+use transaction_proof::VerifyingKey;
 
 use crate::genesis::genesis_with_tree;
 use crate::params::ChainParams;
@@ -230,10 +230,9 @@ impl Chain {
     }
 }
 
-/// Revision of the validation logic. Bump it in the same commit as any
-/// change to how blocks are validated or applied that the parameters do not
-/// capture, so stores built by earlier binaries are refused instead of served.
-pub const CONSENSUS_REVISION: u32 = 3;
+/// Revision marker for the current consensus rules. The chain is reset when
+/// consensus changes, so this remains at the initial revision.
+pub const CONSENSUS_REVISION: u32 = 1;
 
 /// Digest of everything that decides whether an applied block was valid:
 /// [`CONSENSUS_REVISION`], every consensus parameter, the genesis branch,
@@ -241,11 +240,12 @@ pub const CONSENSUS_REVISION: u32 = 3;
 pub fn rules_digest(params: &ChainParams, vk: &VerifyingKey) -> [u8; 32] {
     let mut w = Writer::default();
     w.put(&CONSENSUS_REVISION.to_le_bytes());
-    w.put(b"rhombus-randomx-v1-systemcall-v3-transfer-opcode-private-fee-block-binding");
+    w.put(b"rhombus-randomx-v1-native-transfer-public-byte-fee-per-tx-binding-50-coin-halving");
     w.put(&protocol::consensus::TX_VERSION.to_le_bytes());
-    w.put(&[protocol::consensus::TRANSFER_OPCODE]);
-    w.put(&protocol::consensus::TRANSFER_ENTRYPOINT.to_le_bytes());
-    w.put(&protocol::consensus::COINBASE_ENTRYPOINT.to_le_bytes());
+    w.put(&[
+        protocol::consensus::TRANSFER_KIND,
+        protocol::consensus::COINBASE_KIND,
+    ]);
     w.put(&[protocol::consensus::BLOCK_VERSION]);
     w.put(&protocol::consensus::BLOCK_EMISSION_START.to_le_bytes());
     w.put(&protocol::consensus::TAIL_BLOCK_EMISSION.to_le_bytes());

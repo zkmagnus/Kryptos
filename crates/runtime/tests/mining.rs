@@ -114,7 +114,7 @@ async fn a_pool_mines_through_templates_and_submissions() {
     assert_eq!(info["height"], 0);
     assert_eq!(info["syncing"], false);
     assert_eq!(info["next_height"], 1);
-    assert_eq!(info["subsidy"], "12500000", "12.5 Rhombus tail emission");
+    assert_eq!(info["subsidy"], "5000000000", "50 rawcoin initial emission");
     assert_eq!(info["pow"]["algorithm"], "RandomX");
     assert_eq!(info["next_target"].as_str().unwrap().len(), 8);
 

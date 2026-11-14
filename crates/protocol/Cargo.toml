@@ -8,9 +8,8 @@ license.workspace = true
 
 [dependencies]
 crypto.workspace = true
-program-vm = { path = "../program-vm" }
-systemcall-circuit.workspace = true
-systemcall-proof.workspace = true
+transaction-circuit.workspace = true
+transaction-proof.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
 rand_core.workspace = true
