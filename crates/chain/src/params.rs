@@ -140,8 +140,9 @@ impl ChainParams {
             pow_limit: Target::from_compact(0x207f_ffff).expect("valid compact target"),
             pow_limit_change: None,
             block_interval: 10,
-            // Seven days at a 30-second target block interval.
-            difficulty_window: 20_160,
+            // A 100-block LWMA window (about 16 minutes 40 seconds at
+            // the 10-second target block interval).
+            difficulty_window: 100,
             // Native transaction v3 genesis; distinct from earlier networks.
             genesis_timestamp: 1_793_700_000,
             anchor_max_age: 100,
