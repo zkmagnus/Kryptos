@@ -96,6 +96,7 @@ pub const METHODS: &[&str] = &[
     "getpeerinfo",
     "getnetworkinfo",
     "getconnectioncount",
+    "getmetrics",
     "uptime",
     "stop",
     "help",
@@ -902,6 +903,21 @@ async fn other_methods(
             }))
         }
         "getconnectioncount" => Ok(json!(context.tip().await?.2)),
+        "getmetrics" => match context.ask(Request::Metrics).await? {
+            Response::Metrics(metrics) => Ok(json!({
+                "height": metrics.height,
+                "peers_inbound": metrics.peers_inbound,
+                "peers_outbound": metrics.peers_outbound,
+                "mempool": metrics.mempool,
+                "blocks_mined": metrics.blocks_mined,
+                "blocks_mined_in_chain": metrics.blocks_mined_in_chain,
+                "pending_compact_blocks": metrics.pending_compact_blocks,
+                "uptime_seconds": metrics.uptime_seconds,
+                "mining_ready": metrics.mining_waits.is_none(),
+                "mining_waits": metrics.mining_waits.map(|wait| format!("{wait:?}")),
+            })),
+            other => Err(unexpected(&other)),
+        },
         "uptime" => match context.ask(Request::Metrics).await? {
             Response::Metrics(metrics) => Ok(json!(metrics.uptime_seconds)),
             other => Err(unexpected(&other)),

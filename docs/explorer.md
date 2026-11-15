@@ -6,6 +6,9 @@ The node serves a local browser explorer from its JSON-RPC HTTP listener:
 - Block search accepts a block height or block hash.
 - Transaction search accepts a transaction id and displays public transaction
   fields and its confirmation status.
+- The same page displays the current mempool and node metrics, refreshed every
+  15 seconds while connected. These snapshots use authenticated JSON-RPC calls,
+  so no separate Prometheus listener is needed for the explorer.
 - The page connects to the same JSON-RPC endpoint and requires the node's
   `rpc.token`. It keeps the token in page memory only; it does not persist it in
   browser storage.
@@ -15,6 +18,9 @@ URL in a browser; to set it explicitly, use `--rpc-http 127.0.0.1:18443`.
 By default, the listener is bound to localhost. Keep it on a trusted interface
 because the token grants access to node RPC methods, including methods beyond
 read-only explorer queries.
+
+`getrawmempool`, `getmempoolinfo`, and `getmetrics` supply the pending
+transaction ids, mempool capacity, and node snapshot shown by the page.
 
 ## Address lookups
 
