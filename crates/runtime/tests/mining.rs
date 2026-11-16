@@ -26,11 +26,12 @@ use runtime::node::spawn;
 use runtime::rpc::Token;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use wallet::keys::WalletKeys;
 
 async fn post(addr: SocketAddr, token: &str, body: &str) -> Value {
-    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut stream = p2p::transport::connect_loopback_for_tests(addr)
+        .await
+        .unwrap();
     let request = format!(
         "POST / HTTP/1.1\r\nHost: node\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()

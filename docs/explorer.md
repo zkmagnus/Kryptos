@@ -11,13 +11,15 @@ The node serves a local browser explorer from its JSON-RPC HTTP listener:
   so no separate Prometheus listener is needed for the explorer.
 - The page connects to the same JSON-RPC endpoint and requires the node's
   `rpc.token`. It keeps the token in page memory only; it does not persist it in
-  browser storage.
+  browser storage. The endpoint is fixed to the origin serving the page;
+  cross-origin requests and redirects are rejected. A `connect-src 'self'`
+  content-security policy provides an additional browser-side restriction.
 
 The JSON-RPC HTTP listener is enabled by default. Open the logged `json-rpc`
 URL in a browser; to set it explicitly, use `--rpc-http 127.0.0.1:18443`.
-By default, the listener is bound to localhost. Keep it on a trusted interface
-because the token grants access to node RPC methods, including methods beyond
-read-only explorer queries.
+The listener accepts only `127.0.0.1` binds. It may also be reached through the
+node's Tor HTTP service mapping. The token grants access to node RPC methods,
+including methods beyond read-only explorer queries.
 
 `getrawmempool`, `getmempoolinfo`, and `getmetrics` supply the pending
 transaction ids, mempool capacity, and node snapshot shown by the page.

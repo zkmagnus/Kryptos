@@ -1,17 +1,17 @@
-//! Reachability checks and peer exchange over real encrypted connections.
+//! Onion reachability and peer exchange through memory stream fixtures.
 #![allow(clippy::unwrap_used, clippy::panic)]
 
-use std::net::SocketAddr;
 use std::time::Duration;
 
+mod common;
+use common::{ScriptedService, TorFixture};
 use p2p::addrbook::Snapshot;
+use p2p::address::NetAddr;
 use p2p::message::{Message, PeerAddr};
-use p2p::noise::Role;
 use p2p::peer::{version_info, Direction};
-use p2p::transport::{establish, ConnectionReader, ConnectionWriter};
+use p2p::transport::{split, ConnectionReader, ConnectionWriter};
 use runtime::config::{Config, OUTBOUND_TARGET};
-use runtime::node::{spawn, Event, Handle, PeerSummary, Request, Response};
-use tokio::net::{TcpListener, TcpStream};
+use runtime::node::{Event, Handle, PeerSummary, Request, Response};
 
 const DEADLINE: Duration = Duration::from_secs(30);
 /// Ticks between a node's address exchanges (`discovery::EXCHANGE_SECONDS`).
@@ -19,10 +19,6 @@ const EXCHANGE_TICKS: usize = 600;
 /// Ticks before a node answers the same peer's `GetAddr` again
 /// (`discovery::REPLY_SECONDS`).
 const REPLY_TICKS: usize = 60;
-
-fn listener() -> SocketAddr {
-    "127.0.0.1:0".parse().unwrap()
-}
 
 async fn peers(node: &Handle) -> Vec<PeerSummary> {
     match node.request(Request::Peers).await.unwrap() {
@@ -52,16 +48,8 @@ async fn wait_for(nodes: &[&Handle], mut check: impl AsyncFnMut() -> bool) {
     .unwrap();
 }
 
-fn address(addr: SocketAddr) -> PeerAddr {
-    let ip = match addr.ip() {
-        std::net::IpAddr::V4(ip) => ip.to_ipv6_mapped().octets(),
-        std::net::IpAddr::V6(ip) => ip.octets(),
-    };
-    PeerAddr {
-        ip,
-        port: addr.port(),
-        last_seen: runtime::now(),
-    }
+fn address(addr: NetAddr) -> PeerAddr {
+    PeerAddr::new(addr, runtime::config::DEFAULT_P2P_PORT, runtime::now())
 }
 
 struct Client {
@@ -70,13 +58,13 @@ struct Client {
 }
 
 impl Client {
-    async fn connect(node: &Handle) -> Self {
+    async fn connect(network: &TorFixture, node: &Handle) -> Self {
         let genesis = match node.request(Request::Block(0)).await.unwrap() {
             Response::Block(Some(block)) => block.hash(),
             other => panic!("unexpected {other:?}"),
         };
-        let stream = TcpStream::connect(node.listen_addr.unwrap()).await.unwrap();
-        let (writer, reader) = establish(stream, Role::Initiator).await.unwrap();
+        let stream = network.connect(&network.endpoint(node)).await.unwrap();
+        let (writer, reader) = split(stream);
         let mut client = Self { writer, reader };
         client
             .writer
@@ -133,7 +121,7 @@ impl Client {
         }
     }
 
-    async fn wait_for_address(&mut self, addr: SocketAddr) {
+    async fn wait_for_address(&mut self, addr: NetAddr) {
         let expected = address(addr).key();
         tokio::time::timeout(DEADLINE, async {
             loop {
@@ -151,36 +139,37 @@ impl Client {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_wallet_discovers_a_listener_that_joins_its_seed_later() {
-    let seed = spawn(Config {
-        listen: Some(listener()),
-        ..Config::test()
-    })
-    .await
-    .unwrap();
-    let seed_target = seed.listen_addr.unwrap().to_string();
-    let wallet = spawn(Config {
-        connect: vec![seed_target.clone()],
-        ..Config::test()
-    })
-    .await
-    .unwrap();
+    let network = TorFixture::new();
+    let seed = network
+        .spawn(Config {
+            p2p: true,
+            ..Config::test()
+        })
+        .await;
+    let seed_target = network.endpoint(&seed);
+    let wallet = network
+        .spawn(Config {
+            connect: vec![seed_target.clone()],
+            ..Config::test()
+        })
+        .await;
     wait_for(&[&wallet], async || {
         peers(&wallet).await.iter().any(|p| p.ready)
     })
     .await;
-    let newcomer = spawn(Config {
-        listen: Some(listener()),
-        connect: vec![seed_target],
-        ..Config::test()
-    })
-    .await
-    .unwrap();
-    let newcomer_addr = newcomer.listen_addr.unwrap();
+    let newcomer = network
+        .spawn(Config {
+            p2p: true,
+            connect: vec![seed_target],
+            ..Config::test()
+        })
+        .await;
+    let newcomer_addr = address(newcomer.onion_addr.unwrap()).key();
     wait_for(&[&seed], async || {
         peers(&seed)
             .await
             .iter()
-            .any(|p| p.ready && p.addr == newcomer_addr)
+            .any(|p| p.ready && p.addr == Some(newcomer_addr))
     })
     .await;
     // Verified addresses are pulled, never pushed: the wallet learns the
@@ -190,7 +179,7 @@ async fn a_wallet_discovers_a_listener_that_joins_its_seed_later() {
         peers(&wallet)
             .await
             .iter()
-            .any(|p| p.ready && p.addr == newcomer_addr)
+            .any(|p| p.ready && p.addr == Some(newcomer_addr))
     })
     .await;
     newcomer.shutdown().await;
@@ -200,27 +189,25 @@ async fn a_wallet_discovers_a_listener_that_joins_its_seed_later() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_full_seed_verifies_and_relays_a_new_inbound_listening_node() {
+    let network = TorFixture::new();
     let mut bootstrap = Vec::new();
     for _ in 0..OUTBOUND_TARGET {
         bootstrap.push(
-            spawn(Config {
-                listen: Some(listener()),
-                ..Config::test()
-            })
-            .await
-            .unwrap(),
+            network
+                .spawn(Config {
+                    p2p: true,
+                    ..Config::test()
+                })
+                .await,
         );
     }
-    let seed = spawn(Config {
-        listen: Some(listener()),
-        connect: bootstrap
-            .iter()
-            .map(|n| n.listen_addr.unwrap().to_string())
-            .collect(),
-        ..Config::test()
-    })
-    .await
-    .unwrap();
+    let seed = network
+        .spawn(Config {
+            p2p: true,
+            connect: bootstrap.iter().map(|n| network.endpoint(n)).collect(),
+            ..Config::test()
+        })
+        .await;
     wait_for(&[&seed], async || {
         peers(&seed)
             .await
@@ -230,15 +217,15 @@ async fn a_full_seed_verifies_and_relays_a_new_inbound_listening_node() {
             == OUTBOUND_TARGET
     })
     .await;
-    let mut observer = Client::connect(&seed).await;
-    let newcomer = spawn(Config {
-        listen: Some(listener()),
-        connect: vec![seed.listen_addr.unwrap().to_string()],
-        ..Config::test()
-    })
-    .await
-    .unwrap();
-    let expected = address(newcomer.listen_addr.unwrap()).key();
+    let mut observer = Client::connect(&network, &seed).await;
+    let newcomer = network
+        .spawn(Config {
+            p2p: true,
+            connect: vec![network.endpoint(&seed)],
+            ..Config::test()
+        })
+        .await;
+    let expected = address(newcomer.onion_addr.unwrap()).key();
     tokio::time::timeout(DEADLINE, async {
         while !observer
             .get_addr()
@@ -268,26 +255,28 @@ async fn a_full_seed_verifies_and_relays_a_new_inbound_listening_node() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn accepting_tcp_without_a_network_handshake_does_not_make_an_address_gossipable() {
-    let seed = spawn(Config {
-        listen: Some(listener()),
-        ..Config::test()
-    })
-    .await
-    .unwrap();
-    let mut sender = Client::connect(&seed).await;
-    let mut observer = Client::connect(&seed).await;
-    let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
+async fn accepting_a_stream_without_a_network_handshake_does_not_make_an_address_gossipable() {
+    let network = TorFixture::new();
+    let seed = network
+        .spawn(Config {
+            p2p: true,
+            ..Config::test()
+        })
+        .await;
+    let mut sender = Client::connect(&network, &seed).await;
+    let mut observer = Client::connect(&network, &seed).await;
+    let mut silent = ScriptedService::new();
+    let silent_identity = silent.identity;
     sender
         .writer
-        .send(&Message::Addr(vec![address(silent.local_addr().unwrap())]))
+        .send(&Message::Addr(vec![address(silent_identity)]))
         .await
         .unwrap();
     sender.barrier().await;
     for _ in 0..5 {
         seed.events().send(Event::Tick).await.unwrap();
     }
-    let (_socket, _) = tokio::time::timeout(DEADLINE, silent.accept())
+    let (_socket, ()) = tokio::time::timeout(DEADLINE, silent.accept())
         .await
         .unwrap()
         .unwrap();
@@ -303,15 +292,17 @@ async fn accepting_tcp_without_a_network_handshake_does_not_make_an_address_goss
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unfinished_version_handshake_cannot_start_chain_sync() {
-    let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let node = spawn(Config {
-        connect: vec![server.local_addr().unwrap().to_string()],
-        ..Config::test()
-    })
-    .await
-    .unwrap();
-    let (stream, _) = server.accept().await.unwrap();
-    let (mut writer, mut reader) = establish(stream, Role::Responder).await.unwrap();
+    let network = TorFixture::new();
+    let mut server = ScriptedService::new();
+    let identity = server.identity;
+    let node = network
+        .spawn(Config {
+            connect: vec![identity.endpoint(runtime::config::DEFAULT_P2P_PORT)],
+            ..Config::test()
+        })
+        .await;
+    let (stream, ()) = server.accept().await.unwrap();
+    let (mut writer, mut reader) = split(stream);
     let Message::Version(ours) = reader.recv().await.unwrap() else {
         panic!("expected version");
     };
@@ -337,16 +328,17 @@ async fn an_unfinished_version_handshake_cannot_start_chain_sync() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn established_peers_repeat_announcements_but_ask_only_outbound_peers_for_addresses() {
-    let seed = spawn(Config {
-        listen: Some(listener()),
-        ..Config::test()
-    })
-    .await
-    .unwrap();
-    let mut observer = Client::connect(&seed).await;
+    let network = TorFixture::new();
+    let seed = network
+        .spawn(Config {
+            p2p: true,
+            ..Config::test()
+        })
+        .await;
+    let mut observer = Client::connect(&network, &seed).await;
     tick(&[&seed], EXCHANGE_TICKS).await;
     observer.writer.send(&Message::Ping(789)).await.unwrap();
-    let expected = address(seed.listen_addr.unwrap()).key();
+    let expected = address(seed.onion_addr.unwrap()).key();
     let mut announcement = false;
     loop {
         match observer.recv().await {
@@ -362,17 +354,20 @@ async fn established_peers_repeat_announcements_but_ask_only_outbound_peers_for_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_inbound_peer_can_only_announce_one_address_per_exchange() {
-    let seed = spawn(Config {
-        listen: Some(listener()),
-        ..Config::test()
-    })
-    .await
-    .unwrap();
-    let mut sender = Client::connect(&seed).await;
-    let first = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let second = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let flood = [&first, &second, &second]
-        .map(|l| address(l.local_addr().unwrap()))
+    let network = TorFixture::new();
+    let seed = network
+        .spawn(Config {
+            p2p: true,
+            ..Config::test()
+        })
+        .await;
+    let mut sender = Client::connect(&network, &seed).await;
+    let mut first = ScriptedService::new();
+    let mut second = ScriptedService::new();
+    let first_identity = first.identity;
+    let second_identity = second.identity;
+    let flood = [first_identity, second_identity, second_identity]
+        .map(address)
         .to_vec();
     sender.writer.send(&Message::Addr(flood)).await.unwrap();
     sender.barrier().await;
@@ -392,70 +387,62 @@ async fn an_inbound_peer_can_only_announce_one_address_per_exchange() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_forwarded_port_override_is_verified_and_shared() {
-    let seed = spawn(Config {
-        listen: Some(listener()),
-        ..Config::test()
-    })
-    .await
-    .unwrap();
-    let forward = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let public = forward.local_addr().unwrap();
-    let node = spawn(Config {
-        listen: Some(listener()),
-        advertise: Some(public),
-        connect: vec![seed.listen_addr.unwrap().to_string()],
-        ..Config::test()
-    })
-    .await
-    .unwrap();
-    let private = node.listen_addr.unwrap();
-    let relay = tokio::spawn(async move {
-        while let Ok((mut inbound, _)) = forward.accept().await {
-            tokio::spawn(async move {
-                let mut outbound = TcpStream::connect(private).await.unwrap();
-                let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
-            });
-        }
-    });
+async fn only_the_onion_service_identity_and_virtual_port_are_shared() {
+    let network = TorFixture::new();
+    let seed = network
+        .spawn(Config {
+            p2p: true,
+            ..Config::test()
+        })
+        .await;
+    let node = network
+        .spawn(Config {
+            p2p: true,
+            connect: vec![network.endpoint(&seed)],
+            ..Config::test()
+        })
+        .await;
+    let identity = node.onion_addr.unwrap();
+    let expected = address(identity).key();
     wait_for(&[&seed], async || {
         peers(&seed)
             .await
             .iter()
-            .any(|p| p.ready && p.addr == public)
+            .any(|peer| peer.ready && peer.addr == Some(expected))
     })
     .await;
-    let mut observer = Client::connect(&seed).await;
+    let mut observer = Client::connect(&network, &seed).await;
     observer.writer.send(&Message::GetAddr).await.unwrap();
-    observer.wait_for_address(public).await;
-    relay.abort();
+    observer.wait_for_address(identity).await;
+    assert_eq!(expected.1, runtime::config::DEFAULT_P2P_PORT);
     node.shutdown().await;
     seed.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_restarted_node_still_shares_the_listeners_it_verified() {
+async fn a_restarted_node_reconnects_saved_anchors_and_shares_verified_services() {
+    let network = TorFixture::new();
     let dir = tempfile::tempdir().unwrap();
-    let listening = spawn(Config {
-        listen: Some(listener()),
-        ..Config::test()
-    })
-    .await
-    .unwrap();
-    let target = listening.listen_addr.unwrap();
-    let node = spawn(Config {
-        datadir: dir.path().to_path_buf(),
-        cleanup_datadir: false,
-        connect: vec![target.to_string()],
-        ..Config::test()
-    })
-    .await
-    .unwrap();
+    let listening = network
+        .spawn(Config {
+            p2p: true,
+            ..Config::test()
+        })
+        .await;
+    let target = listening.onion_addr.unwrap();
+    let node = network
+        .spawn(Config {
+            datadir: dir.path().to_path_buf(),
+            cleanup_datadir: false,
+            connect: vec![target.endpoint(runtime::config::DEFAULT_P2P_PORT)],
+            ..Config::test()
+        })
+        .await;
     wait_for(&[&node], async || {
         peers(&node)
             .await
             .iter()
-            .any(|p| p.ready && p.addr == target)
+            .any(|p| p.ready && p.addr == Some(address(target).key()))
     })
     .await;
     node.shutdown().await;
@@ -468,22 +455,78 @@ async fn a_restarted_node_still_shares_the_listeners_it_verified() {
         .find(|s| s.addr.key() == address(target).key());
     assert!(entry.unwrap().verified_at.is_some(), "saved as verified");
 
-    // With the listener gone the restarted node cannot verify it again, so
-    // sharing it proves the verification came from disk.
-    listening.shutdown().await;
-    let restarted = spawn(Config {
-        datadir: dir.path().to_path_buf(),
-        cleanup_datadir: false,
-        listen: Some(listener()),
-        ..Config::test()
+    // The empty configured-peer list must reconnect through the saved anchor.
+    // Its persisted verification was also checked directly above.
+    let restarted = network
+        .spawn(Config {
+            datadir: dir.path().to_path_buf(),
+            cleanup_datadir: false,
+            p2p: true,
+            ..Config::test()
+        })
+        .await;
+    wait_for(&[&restarted], async || {
+        peers(&restarted)
+            .await
+            .iter()
+            .any(|peer| peer.ready && peer.addr == Some(address(target).key()))
     })
-    .await
-    .unwrap();
-    let mut client = Client::connect(&restarted).await;
+    .await;
+    let mut client = Client::connect(&network, &restarted).await;
     let shared = client.get_addr().await;
     assert!(
         shared.iter().any(|a| a.key() == address(target).key()),
         "{shared:?}"
     );
     restarted.shutdown().await;
+    listening.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_outbound_only_restart_starts_tor_for_saved_anchors() {
+    let network = TorFixture::new();
+    let directory = tempfile::tempdir().unwrap();
+    let listening = network
+        .spawn(Config {
+            p2p: true,
+            ..Config::test()
+        })
+        .await;
+    let target = listening.onion_addr.unwrap();
+    let node = network
+        .spawn(Config {
+            datadir: directory.path().to_path_buf(),
+            cleanup_datadir: false,
+            connect: vec![network.endpoint(&listening)],
+            ..Config::test()
+        })
+        .await;
+    wait_for(&[&node], async || {
+        peers(&node)
+            .await
+            .iter()
+            .any(|peer| peer.ready && peer.addr == Some(address(target).key()))
+    })
+    .await;
+    node.shutdown().await;
+
+    // No listener or configured peer remains to activate Tor. Persisted
+    // anchors alone must enable readiness monitoring and the isolated dial.
+    let restarted = network
+        .spawn(Config {
+            datadir: directory.path().to_path_buf(),
+            cleanup_datadir: false,
+            ..Config::test()
+        })
+        .await;
+    assert!(restarted.onion_addr.is_some());
+    wait_for(&[&restarted], async || {
+        peers(&restarted)
+            .await
+            .iter()
+            .any(|peer| peer.ready && peer.addr == Some(address(target).key()))
+    })
+    .await;
+    restarted.shutdown().await;
+    listening.shutdown().await;
 }

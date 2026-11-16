@@ -13,7 +13,7 @@ use pasta_curves::pallas;
 use reddsa::orchard::{Binding, SpendAuth};
 use reddsa::{SigType, SigningKey, VerificationKey};
 
-use crate::encoding::point_from_bytes;
+use crate::encoding::{base_from_bytes, point_from_bytes};
 use crate::hash::WIDE_OUTPUT_LEN;
 
 /// Hash-to-curve domain prefix shared by every generator in the system.
@@ -98,10 +98,10 @@ pub fn extract_x(point: &pallas::Point) -> pallas::Base {
         .unwrap_or(pallas::Base::ZERO)
 }
 
-/// Reduces a base field element to a scalar modulo the scalar field order.
+/// Embeds a base field element into the scalar field without changing its value.
 ///
-/// The base field is larger than the scalar field, so this is a many-to-one
-/// map. It matches the `mod r_P` operation used in nullifier derivation.
+/// The Pallas base field modulus is smaller than the scalar field modulus,
+/// so every canonical base field element has an exact scalar representation.
 pub fn base_to_scalar(value: &pallas::Base) -> pallas::Scalar {
     let mut wide = [0u8; WIDE_OUTPUT_LEN];
     let repr = value.to_repr();
@@ -111,11 +111,17 @@ pub fn base_to_scalar(value: &pallas::Base) -> pallas::Scalar {
     crate::hash::wide_to_scalar(&wide)
 }
 
-/// Embeds a scalar into the base field. Lossless because the scalar field
-/// order is below the base field order; [`base_to_scalar`] inverts it.
-pub fn scalar_to_base(value: &pallas::Scalar) -> pallas::Base {
-    // Every canonical scalar encoding is also a canonical base encoding.
-    Option::from(pallas::Base::from_repr(value.to_repr())).unwrap_or(pallas::Base::ZERO)
+/// Converts a scalar to the same integer in the base field, if it fits.
+///
+/// The scalar field modulus is larger than the base field modulus. This
+/// conversion rejects out-of-range values rather than reducing them;
+/// [`base_to_scalar`] inverts every successful conversion.
+///
+/// # Errors
+/// Returns [`crate::Error::InvalidBase`] if `value` is at least the base field
+/// modulus.
+pub fn scalar_to_base(value: &pallas::Scalar) -> crate::Result<pallas::Base> {
+    base_from_bytes(&value.to_repr())
 }
 
 /// A Pedersen commitment `[value] * value_base + [blind] * blind_base`.
@@ -203,13 +209,31 @@ mod tests {
     }
 
     #[test]
-    fn scalar_to_base_is_inverted_by_base_to_scalar() {
-        let s = pallas::Scalar::random(ChaCha20Rng::seed_from_u64(5));
-        assert_eq!(base_to_scalar(&scalar_to_base(&s)), s);
-        assert_eq!(
-            scalar_to_base(&pallas::Scalar::from(42u64)),
-            pallas::Base::from(42u64)
-        );
+    fn field_conversions_round_trip_values_that_fit_in_both_fields() {
+        for base in [
+            pallas::Base::ZERO,
+            pallas::Base::ONE,
+            pallas::Base::from(42u64),
+            -pallas::Base::ONE,
+        ] {
+            let scalar = pallas::Scalar::from_repr(base.to_repr()).unwrap();
+            assert_eq!(base_to_scalar(&base), scalar);
+            assert_eq!(scalar_to_base(&scalar), Ok(base));
+        }
+    }
+
+    #[test]
+    fn scalar_to_base_rejects_the_modulus_boundary_and_larger_values() {
+        let largest_base = -pallas::Base::ONE;
+        let base_modulus =
+            pallas::Scalar::from_repr(largest_base.to_repr()).unwrap() + pallas::Scalar::ONE;
+        for scalar in [
+            base_modulus,
+            base_modulus + pallas::Scalar::ONE,
+            -pallas::Scalar::ONE,
+        ] {
+            assert_eq!(scalar_to_base(&scalar), Err(crate::Error::InvalidBase));
+        }
     }
 
     #[test]

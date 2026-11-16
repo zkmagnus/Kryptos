@@ -27,7 +27,6 @@ use runtime::node::{spawn, Handle, Request, Response};
 use runtime::rpc::Token;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use transaction_proof::ProvingKey;
 use wallet::keys::WalletKeys;
 use wallet::spend::{build_payment, Payment};
@@ -35,7 +34,9 @@ use wallet::wallet::Wallet;
 
 /// One raw HTTP POST; returns the status line and the JSON body.
 async fn post(addr: SocketAddr, token: Option<&str>, body: &str) -> (String, Value) {
-    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut stream = p2p::transport::connect_loopback_for_tests(addr)
+        .await
+        .unwrap();
     let auth = token.map_or(String::new(), |t| format!("Authorization: Bearer {t}\r\n"));
     let request = format!(
         "POST / HTTP/1.1\r\nHost: node\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
@@ -99,17 +100,19 @@ async fn json_rpc_serves_the_chain_and_accepts_transactions() {
         network: Network::Test,
         datadir: test_dir.path().join("chain"),
         cleanup_datadir: false,
-        listen: None,
-        advertise: None,
+        offline: true,
+        p2p: false,
+        addnode: Vec::new(),
+        no_seeds: true,
+        max_outbound: 8,
         connect: Vec::new(),
-        proxy: None,
+        tor: runtime::tor::TorConfig::default(),
         mine_to: Some(miner_keys.default_address().unwrap()),
         mining_threads: 1,
         rpc: None,
         rpc_http: Some("127.0.0.1:0".parse().unwrap()),
         rpc_token: Some(token.clone()),
         block_notify: None,
-        metrics: None,
         max_inbound: 125,
     })
     .await

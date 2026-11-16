@@ -31,12 +31,13 @@ use protocol::transaction::{Transaction, TxId};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Value};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpListener;
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use transaction_proof::ProvingKey;
 
 use crate::config::{Network, MEMPOOL_CAPACITY};
-use crate::http::{read_request, respond_with, Request as HttpRequest};
+use crate::http::{read_request_if, respond_with, Request as HttpRequest};
 use crate::miner::Template;
 use crate::node::{Event, Located, NotReady, PeerSummary, Request, Response, Submission, TxStatus};
 use crate::rpc::Token;
@@ -441,18 +442,39 @@ pub async fn serve(
 /// Serves `dispatcher`'s methods forever behind `token`, one request per
 /// connection.
 pub async fn serve_with<D: Dispatch>(listener: TcpListener, token: Token, dispatcher: D) {
+    let slots = Arc::new(Semaphore::new(16));
     while let Ok((stream, _)) = listener.accept().await {
+        let Ok(permit) = slots.clone().try_acquire_owned() else {
+            continue;
+        };
         let dispatcher = dispatcher.clone();
         let token = token.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             let mut stream = stream;
-            let _ = handle(&mut stream, &dispatcher, &token).await;
+            let _ = serve_stream(&mut stream, &dispatcher, &token).await;
         });
     }
 }
 
-async fn handle<D: Dispatch>(stream: &mut TcpStream, dispatcher: &D, token: &Token) -> Result<()> {
-    let request = match read_request(stream, MAX_BODY).await {
+/// Serves one HTTP RPC request on an already accepted stream.
+///
+/// # Errors
+/// Returns an I/O or protocol error for a failed request.
+pub async fn serve_stream<D: Dispatch, S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    dispatcher: &D,
+    token: &Token,
+) -> Result<()> {
+    let request = match tokio::time::timeout(
+        Duration::from_secs(30),
+        read_request_if(stream, MAX_BODY, |request| {
+            request.method == "POST" && authorized(request, token)
+        }),
+    )
+    .await
+    .map_err(|_| Error::Argument("HTTP request timed out".into()))?
+    {
         Ok(request) => request,
         Err(Error::Io(error)) => return Err(Error::Io(error)),
         Err(error) => {
@@ -495,7 +517,11 @@ fn authorized(request: &HttpRequest, token: &Token) -> bool {
         .is_some_and(|presented| token.matches(presented.trim()))
 }
 
-async fn respond_json(stream: &mut TcpStream, status: &str, body: &Value) -> Result<()> {
+async fn respond_json<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    status: &str,
+    body: &Value,
+) -> Result<()> {
     let bytes = serde_json::to_vec(body).unwrap_or_default();
     respond_with(stream, status, "application/json", &bytes).await
 }
@@ -742,9 +768,7 @@ fn randomx_json(params: &ChainParams) -> Value {
 }
 
 fn target_hex(compact: u32) -> String {
-    Target::from_compact(compact)
-        .map(|t| format!("{:064x}", t.as_u256()))
-        .unwrap_or_default()
+    Target::from_compact(compact).map_or_default(|t| format!("{:064x}", t.as_u256()))
 }
 
 fn parse_nonce(text: &str) -> core::result::Result<[u8; 32], RpcError> {
@@ -885,23 +909,7 @@ async fn other_methods(
             .iter()
             .map(peer_json)
             .collect::<Vec<_>>())),
-        "getnetworkinfo" => {
-            let peers = peers(context).await?;
-            let count = |direction: Direction| {
-                peers
-                    .iter()
-                    .filter(|p| p.ready && p.direction == direction)
-                    .count()
-            };
-            Ok(json!({
-                "network": context.network.to_string(),
-                "protocol_version": PROTOCOL_VERSION,
-                "connections": peers.iter().filter(|p| p.ready).count(),
-                "connections_in": count(Direction::Inbound),
-                "connections_out": count(Direction::Outbound),
-                "handshaking": peers.iter().filter(|p| !p.ready).count(),
-            }))
-        }
+        "getnetworkinfo" => Ok(network_info(context.network, &peers(context).await?)),
         "getconnectioncount" => Ok(json!(context.tip().await?.2)),
         "getmetrics" => match context.ask(Request::Metrics).await? {
             Response::Metrics(metrics) => Ok(json!({
@@ -929,6 +937,23 @@ async fn other_methods(
         "help" => Ok(json!(METHODS)),
         other => Err(unknown_method(other)),
     }
+}
+
+fn network_info(network: Network, peers: &[PeerSummary]) -> Value {
+    let count = |direction: Direction| {
+        peers
+            .iter()
+            .filter(|p| p.ready && p.direction == direction)
+            .count()
+    };
+    json!({
+        "network": network.to_string(),
+        "protocol_version": PROTOCOL_VERSION,
+        "connections": peers.iter().filter(|p| p.ready).count(),
+        "connections_in": count(Direction::Inbound),
+        "connections_out": count(Direction::Outbound),
+        "handshaking": peers.iter().filter(|p| !p.ready).count(),
+    })
 }
 
 async fn blockchain_info(context: &Context) -> core::result::Result<Value, RpcError> {
@@ -1194,7 +1219,7 @@ fn status_json(status: TxStatus, tip: u32) -> Value {
 fn peer_json(peer: &PeerSummary) -> Value {
     json!({
         "id": peer.id,
-        "addr": peer.addr.to_string(),
+        "addr": peer.addr.map(|(addr, port)| addr.endpoint(port)),
         "target": peer.target,
         "direction": match peer.direction {
             Direction::Inbound => "inbound",
@@ -1209,6 +1234,67 @@ fn peer_json(peer: &PeerSummary) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn server_rejects_unauthenticated_large_body_before_reading_it() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (events, _receiver) = mpsc::channel(1);
+        let server = tokio::spawn(serve_with(
+            listener,
+            Token::new("secret").unwrap(),
+            Context::new(events, Network::Test),
+        ));
+        let mut client = p2p::transport::connect_loopback_for_tests(addr)
+            .await
+            .unwrap();
+        client
+            .write_all(b"POST / HTTP/1.1\r\nContent-Length: 33554432\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(Duration::from_secs(1), client.read_to_string(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.starts_with("HTTP/1.1 401 Unauthorized"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn server_caps_silent_connections() {
+        use tokio::io::AsyncReadExt;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (events, _receiver) = mpsc::channel(1);
+        let server = tokio::spawn(serve_with(
+            listener,
+            Token::new("secret").unwrap(),
+            Context::new(events, Network::Test),
+        ));
+        let mut held = Vec::new();
+        for _ in 0..16 {
+            held.push(
+                p2p::transport::connect_loopback_for_tests(addr)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let mut excess = p2p::transport::connect_loopback_for_tests(addr)
+            .await
+            .unwrap();
+        let mut byte = [0];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), excess.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        drop(held);
+        server.abort();
+    }
+
     use protocol::address::RhombusAddress as Address;
 
     use super::*;
@@ -1354,9 +1440,7 @@ mod tests {
         let with = |value: Option<&str>| HttpRequest {
             method: "POST".into(),
             path: "/".into(),
-            headers: value
-                .map(|v| vec![("authorization".to_string(), v.to_string())])
-                .unwrap_or_default(),
+            headers: value.map_or_default(|v| vec![("authorization".to_string(), v.to_string())]),
             body: Vec::new(),
         };
         assert!(authorized(&with(Some("Bearer secret")), &token));

@@ -1,5 +1,6 @@
 //! The `Rhombus` command line.
 
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -23,6 +24,7 @@ use crate::config::{Config, Network};
 use crate::paths;
 use crate::rpc::{Client, Control, Endpoint, Token, TOKEN_FILE};
 use crate::shutdown::Shutdown;
+use crate::tor::TorConfig;
 use crate::{Error, Result};
 
 /// Default control socket.
@@ -54,9 +56,12 @@ pub struct WalletArgs {
 /// How a command reaches a node's control socket.
 #[derive(clap::Args, Debug)]
 pub struct RpcArgs {
-    /// Node control socket.
-    #[arg(long, default_value = DEFAULT_RPC)]
+    /// Node onion control service, as `<v3 hostname>.onion:port`.
+    #[arg(long)]
     pub rpc: String,
+    /// Directory for this client's persistent embedded Tor state.
+    #[arg(long)]
+    pub datadir: Option<PathBuf>,
     /// The node's token; also read from `RPC_TOKEN`.
     #[arg(long, env = TOKEN_ENV, conflicts_with = "rpc_token_file", hide_env_values = true)]
     pub rpc_token: Option<String>,
@@ -85,11 +90,22 @@ impl RpcArgs {
     ///
     /// # Errors
     /// See [`Self::token`].
-    pub fn endpoint(&self) -> Result<Endpoint> {
-        Ok(Endpoint {
+    pub async fn endpoint(&self) -> Result<Endpoint> {
+        p2p::address::NetAddr::parse_endpoint(&self.rpc)?;
+        let token = self.token()?;
+        let directory = self.datadir.clone().map_or_else(
+            || paths::user_data_dir().map(|path| path.join("rpc-client")),
+            Ok,
+        )?;
+        let (network, _incoming) = p2p::transport::TorNetwork::start(&directory, false, &[])?;
+        network.wait_ready().await?;
+        let endpoint = Endpoint {
             addr: self.rpc.clone(),
-            token: self.token()?,
-        })
+            token,
+            network,
+        };
+        endpoint.validate()?;
+        Ok(endpoint)
     }
 
     /// Connects and authenticates.
@@ -98,7 +114,7 @@ impl RpcArgs {
     /// Fails without a token, if the socket is unreachable, or with
     /// [`Error::Unauthorized`].
     pub async fn connect(&self) -> Result<Client> {
-        self.endpoint()?.connect().await
+        self.endpoint().await?.connect().await
     }
 }
 
@@ -115,22 +131,30 @@ pub enum Command {
         /// `<user data>/<network>/chain`, the same chain the desktop app uses.
         #[arg(long)]
         datadir: Option<PathBuf>,
-        /// Address to accept peers on.
+        /// Disable inbound P2P service streams.
         #[arg(long)]
-        listen: Option<SocketAddr>,
-        /// Public IP:port to announce, for example a forwarded port behind NAT.
-        #[arg(long, requires = "listen", conflicts_with = "proxy")]
-        advertise: Option<SocketAddr>,
-        /// Peers to connect to as `host:port`; repeatable.
+        no_p2p: bool,
+        /// Tor v3 peers to connect to as `<hostname>.onion:port`; repeatable.
         #[arg(long)]
         connect: Vec<String>,
-        /// Extra seed peers as `host:port`; repeatable.
+        /// Extra Tor v3 seed peers as `<hostname>.onion:port`; repeatable.
         #[arg(long)]
         seed: Vec<String>,
-        /// SOCKS5 proxy for outbound connections, for example Tor's
-        /// `127.0.0.1:9050`.
+        /// Additional onion peers to maintain; repeatable.
         #[arg(long)]
-        proxy: Option<SocketAddr>,
+        addnode: Vec<String>,
+        /// Disable built-in seed peers.
+        #[arg(long)]
+        no_seeds: bool,
+        /// Maximum regular outbound peers.
+        #[arg(long, default_value_t = crate::config::OUTBOUND_TARGET)]
+        max_outbound: usize,
+        /// Public port of the Tor hidden service.
+        #[arg(long, default_value_t = crate::config::DEFAULT_P2P_PORT)]
+        p2p_port: u16,
+        /// Maximum inbound peers; Tor identities do not identify inbound dialers.
+        #[arg(long, default_value_t = crate::config::DEFAULT_MAX_INBOUND)]
+        max_inbound: usize,
         /// Mine to this address.
         #[arg(long)]
         mine: Option<String>,
@@ -149,9 +173,6 @@ pub enum Command {
         /// in the data directory when omitted; later starts reuse it.
         #[arg(long, env = TOKEN_ENV, hide_env_values = true)]
         rpc_token: Option<String>,
-        /// Serve Prometheus metrics at `GET /metrics` on this address.
-        #[arg(long)]
-        metrics: Option<SocketAddr>,
         /// Shell command to run on every new main-chain tip, with `%s`
         /// replaced by the block hash.
         #[arg(long)]
@@ -183,12 +204,17 @@ pub enum Command {
         #[arg(long)]
         wallet: PathBuf,
         /// Spending key to import, hex.
-        #[arg(long, conflicts_with = "phrase")]
+        #[arg(long, conflicts_with = "phrase", requires = "restore_through")]
         sk: Option<String>,
         /// Restore from a seed phrase, taken from `SEED_PHRASE` or
         /// prompted. A fresh phrase is generated and printed if not given.
-        #[arg(long)]
+        #[arg(long, requires = "restore_through")]
         phrase: bool,
+        /// Highest new-scheme address index to recover, inclusive (0..4095).
+        /// Use zero for legacy-only recovery; all legacy addresses are scanned.
+        /// Required when restoring a phrase/key; scan costs grow with this range.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(0..4096))]
+        restore_through: Option<u64>,
         /// Account of the seed phrase to use.
         #[arg(long, default_value_t = 0, conflicts_with = "sk")]
         account: u32,
@@ -209,7 +235,7 @@ pub enum Command {
         #[arg(long, default_value = "main")]
         network: Network,
     },
-    /// Show the default address of a wallet.
+    /// Show the current unused receiving address of a wallet.
     Address {
         /// The wallet.
         #[command(flatten)]
@@ -259,17 +285,19 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Run {
             network,
             datadir,
-            listen,
-            advertise,
+            no_p2p,
             connect,
             seed,
-            proxy,
+            addnode,
+            no_seeds,
+            max_outbound,
+            p2p_port,
+            max_inbound,
             mine,
             mining_threads,
             rpc,
             rpc_http,
             rpc_token,
-            metrics,
             blocknotify,
             log_level,
             log_file,
@@ -279,17 +307,19 @@ pub async fn run(cli: Cli) -> Result<()> {
             run_node(RunOptions {
                 network,
                 datadir: node_datadir(datadir, network)?,
-                listen,
-                advertise,
+                p2p: !no_p2p,
                 connect,
                 seed,
-                proxy,
+                addnode,
+                no_seeds,
+                max_outbound,
+                tor: TorConfig { p2p_port },
+                max_inbound,
                 mine,
                 mining_threads,
                 rpc,
                 rpc_http,
                 rpc_token: token,
-                metrics,
                 blocknotify,
             })
             .await
@@ -304,9 +334,17 @@ pub async fn run(cli: Cli) -> Result<()> {
             wallet,
             sk,
             phrase,
+            restore_through,
             account,
             network,
-        } => create_wallet(&wallet, sk.as_deref(), phrase, account, network),
+        } => create_wallet(
+            &wallet,
+            sk.as_deref(),
+            phrase,
+            account,
+            network,
+            restore_through,
+        ),
         Command::BackupWallet {
             wallet,
             out,
@@ -365,6 +403,9 @@ async fn send(
     let payment = Payment { recipient, amount };
     let transaction = build_payment(&wallet, payment, &pk, branch, &mut rand::rngs::OsRng)?;
     let actual_fee = transaction.fee().raw();
+    // Download closes its session before private scanning; proof generation
+    // can also exceed the server's idle deadline. Submit on a fresh connection.
+    let mut client = rpc.connect().await?;
     let txid = client
         .call(&format!("submit {}", to_hex(&transaction.to_vec())))
         .await?;
@@ -389,17 +430,19 @@ fn node_datadir(datadir: Option<PathBuf>, network: Network) -> Result<PathBuf> {
 struct RunOptions {
     network: Network,
     datadir: PathBuf,
-    listen: Option<SocketAddr>,
-    advertise: Option<SocketAddr>,
+    p2p: bool,
     connect: Vec<String>,
     seed: Vec<String>,
-    proxy: Option<SocketAddr>,
+    addnode: Vec<String>,
+    no_seeds: bool,
+    max_outbound: usize,
+    tor: TorConfig,
+    max_inbound: usize,
     mine: Option<String>,
     mining_threads: usize,
     rpc: SocketAddr,
     rpc_http: SocketAddr,
     rpc_token: Option<Token>,
-    metrics: Option<SocketAddr>,
     blocknotify: Option<String>,
 }
 
@@ -407,17 +450,19 @@ async fn run_node(opts: RunOptions) -> Result<()> {
     let RunOptions {
         network,
         datadir,
-        listen,
-        advertise,
+        p2p,
         connect,
         seed,
-        proxy,
+        addnode,
+        no_seeds,
+        max_outbound,
+        tor,
+        max_inbound,
         mine,
         mining_threads,
         rpc,
         rpc_http,
         rpc_token,
-        metrics,
         blocknotify,
     } = opts;
     let mine_to = mine
@@ -427,32 +472,34 @@ async fn run_node(opts: RunOptions) -> Result<()> {
     let token_given = rpc_token.is_some();
     let mut targets = connect;
     targets.extend(seed);
-    targets.extend(network.seeds().iter().map(ToString::to_string));
     let config = Config {
         network,
         datadir,
         cleanup_datadir: false,
-        listen,
-        advertise,
+        offline: false,
+        p2p,
         connect: targets,
-        proxy,
+        addnode,
+        no_seeds,
+        max_outbound,
+        tor,
         mine_to,
         mining_threads,
         rpc: Some(rpc),
         rpc_http: Some(rpc_http),
         rpc_token,
         block_notify: blocknotify,
-        metrics,
-        max_inbound: crate::config::DEFAULT_MAX_INBOUND,
+        max_inbound,
     };
     let shutdown = Shutdown::listen()?;
     let handle = crate::node::spawn(config).await?;
     let log = crate::node::log;
     log(&format!("Rhombus up on the {network} network"));
-    match handle.listen_addr {
-        Some(addr) => log(&format!("peers      listening on {addr}")),
-        None => log("peers      outbound only"),
-    }
+    log(if p2p {
+        "peers      embedded onion service enabled"
+    } else {
+        "peers      outbound only"
+    });
     match handle.rpc_addr {
         Some(addr) => log(&format!("control    {addr}")),
         None => log("control    disabled"),
@@ -460,10 +507,6 @@ async fn run_node(opts: RunOptions) -> Result<()> {
     match handle.rpc_http_addr {
         Some(addr) => log(&format!("json-rpc   http://{addr}/")),
         None => log("json-rpc   disabled"),
-    }
-    match handle.metrics_addr {
-        Some(addr) => log(&format!("metrics    {addr}")),
-        None => log("metrics    disabled"),
     }
     // Say where the token is, or that it was supplied by the operator.
     if token_given {
@@ -510,7 +553,13 @@ fn create_wallet(
     restore: bool,
     account: u32,
     network: Network,
+    restore_through: Option<u64>,
 ) -> Result<()> {
+    if (restore || sk.is_some()) != restore_through.is_some() {
+        return Err(Error::Argument(
+            "restoring a phrase/key requires --restore-through; omit it for a new seed".into(),
+        ));
+    }
     let (sk, fresh) = match (sk, restore) {
         (Some(hex), _) => (sk_from_hex(hex)?, None),
         (None, true) => (seed_phrase()?.spending_key(account)?, None),
@@ -520,18 +569,34 @@ fn create_wallet(
         }
     };
     let genesis = genesis(&network.params()).hash();
-    let created = Wallet::create(path, &sk, genesis, &mut rand::rngs::OsRng)?;
+    let created = match restore_through {
+        Some(last) => Wallet::restore(path, &sk, genesis, last, &mut rand::rngs::OsRng)?,
+        None => Wallet::create(path, &sk, genesis, &mut rand::rngs::OsRng)?,
+    };
     if let Some(phrase) = fresh {
         println!("seed_phrase: {}", *phrase.words());
-        println!("write the seed phrase down; it restores this wallet on any machine");
+        println!("record the seed phrase and highest issued address index for recovery");
     }
+    let receiving = created.current_receive_address()?;
+    let range = created.address_scan_range()?;
+    let last_index = range
+        .end
+        .checked_sub(1)
+        .ok_or_else(|| Error::Argument("wallet address scan range is empty".into()))?;
     println!(
-        "address: {}",
-        created
-            .keys()
-            .default_address()?
-            .encode(network.address_prefix())
+        "scan_address_indices: {}..={} (plus all legacy addresses)",
+        range.start, last_index
     );
+    println!("next_address_index: {}", range.end);
+    match receiving {
+        Some((index, address)) => {
+            println!("address_index: {index}");
+            println!("address: {}", address.encode(network.address_prefix()));
+        }
+        None => println!(
+            "address_rotation_exhausted: true; use another account or wallet for new addresses"
+        ),
+    }
     Ok(())
 }
 
@@ -541,7 +606,6 @@ fn backup_wallet(wallet: &WalletArgs, out: &Path, network: Network) -> Result<()
     let wallet = open_wallet(wallet, genesis)?;
     let bytes = wallet.backup_json()?;
     let mut file = paths::create_private(out)?;
-    use std::io::Write as _;
     file.write_all(&bytes)?;
     file.sync_all()?;
     println!("wrote JSON wallet backup to {}", out.display());
@@ -561,17 +625,16 @@ fn keygen(network: Network) -> Result<()> {
     Ok(())
 }
 
-/// Prints a wallet's default address for `network`.
+/// Prints the wallet's current unused receiving address for `network`.
 fn show_address(wallet: &WalletArgs, network: Network) -> Result<()> {
     let genesis = genesis(&network.params()).hash();
     let wallet = open_wallet(wallet, genesis)?;
-    println!(
-        "{}",
-        wallet
-            .keys()
-            .default_address()?
-            .encode(network.address_prefix())
-    );
+    let (_, address) = wallet.current_receive_address()?.ok_or_else(|| {
+        Error::Argument(
+            "address rotation exhausted; use another account or wallet for new addresses".into(),
+        )
+    })?;
+    println!("{}", address.encode(network.address_prefix()));
     Ok(())
 }
 
@@ -583,16 +646,14 @@ fn network_of(genesis: &BlockHash) -> Result<Network> {
 
 /// The seed phrase from the environment, or prompted on standard input.
 fn seed_phrase() -> Result<SeedPhrase> {
-    let text = match std::env::var(PHRASE_ENV) {
-        Ok(value) => value,
-        Err(_) => {
-            use std::io::Write as _;
-            print!("Seed phrase: ");
-            std::io::stdout().flush()?;
-            let mut text = String::new();
-            std::io::stdin().read_line(&mut text)?;
-            text.trim().to_owned()
-        }
+    let text = if let Ok(value) = std::env::var(PHRASE_ENV) {
+        value
+    } else {
+        print!("Seed phrase: ");
+        std::io::stdout().flush()?;
+        let mut text = String::new();
+        std::io::stdin().read_line(&mut text)?;
+        text.trim().to_owned()
     };
     Ok(SeedPhrase::parse(&text)?)
 }
@@ -608,6 +669,12 @@ fn open_wallet_file(path: &Path, genesis: BlockHash) -> Result<Wallet> {
 
 /// Brings the wallet up to the node's tip, rolling back first if the
 /// node's chain diverged from what the wallet scanned. Returns the tip.
+/// Downloads the public snapshot to an anonymous temporary file before any
+/// scanning, so requests for successive blocks do not expose trial-decryption
+/// or wallet database timing. Memory use is bounded by one block; temporary
+/// disk use is proportional to the missing snapshot and is released on return.
+/// Closes the download session before scanning; callers performing later RPCs
+/// must establish a fresh connection.
 ///
 /// # Errors
 /// Fails on a control socket or wallet error.
@@ -636,13 +703,39 @@ pub async fn sync_wallet(client: &mut impl Control, wallet: &Wallet, light: bool
     } else if height < wallet.next_height()? {
         wallet.rollback_to(height.saturating_sub(1))?;
     }
+    let first = wallet.next_height()?;
+    if first > tip {
+        client.close().await?;
+        return Ok(tip);
+    }
+    let mut downloaded = download_wallet_snapshot(client, first, tip, light).await?;
+    // End-of-session timing must depend on downloading public bytes, not on
+    // the subsequent private scan or database writes.
+    client.close().await?;
     for h in wallet.next_height()?..=tip {
+        let mut length = [0u8; 8];
+        downloaded.read_exact(&mut length)?;
+        let length = usize::try_from(u64::from_le_bytes(length))
+            .map_err(|_| Error::Argument("downloaded block too large".into()))?;
+        if length > MAX_WALLET_BLOCK_BYTES {
+            return Err(Error::Argument("downloaded block too large".into()));
+        }
+        let mut bytes = vec![0; length];
+        downloaded.read_exact(&mut bytes)?;
         if light {
-            wallet.scan_compact(&fetch_compact(client, h).await?)?;
+            let block = CompactBlock::from_slice(&bytes)?;
+            if block.height != h {
+                return Err(Error::Argument("downloaded block height mismatch".into()));
+            }
+            wallet.scan_compact(&block)?;
         } else {
-            let block = fetch_block(client, h).await?;
+            let block = Block::from_slice(&bytes)?;
+            if block.header().height != h {
+                return Err(Error::Argument("downloaded block height mismatch".into()));
+            }
             wallet.scan(&block)?;
         }
+        tokio::task::yield_now().await;
     }
     Ok(tip)
 }
@@ -668,9 +761,36 @@ async fn fetch_hash(client: &mut impl Control, height: u32) -> Result<Option<Blo
     }
 }
 
-async fn fetch_compact(client: &mut impl Control, height: u32) -> Result<CompactBlock> {
-    let hex = client.call(&format!("compact {height}")).await?;
-    Ok(CompactBlock::from_slice(&from_hex(&hex)?)?)
+// The control client's 128 MiB reply limit holds at most 64 MiB of hex data.
+const MAX_WALLET_BLOCK_BYTES: usize = 64 * 1024 * 1024;
+
+async fn download_wallet_snapshot(
+    client: &mut impl Control,
+    first: u32,
+    tip: u32,
+    light: bool,
+) -> Result<std::fs::File> {
+    let mut file = tempfile::tempfile()?;
+    let command = if light { "compact" } else { "block" };
+    for height in first..=tip {
+        let hex = client.call(&format!("{command} {height}")).await?;
+        if hex.len() > MAX_WALLET_BLOCK_BYTES.saturating_mul(2) {
+            return Err(Error::Argument("downloaded block too large".into()));
+        }
+        let bytes = from_hex(&hex)?;
+        let actual = if light {
+            CompactBlock::from_slice(&bytes)?.height
+        } else {
+            Block::from_slice(&bytes)?.header().height
+        };
+        if actual != height {
+            return Err(Error::Argument("downloaded block height mismatch".into()));
+        }
+        file.write_all(&(bytes.len() as u64).to_le_bytes())?;
+        file.write_all(&bytes)?;
+    }
+    file.seek(SeekFrom::Start(0))?;
+    Ok(file)
 }
 
 async fn status_height(client: &mut impl Control) -> Result<u32> {
@@ -696,6 +816,157 @@ mod tests {
     use super::*;
 
     #[test]
+    fn restore_requires_an_explicit_bounded_address_range() {
+        let base = ["rhombus", "create", "--wallet", "unused.redb", "--phrase"];
+        assert!(Cli::try_parse_from(base).is_err());
+        for bound in ["0", "4095"] {
+            assert!(
+                Cli::try_parse_from(base.into_iter().chain(["--restore-through", bound])).is_ok()
+            );
+        }
+        for bound in ["4096", "18446744073709551615"] {
+            assert!(
+                Cli::try_parse_from(base.into_iter().chain(["--restore-through", bound])).is_err()
+            );
+        }
+        assert!(Cli::try_parse_from([
+            "rhombus",
+            "create",
+            "--wallet",
+            "unused.redb",
+            "--sk",
+            "00"
+        ])
+        .is_err());
+    }
+
+    struct SnapshotSource<'a> {
+        wallet: &'a Wallet,
+        blocks: Vec<Block>,
+        light: bool,
+        expected_next: u32,
+        requests: Vec<u32>,
+        fail_at: Option<u32>,
+    }
+
+    impl Control for SnapshotSource<'_> {
+        fn close(&mut self) -> impl std::future::Future<Output = Result<()>> {
+            assert_eq!(
+                self.wallet.next_height().unwrap(),
+                self.expected_next,
+                "end-of-session must precede private scanning"
+            );
+            std::future::ready(Ok(()))
+        }
+
+        fn call(&mut self, line: &str) -> impl std::future::Future<Output = Result<String>> {
+            std::future::ready((|| {
+                // Invariant: no note scanning or database update between requests.
+                assert_eq!(self.wallet.next_height().unwrap(), self.expected_next);
+                if line == "status" {
+                    return Ok(format!("height={}", self.blocks.len().saturating_sub(1)));
+                }
+                let (command, height) = line.split_once(' ').unwrap();
+                let height: u32 = height.parse().unwrap();
+                let block = &self.blocks[height as usize];
+                if command == "hash" {
+                    return Ok(to_hex(block.hash().as_bytes()));
+                }
+                self.requests.push(height);
+                if self.fail_at == Some(height) {
+                    return Err(Error::Stopped);
+                }
+                assert_eq!(command, if self.light { "compact" } else { "block" });
+                Ok(to_hex(&if self.light {
+                    CompactBlock::from_block(block)?.to_vec()
+                } else {
+                    block.to_vec()
+                }))
+            })())
+        }
+    }
+
+    struct ReorgSource<'a>(SnapshotSource<'a>);
+    impl Control for ReorgSource<'_> {
+        async fn close(&mut self) -> Result<()> {
+            self.0.close().await
+        }
+
+        async fn call(&mut self, line: &str) -> Result<String> {
+            self.0.expected_next = if line.starts_with("hash ") || line == "status" {
+                3
+            } else {
+                2
+            };
+            self.0.call(line).await
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_downloads_before_scanning_and_replays_reorganizations() {
+        for light in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let first = genesis(&Network::Test.params());
+            let second = Block::new(
+                protocol::block::empty_header(1, first.hash(), first.header().commitment_root),
+                vec![],
+            );
+            let third = Block::new(
+                protocol::block::empty_header(2, second.hash(), second.header().commitment_root),
+                vec![],
+            );
+            let wallet = Wallet::create(
+                dir.path().join("wallet.redb"),
+                &SpendingKey::from_bytes([42; 32]),
+                first.hash(),
+                &mut rand::rngs::OsRng,
+            )
+            .unwrap();
+            let mut source = SnapshotSource {
+                wallet: &wallet,
+                blocks: vec![first, second, third],
+                light,
+                expected_next: 0,
+                requests: vec![],
+                fail_at: Some(1),
+            };
+            assert!(sync_wallet(&mut source, &wallet, light).await.is_err());
+            assert_eq!(
+                wallet.next_height().unwrap(),
+                0,
+                "failed download must not scan a prefix"
+            );
+            source.requests.clear();
+            source.fail_at = None;
+            assert_eq!(sync_wallet(&mut source, &wallet, light).await.unwrap(), 2);
+            assert_eq!(source.requests, vec![0, 1, 2]);
+            assert_eq!(wallet.next_height().unwrap(), 3);
+            source.expected_next = 3;
+            source.requests.clear();
+            assert_eq!(sync_wallet(&mut source, &wallet, light).await.unwrap(), 2);
+            assert!(
+                source.requests.is_empty(),
+                "up-to-date wallets do not fetch blocks"
+            );
+
+            // Rollback happens before the download; the remaining snapshot is
+            // still fetched without interleaved scanning.
+            let mut replacement = source.blocks[2].header().clone();
+            replacement.timestamp += 1;
+            source.blocks[2] = Block::new(replacement, vec![]);
+            // Hash lookups happen before rollback, so use a separate source
+            // that checks the invariant only for block requests below.
+            let mut reorg = ReorgSource(source);
+            assert_eq!(sync_wallet(&mut reorg, &wallet, light).await.unwrap(), 2);
+            assert_eq!(reorg.0.requests, vec![2]);
+            assert_eq!(
+                wallet.scanned_hash(2).unwrap(),
+                Some(reorg.0.blocks[2].hash())
+            );
+        }
+    }
+
+    #[test]
     fn nodes_use_the_default_or_given_datadir() {
         let dir = tempfile::tempdir().unwrap();
         let chain = dir.path().join("nested").join("chain");
@@ -705,19 +976,45 @@ mod tests {
     }
 
     #[test]
-    fn advertising_requires_a_listener_and_conflicts_with_a_proxy() {
-        let base = ["Rhombus", "run", "--advertise", "8.8.8.8:19000"];
-        assert!(Cli::try_parse_from(base).is_err());
-        let listener = ["--listen", "0.0.0.0:19000"];
-        assert!(Cli::try_parse_from(base.into_iter().chain(listener)).is_ok());
-        for transport in ["--proxy"] {
-            assert!(Cli::try_parse_from(
-                base.into_iter()
-                    .chain(listener)
-                    .chain([transport, "127.0.0.1:9050"])
-            )
-            .is_err());
+    fn embedded_tor_cli_has_no_daemon_or_direct_transport_options() {
+        for flag in [
+            "--advertise",
+            "--proxy",
+            "--listen",
+            "--socks-port",
+            "--tor-binary",
+            "--tor-external",
+        ] {
+            assert!(Cli::try_parse_from(["Rhombus", "run", flag, "127.0.0.1:9050"]).is_err());
         }
+        let target = p2p::address::NetAddr::TorV3([9; 32]).endpoint(19000);
+        let cli = Cli::try_parse_from([
+            "Rhombus",
+            "run",
+            "--addnode",
+            &target,
+            "--addnode",
+            &target,
+            "--no-seeds",
+        ])
+        .unwrap();
+        let Command::Run {
+            no_p2p,
+            no_seeds,
+            addnode,
+            max_outbound,
+            p2p_port,
+            ..
+        } = cli.command
+        else {
+            panic!("run command")
+        };
+        assert!(!no_p2p);
+        assert!(no_seeds);
+        assert_eq!(addnode.len(), 2);
+        assert_eq!(max_outbound, 8);
+        assert_eq!(p2p_port, crate::config::DEFAULT_P2P_PORT);
+        assert!(Cli::try_parse_from(["Rhombus", "status"]).is_err());
     }
 
     /// The network a parsed command is for, if it takes one.

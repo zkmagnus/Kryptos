@@ -1,0 +1,4 @@
+#!/bin/bash
+set -e
+rustup +nightly component add clippy
+cargo +nightly clippy --locked --workspace --all-features --all-targets

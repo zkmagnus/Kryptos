@@ -1,7 +1,8 @@
 //! Diversified payment addresses.
 //!
 //! An address contains a diversifier, a diversified Pallas transmission key,
-//! and a shared ML-KEM encapsulation key. Raw encoding is `d || pk_d || ek`.
+//! and an ML-KEM encapsulation key. New addresses derive a separate ML-KEM key
+//! per diversifier; legacy addresses share one key. Raw encoding is `d || pk_d || ek`.
 //! Text encoding is lowercase hexadecimal of the raw address and a
 //! network-bound checksum.
 use crypto::diversifier::DiversifierIndex;
@@ -44,7 +45,7 @@ pub struct RhombusAddress {
 }
 
 impl RhombusAddress {
-    /// Derives the address for `diversifier` under `ivk`.
+    /// Derives an address with a separate ML-KEM key for `diversifier`.
     ///
     /// # Errors
     /// Fails if the diversifier is invalid.
@@ -53,7 +54,7 @@ impl RhombusAddress {
         Ok(Self {
             diversifier,
             pk_d: ivk.transmission_key(&diversifier)?,
-            ek: fvk.receiver_key().1,
+            ek: fvk.receiver_key_for_diversifier(&diversifier).1,
         })
     }
 
@@ -62,12 +63,36 @@ impl RhombusAddress {
     /// # Errors
     /// Fails if key derivation or the diversifier is invalid.
     pub fn from_index(fvk: &FullViewingKey, index: DiversifierIndex) -> Result<Self> {
+        Self::derive(fvk, fvk.diversifier_key().diversifier(index)?)
+    }
+
+    /// Reconstructs an existing address using the legacy shared ML-KEM key.
+    ///
+    /// # Errors
+    /// Fails if the diversifier or viewing key is invalid.
+    pub fn legacy_derive(fvk: &FullViewingKey, diversifier: Diversifier) -> Result<Self> {
+        let ivk = fvk.incoming_viewing_key()?;
+        Ok(Self {
+            diversifier,
+            pk_d: ivk.transmission_key(&diversifier)?,
+            ek: fvk.receiver_key().1,
+        })
+    }
+
+    /// Reconstructs a legacy address at `index`, preserving its original bytes.
+    ///
+    /// # Errors
+    /// Fails if key derivation or the diversifier is invalid.
+    pub fn legacy_from_index(fvk: &FullViewingKey, index: DiversifierIndex) -> Result<Self> {
         let transmission_key = fvk.receiver_key().1;
         Self::from_index_with_kem(fvk, index, &transmission_key)
     }
 
-    /// Derives the address at `index` using a previously derived ML-KEM key.
-    /// This avoids repeating deterministic key generation for each address.
+    /// Builds the address at `index` using the supplied ML-KEM key verbatim.
+    ///
+    /// This does not derive an address-specific key. It supports reconstruction
+    /// of legacy addresses with their cached shared key. New callers should use
+    /// [`Self::from_index`], or supply the key for this exact diversifier.
     pub fn from_index_with_kem(
         fvk: &FullViewingKey,
         index: DiversifierIndex,
@@ -105,7 +130,7 @@ impl RhombusAddress {
         &self.pk_d
     }
 
-    /// The shared ML-KEM encapsulation key for this viewing key.
+    /// The ML-KEM encapsulation key carried by this address.
     pub fn kem_key(&self) -> &TransmissionKey {
         &self.ek
     }
@@ -354,8 +379,35 @@ mod tests {
         );
         let a1 = RhombusAddress::from_index(&fvk, DiversifierIndex::from(1)).unwrap();
         assert_ne!(a0, a1);
+        assert_ne!(a0.kem_key(), a1.kem_key());
+        let restored = FullViewingKey::from_bytes(&fvk.to_bytes()).unwrap();
+        assert_eq!(
+            a1,
+            RhombusAddress::from_index(&restored, DiversifierIndex::from(1)).unwrap()
+        );
         let recovered = fvk.diversifier_key().index(a1.diversifier()).unwrap();
         assert_eq!(recovered, DiversifierIndex::from(1));
+    }
+
+    #[test]
+    fn legacy_addresses_preserve_the_shared_key_and_encoding() {
+        let fvk = FullViewingKey::derive(&SpendingKey::random(&mut ChaCha20Rng::seed_from_u64(9)))
+            .unwrap();
+        let a0 = RhombusAddress::legacy_from_index(&fvk, DiversifierIndex::ZERO).unwrap();
+        let a1 = RhombusAddress::legacy_from_index(&fvk, DiversifierIndex::from(1)).unwrap();
+        let (_, legacy_key) = fvk.receiver_key();
+        let expected = RhombusAddress::from_parts(*a0.diversifier(), *a0.pk_d(), legacy_key);
+        assert_eq!(a0.to_bytes(), expected.to_bytes());
+        assert_eq!(a0.kem_key(), a1.kem_key());
+        assert_eq!(
+            a0,
+            RhombusAddress::legacy_derive(&fvk, *a0.diversifier()).unwrap()
+        );
+        assert_eq!(RhombusAddress::from_slice(&a1.to_vec()).unwrap(), a1);
+        let new = RhombusAddress::from_index(&fvk, DiversifierIndex::ZERO).unwrap();
+        assert_eq!(new.diversifier(), a0.diversifier());
+        assert_eq!(new.pk_d(), a0.pk_d());
+        assert_ne!(new.kem_key(), a0.kem_key());
     }
 
     #[test]

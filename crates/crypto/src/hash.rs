@@ -48,8 +48,11 @@ pub const DK: Domain = Domain(b"DkDerive________");
 /// Derivation of the ML-KEM seed from full viewing key material.
 pub const KEM_SEED: Domain = Domain(b"KemSeed_________");
 
+/// Derivation of a distinct ML-KEM seed for each address diversifier.
+pub const KEM_ADDRESS_SEED: Domain = Domain(b"KemAddrSeed_____");
+
 /// Master key derivation from a seed.
-pub const ZIP32_MASTER: Domain = Domain(b"IP32Master______");
+pub const RIP1_MASTER: Domain = Domain(b"IP32Master______");
 
 /// Transaction identifier over the effecting data.
 pub const TXID: Domain = Domain(b"TxIdHash________");

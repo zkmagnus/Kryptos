@@ -1,0 +1,10 @@
+services:
+  rhombus:
+    build: .
+    command: ["run", "--datadir", "/data", "--network", "test"]
+    volumes:
+      - node-data:/data
+    stop_grace_period: 1m
+
+volumes:
+  node-data:

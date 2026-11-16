@@ -13,13 +13,14 @@
 //! [`Store::apply`] and [`Store::revert`] each run in one write
 //! transaction, so the tables never disagree after a crash.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use protocol::block::{Block, BlockHash};
 use protocol::bytes::Encodable;
 use protocol::consensus::next_height;
 use protocol::nullifier::Nullifier;
-use protocol::transaction::{Transaction, TxId};
+use protocol::transaction::{Anchor, Transaction, TxId};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::tree::CommitmentTree;
@@ -51,6 +52,15 @@ pub struct Tip {
     pub height: u32,
     /// Hash of the tip block.
     pub hash: BlockHash,
+}
+
+/// A block-state violation found against one consistent chain snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockStateViolation {
+    /// A transaction references an unknown or stale commitment-tree root.
+    UnknownOrStaleAnchor,
+    /// A transaction spends a nullifier already present on the chain.
+    NullifierAlreadySpent,
 }
 
 /// The chain database.
@@ -93,6 +103,48 @@ impl Store {
         }
         tx.commit()?;
         Ok(Self { db })
+    }
+
+    /// Records the original tip and fork before the first reorg mutation.
+    /// The journal remains until either the new chain or recovery is complete.
+    pub fn begin_reorg(&self, original: BlockHash, fork: BlockHash) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        {
+            let mut meta = tx.open_table(META)?;
+            if meta.get("reorg_original")?.is_some() {
+                return Err(Error::Corrupt("unfinished reorganization"));
+            }
+            meta.insert("reorg_original", original.as_bytes())?;
+            meta.insert("reorg_fork", fork.as_bytes())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The unfinished reorg's original tip and fork, if any.
+    pub fn pending_reorg(&self) -> Result<Option<(BlockHash, BlockHash)>> {
+        let tx = self.db.begin_read()?;
+        let meta = tx.open_table(META)?;
+        match (meta.get("reorg_original")?, meta.get("reorg_fork")?) {
+            (None, None) => Ok(None),
+            (Some(original), Some(fork)) => Ok(Some((
+                BlockHash::from_bytes(*original.value()),
+                BlockHash::from_bytes(*fork.value()),
+            ))),
+            _ => Err(Error::Corrupt("incomplete reorganization journal")),
+        }
+    }
+
+    /// Commits completion of a reorg or its recovery.
+    pub fn finish_reorg(&self) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        {
+            let mut meta = tx.open_table(META)?;
+            meta.remove("reorg_original")?;
+            meta.remove("reorg_fork")?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// The current tip, or `None` before genesis.
@@ -175,6 +227,19 @@ impl Store {
         Ok(())
     }
 
+    /// Encoded body size without decoding or allocating its transactions.
+    /// Used to reserve network capacity before loading a stored block.
+    ///
+    /// # Errors
+    /// Fails on a database read error.
+    pub fn block_encoded_len(&self, hash: &BlockHash) -> Result<Option<usize>> {
+        let tx = self.db.begin_read()?;
+        let blocks = tx.open_table(BLOCKS)?;
+        Ok(blocks
+            .get(hash.as_bytes())?
+            .map(|bytes| bytes.value().len()))
+    }
+
     /// The block with the given hash.
     ///
     /// # Errors
@@ -208,6 +273,55 @@ impl Store {
         let tx = self.db.begin_read()?;
         let nullifiers = tx.open_table(NULLIFIERS)?;
         Ok(nullifiers.get(&nullifier.to_bytes())?.is_some())
+    }
+
+    /// Checks all transaction anchors and nullifiers against one chain
+    /// snapshot. Recent frontiers are decoded once for the whole block.
+    ///
+    /// # Errors
+    /// Fails on a database read error or corrupt tip/frontier data.
+    pub fn check_block_state(
+        &self,
+        anchors: &[Anchor],
+        spent_nullifiers: &[Nullifier],
+        max_anchor_age: u32,
+    ) -> Result<Option<BlockStateViolation>> {
+        let read = self.db.begin_read()?;
+        let meta = read.open_table(META)?;
+        let Some(tip_hash) = meta.get(TIP)? else {
+            return Ok(Some(BlockStateViolation::UnknownOrStaleAnchor));
+        };
+        let tip_hash = BlockHash::from_bytes(*tip_hash.value());
+        let blocks = read.open_table(BLOCKS)?;
+        let tip_block = blocks
+            .get(tip_hash.as_bytes())?
+            .ok_or(Error::Corrupt("tip block missing"))?;
+        let tip = Block::from_slice(tip_block.value())?;
+        let tip_height = tip.header().height;
+        let floor = tip_height.saturating_sub(max_anchor_age);
+
+        let frontiers = read.open_table(FRONTIERS)?;
+        let mut unresolved_anchors: HashSet<_> = anchors.iter().map(Anchor::to_bytes).collect();
+        for height in (floor..=tip_height).rev() {
+            if unresolved_anchors.is_empty() {
+                break;
+            }
+            if let Some(bytes) = frontiers.get(height)? {
+                let frontier = CommitmentTree::from_slice(bytes.value())?;
+                unresolved_anchors.remove(&frontier.root().to_bytes());
+            }
+        }
+        if !unresolved_anchors.is_empty() {
+            return Ok(Some(BlockStateViolation::UnknownOrStaleAnchor));
+        }
+
+        let nullifiers = read.open_table(NULLIFIERS)?;
+        for nullifier in spent_nullifiers {
+            if nullifiers.get(&nullifier.to_bytes())?.is_some() {
+                return Ok(Some(BlockStateViolation::NullifierAlreadySpent));
+            }
+        }
+        Ok(None)
     }
 
     /// The commitment tree after the tip, or the empty tree before genesis.
@@ -267,6 +381,9 @@ impl Store {
     /// Fails on a write error.
     pub fn prune_frontiers_below(&self, height: u32) -> Result<()> {
         let tx = self.db.begin_write()?;
+        if tx.open_table(META)?.get("reorg_original")?.is_some() {
+            return Ok(());
+        }
         {
             let mut frontiers = tx.open_table(FRONTIERS)?;
             frontiers.retain(|h, _| h >= height)?;
@@ -567,6 +684,47 @@ mod tests {
     }
 
     #[test]
+    fn block_state_checks_many_anchors_and_nullifiers_together() {
+        let (_dir, store) = temp_store();
+        let mut tree = CommitmentTree::empty();
+        tree.append(&cmx(1)).unwrap();
+        let first_root = tree.root();
+        let genesis = block(0, BlockHash::ZERO);
+        store.apply(&genesis, &tree).unwrap();
+        tree.append(&cmx(2)).unwrap();
+        let latest_root = tree.root();
+        store.apply(&block(1, genesis.hash()), &tree).unwrap();
+
+        assert_eq!(
+            store.check_block_state(&[latest_root], &[], 0).unwrap(),
+            None
+        );
+        assert_eq!(
+            store.check_block_state(&[first_root], &[], 0).unwrap(),
+            Some(BlockStateViolation::UnknownOrStaleAnchor)
+        );
+        assert_eq!(
+            store.check_block_state(&[first_root], &[], 1).unwrap(),
+            None
+        );
+
+        let spent = Nullifier::from_base(&pallas::Base::from(77u64));
+        let write = store.db.begin_write().unwrap();
+        write
+            .open_table(NULLIFIERS)
+            .unwrap()
+            .insert(&spent.to_bytes(), 0)
+            .unwrap();
+        write.commit().unwrap();
+        assert_eq!(
+            store
+                .check_block_state(&[latest_root], &[spent], 1)
+                .unwrap(),
+            Some(BlockStateViolation::NullifierAlreadySpent)
+        );
+    }
+
+    #[test]
     fn pruned_frontiers_are_gone_and_recent_ones_stay() {
         let (_dir, store) = temp_store();
         let mut prev = BlockHash::ZERO;
@@ -620,7 +778,12 @@ mod tests {
     fn put_block_stores_bytes_without_moving_the_tip() {
         let (_dir, store) = temp_store();
         let side = block(5, BlockHash::from_bytes([9; 32]));
+        assert_eq!(store.block_encoded_len(&side.hash()).unwrap(), None);
         store.put_block(&side).unwrap();
+        assert_eq!(
+            store.block_encoded_len(&side.hash()).unwrap(),
+            Some(side.to_vec().len())
+        );
         assert_eq!(store.block(&side.hash()).unwrap(), Some(side));
         assert_eq!(store.tip().unwrap(), None);
     }

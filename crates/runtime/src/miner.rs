@@ -4,6 +4,7 @@ use chain::difficulty::{next_target, Sample};
 use chain::params::ChainParams;
 use chain::pow::RandomXPow;
 use chain::target::Target;
+use p2p::transport::TorStatus;
 use protocol::address::RhombusAddress;
 use protocol::amount::RawCoin;
 use protocol::block::{empty_header, tx_root, Block, BlockHash, BlockHeader, PowSolution};
@@ -27,7 +28,7 @@ use crate::{Error, Result};
 /// Nonces tried per template before asking for a fresh one.
 const NONCES_PER_TEMPLATE: u32 = 32;
 /// How long a worker waits before asking again when the node is not
-/// ready to mine (no peers, or catching up).
+/// ready to mine (Tor unavailable, no peers, or catching up).
 const NOT_READY_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// What a miner needs to build the next block.
@@ -196,6 +197,19 @@ pub fn start(
     events: mpsc::Sender<Event>,
     tip: watch::Receiver<BlockHash>,
 ) -> Miner {
+    start_with_tor(payout, params, threads, events, tip, None)
+}
+
+/// Starts workers that also cancel their current work when the node's
+/// embedded Tor service loses readiness. Offline nodes pass no status.
+pub(crate) fn start_with_tor(
+    payout: RhombusAddress,
+    params: ChainParams,
+    threads: usize,
+    events: mpsc::Sender<Event>,
+    tip: watch::Receiver<BlockHash>,
+    tor_status: Option<watch::Receiver<TorStatus>>,
+) -> Miner {
     let threads = threads.max(1);
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
@@ -215,6 +229,7 @@ pub fn start(
                 pk: Arc::clone(&pk),
                 stop: Arc::clone(&flag),
                 tip: tip.clone(),
+                tor_status: tor_status.clone(),
             };
             workers.push(tokio::spawn(worker.run(events.clone())));
         }
@@ -232,9 +247,17 @@ pub fn start(
 }
 
 /// Whether a worker should try another nonce on a template built on
-/// `parent`: it has not been stopped, and `parent` is still the best tip.
-fn worth_mining(stop: &AtomicBool, tip: &watch::Receiver<BlockHash>, parent: BlockHash) -> bool {
-    !stop.load(Ordering::Relaxed) && *tip.borrow() == parent
+/// `parent`: it has not been stopped, `parent` is still the best tip, and
+/// its embedded Tor service (if any) is ready.
+fn worth_mining(
+    stop: &AtomicBool,
+    tip: &watch::Receiver<BlockHash>,
+    parent: BlockHash,
+    tor_status: Option<&watch::Receiver<TorStatus>>,
+) -> bool {
+    !stop.load(Ordering::Relaxed)
+        && *tip.borrow() == parent
+        && tor_status.is_none_or(crate::tor::service_ready)
 }
 
 /// What one worker needs.
@@ -244,6 +267,7 @@ struct Worker {
     pk: Arc<ProvingKey>,
     stop: Arc<AtomicBool>,
     tip: watch::Receiver<BlockHash>,
+    tor_status: Option<watch::Receiver<TorStatus>>,
 }
 
 impl Worker {
@@ -272,12 +296,13 @@ impl Worker {
                 self.tip.clone(),
                 template.parent.hash(),
             );
+            let tor_status = self.tor_status.clone();
             // Proving and solving are CPU-bound; run them on the blocking pool
             // so many workers use many cores without starving the runtime.
             let found = tokio::task::spawn_blocking(move || {
                 let mut rng = rand::rngs::OsRng;
                 template.mine(&payout, pk.as_ref(), &pow, &mut rng, || {
-                    worth_mining(&stop, &tip, parent)
+                    worth_mining(&stop, &tip, parent, tor_status.as_ref())
                 })
             })
             .await
@@ -306,12 +331,47 @@ mod tests {
         );
         let (tip, watched) = watch::channel(a);
         let stop = AtomicBool::new(false);
-        assert!(worth_mining(&stop, &watched, a));
-        assert!(!worth_mining(&stop, &watched, b), "built on a stale parent");
+        assert!(worth_mining(&stop, &watched, a, None));
+        assert!(
+            !worth_mining(&stop, &watched, b, None),
+            "built on a stale parent"
+        );
         tip.send_replace(b);
-        assert!(!worth_mining(&stop, &watched, a), "the tip moved on");
-        assert!(worth_mining(&stop, &watched, b));
+        assert!(!worth_mining(&stop, &watched, a, None), "the tip moved on");
+        assert!(worth_mining(&stop, &watched, b, None));
         stop.store(true, Ordering::Relaxed);
-        assert!(!worth_mining(&stop, &watched, b), "stopped");
+        assert!(!worth_mining(&stop, &watched, b, None), "stopped");
+    }
+
+    #[test]
+    fn active_work_waits_for_tor_and_stops_on_readiness_loss() {
+        let parent = BlockHash::from_bytes([1; 32]);
+        let (_tip, watched) = watch::channel(parent);
+        let stop = AtomicBool::new(false);
+        let (status, tor) = watch::channel(TorStatus::default());
+        let can_mine = || worth_mining(&stop, &watched, parent, Some(&tor));
+        assert!(!can_mine(), "bootstrap must finish before mining");
+        let ready = TorStatus {
+            client_ready: true,
+            onion: Some(p2p::address::NetAddr::TorV3([2; 32])),
+        };
+        status.send_replace(TorStatus {
+            onion: None,
+            ..ready
+        });
+        assert!(!can_mine(), "the onion service must also be ready");
+        status.send_replace(TorStatus {
+            client_ready: false,
+            ..ready
+        });
+        assert!(!can_mine(), "a service identity alone is insufficient");
+        status.send_replace(ready);
+        assert!(can_mine());
+        status.send_replace(TorStatus::default());
+        assert!(!can_mine(), "Tor loss cancels work even on the same tip");
+        status.send_replace(ready);
+        assert!(can_mine(), "recovery permits work again");
+        drop(status);
+        assert!(!can_mine(), "a stopped supervisor must block mining");
     }
 }

@@ -17,7 +17,7 @@
 //! - [`poseidon`]: the circuit-friendly hash, one typed function per use.
 //! - [`merkle`]: the coin commitment tree primitives.
 //! - [`diversifier`]: diversifier indices and their encryption into diversifiers.
-//! - [`zip32`]: hierarchical derivation of spending keys from a seed.
+//! - [`rip1`]: hierarchical derivation of spending keys from a seed.
 #![cfg_attr(
     test,
     allow(
@@ -38,9 +38,9 @@ pub mod hash;
 pub mod keys;
 pub mod merkle;
 pub mod poseidon;
+pub mod rip1;
 pub mod secret;
 pub mod signature;
-pub mod zip32;
 
 pub use error::Error;
 pub use pasta_curves::pallas;

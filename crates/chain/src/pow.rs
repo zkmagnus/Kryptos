@@ -123,3 +123,31 @@ impl RandomXPow {
         Ok(vm.hash(input))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_bindings_match_the_published_randomx_vectors() {
+        // RandomX upstream vectors test_a/test_b in the vendored
+        // randomx/src/tests/tests.cpp. These exercise the generated FFI and
+        // native library together, independently of Rhombus header encoding.
+        let pow = RandomXPow::new(b"test key 000").unwrap();
+        for (input, expected) in [
+            (
+                b"This is a test".as_slice(),
+                "639183aae1bf4c9a35884cb46b09cad9175f04efd7684e7262a0ac1c2f0b4e3f",
+            ),
+            (
+                b"Lorem ipsum dolor sit amet".as_slice(),
+                "300a0adb47603dedb42228ccb2b211104f4da45af709cd7547cd049e9489c969",
+            ),
+        ] {
+            assert_eq!(
+                crypto::encoding::to_hex(&pow.hash(input).unwrap()),
+                expected
+            );
+        }
+    }
+}

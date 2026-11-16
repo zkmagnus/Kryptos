@@ -98,9 +98,9 @@ upgrade. Transaction bytes and block bytes changed; chain reset is assumed.
 - The previous fee-only workspace audit had all tests pass except
   `wallet::seed::tests::derivation_is_pinned_and_accounts_differ`.
 - That remaining test expects spending key
-  `aeee2840...79dddaf3`, while the unchanged ZIP32 derivation code returns
+  `aeee2840...79dddaf3`, while the unchanged RIP1 derivation code returns
   `88cffd3a...ecd4863a`. The mismatch is present in the committed baseline
-  (`seed.rs` and `zip32.rs` were not changed here); the expected vector needs
+  (`seed.rs` and `rip1.rs` were not changed here); the expected vector needs
   a separate derivation compatibility review.
 - Chain integration tests pass (20/20), including fee-bearing transfers,
   tampered fee rejection, coinbase mint checks, and consensus branch

@@ -1,0 +1,132 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 4 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  CARGO_BUILD_JOBS: "2"
+  # Keep CI artifacts portable; the repository's native target-cpu flag is
+  # intentionally for local builds only.
+  RUSTFLAGS: ""
+
+jobs:
+  format:
+    name: Rust formatting
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain
+      - run: cargo fmt --all -- --check
+      - name: Reject direct networking and local DNS
+        run: python3 scripts/check_tor_network.py
+
+  test:
+    name: Linux build and tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install RandomX build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends build-essential cmake clang libclang-dev pkg-config libssl-dev libsqlite3-dev liblzma-dev libzstd-dev
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain
+      - name: Verify seed reference independently
+        run: python3 scripts/check_seed_vectors.py
+      - name: Check all workspace targets
+        run: cargo check --workspace --all-targets --locked
+      - name: Run workspace Clippy
+        run: cargo clippy --workspace --all-targets --locked
+      - name: Run unit, integration, and documentation tests
+        # Limit concurrent provers/RandomX instances on the hosted runner.
+        run: cargo test --workspace --locked -- --test-threads=2
+
+  portability:
+    name: Portable build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-24.04
+          - name: Linux aarch64
+            os: ubuntu-24.04-arm
+          - name: macOS Intel
+            os: macos-15-intel
+          - name: macOS Apple Silicon
+            os: macos-15
+          - name: Windows MSVC
+            os: windows-2025
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install Linux native dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends build-essential cmake clang libclang-dev pkg-config libssl-dev libsqlite3-dev liblzma-dev libzstd-dev
+      - name: Install macOS native dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew install cmake llvm
+          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+      - name: Install Windows libclang
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install llvm --yes --no-progress
+          "LIBCLANG_PATH=$env:ProgramFiles\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain
+      - name: Build and link portable release binaries
+        run: cargo build --release --locked -p runtime --bins
+      - name: Check portable release vectors and proof validation
+        run: |
+          cargo test --release --locked -p crypto -p circuit -p protocol -- --test-threads=2
+          cargo test --release --locked -p chain --lib pow::tests::native_bindings_match_the_published_randomx_vectors
+      - name: Check native release vectors and proof validation
+        env:
+          # Isolate comparison tests from the portable release artifacts.
+          CARGO_TARGET_DIR: target/native-vectors
+          RUSTFLAGS: "-C target-cpu=native"
+        run: |
+          cargo test --release --locked -p crypto -p circuit -p protocol -- --test-threads=2
+          cargo test --release --locked -p chain --lib pow::tests::native_bindings_match_the_published_randomx_vectors
+
+  dependencies:
+    name: Dependency advisories
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain
+      - name: Install pinned cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Check the lockfile against current RustSec advisories
+        run: cargo audit --deny warnings

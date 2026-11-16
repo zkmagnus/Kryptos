@@ -3,12 +3,12 @@
 //! A phrase is 24 English words carrying 256 bits of entropy. The BIP 39
 //! seed is derived from it with the standard empty BIP 39 passphrase, and the account
 //! spending key is `m / 32' / 1' / account'` of that seed as in
-//! [`crypto::zip32`]. The phrase is the backup: anyone holding it
+//! [`crypto::rip1`]. The phrase is the backup: anyone holding it
 //! holds every account.
 
 use bip39::{Language, Mnemonic};
 use crypto::keys::SpendingKey;
-use crypto::zip32::ExtendedSpendingKey;
+use crypto::rip1::ExtendedSpendingKey;
 use rand_core::{CryptoRng, RngCore};
 use zeroize::Zeroizing;
 
@@ -82,6 +82,7 @@ impl SeedPhrase {
 #[cfg(test)]
 mod tests {
     use crypto::encoding::to_hex;
+    use crypto::rip1::ChildIndex;
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
 
@@ -128,11 +129,18 @@ mod tests {
         let sk1 = phrase.spending_key(1).unwrap();
         assert_ne!(sk0.to_bytes(), sk1.to_bytes());
         assert!(phrase.spending_key(1 << 31).is_err());
-        // Pinned so a change in derivation cannot silently orphan wallets.
+        // Independently checked with Python hashlib; see
+        // docs/seed-derivation-compatibility.md and scripts/check_seed_vectors.py.
+        // Keep production derivation stable so existing wallets retain keys.
         assert_eq!(
             to_hex(&sk0.to_bytes()),
-            "aeee2840de33f371c576fdde22e552725f6e7002c642a64cbfbaa71679dddaf3",
+            "88cffd3a1ae06fdcc3096cfdd5d488961565de3fbc9d981117ba84edecd4863a",
             "account 0 spending key of the all-zero phrase changed"
+        );
+        assert_eq!(
+            to_hex(&sk1.to_bytes()),
+            "7736bcda73926421570caa1d2375dc2d71ddc33c32194be23d78f80658274f84",
+            "account 1 spending key of the all-zero phrase changed"
         );
         let keys = WalletKeys::from_spending_key(sk0).unwrap();
         let address = keys.default_address().unwrap();
@@ -144,6 +152,43 @@ mod tests {
             ),
             Ok(address),
             "account 0 address of the all-zero phrase did not round-trip"
+        );
+    }
+
+    #[test]
+    fn bip39_reference_and_intermediate_derivation_stages_are_pinned() {
+        let phrase = SeedPhrase::parse(ZERO_PHRASE).unwrap();
+        // Official BIP39 all-zero 256-bit entropy vector. TREZOR is only
+        // the reference passphrase; Rhombus production uses the empty one.
+        assert_eq!(
+            to_hex(&phrase.0.to_seed("TREZOR")),
+            concat!(
+                "bda85446c68413707090a52022edd26a1c9462295029f2e60cd7c4f2bbd3097170af",
+                "7a4d73245cafa9c3cca8d561a7c3de6f5d4a10be8ed2a5e608d68f92fcc8"
+            )
+        );
+        let seed = phrase.0.to_seed(SEED_PASSPHRASE);
+        assert_eq!(
+            to_hex(&seed),
+            concat!(
+                "408b285c123836004f4b8842c89324c1f01382450c0d439af345ba7fc49acf705489c",
+                "6fc77dbd4e3dc1dd8cc6bc9f043db8ada1e243c4a0eafb290d399480840"
+            )
+        );
+        let master = ExtendedSpendingKey::master(&seed).unwrap();
+        assert_eq!(
+            to_hex(&master.spending_key().to_bytes()),
+            "939edc84b8082c372f6946ba2ba426a3643f557279559b3948b630c6c38d26b3"
+        );
+        let purpose = master.child(ChildIndex::hardened(32).unwrap()).unwrap();
+        assert_eq!(
+            to_hex(&purpose.spending_key().to_bytes()),
+            "6c7f416029f7af9a825c7708d0104dbcba1bd90389672eb25fbfa12b82a6a48f"
+        );
+        let coin_type = purpose.child(ChildIndex::hardened(1).unwrap()).unwrap();
+        assert_eq!(
+            to_hex(&coin_type.spending_key().to_bytes()),
+            "998868c0baa59b676dde0d0dfbdb0d39663d3ec9a7ea51c96625fceef11d2f75"
         );
     }
 }

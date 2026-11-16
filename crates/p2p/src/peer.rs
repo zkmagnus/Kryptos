@@ -9,9 +9,9 @@ use crate::message::{Inventory, Message, VersionInfo, PROTOCOL_VERSION};
 /// Misbehavior score at which a peer is dropped and banned.
 pub const BAN_THRESHOLD: u32 = 100;
 /// Seconds between pings.
-pub const PING_INTERVAL: u64 = 60;
+pub const PING_INTERVAL: u64 = 120;
 /// Seconds without a pong before disconnecting.
-pub const PING_TIMEOUT: u64 = 120;
+pub const PING_TIMEOUT: u64 = 240;
 /// Inventory items remembered per peer, to avoid re-announcing.
 pub const KNOWN_INVENTORY_CAP: usize = 50_000;
 /// Disconnect reason when the remote side is this node: its version
@@ -231,6 +231,8 @@ pub fn version_info(nonce: u64, best_height: u32, genesis: BlockHash, now: u64) 
         best_height,
         genesis,
         timestamp: now,
+        services: 1,
+        onion: None,
     }
 }
 

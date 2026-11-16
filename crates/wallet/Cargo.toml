@@ -20,6 +20,9 @@ incrementalmerkletree.workspace = true
 bip39 = { version = "2", features = ["rand_core", "zeroize"] }
 serde_json.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 rand.workspace = true
 rand_chacha.workspace = true

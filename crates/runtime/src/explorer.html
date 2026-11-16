@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark light">
+  <meta http-equiv="Content-Security-Policy" content="connect-src 'self'">
   <title>Rhombus Explorer</title>
   <style>
     :root { color-scheme: dark; --bg:#101411; --panel:#181f1a; --line:#303b32; --text:#e8eee8; --muted:#9eaca0; --accent:#9dd6a5; --warn:#f1c779; }
@@ -20,11 +21,11 @@
   <header><div class="eyebrow">Shielded chain explorer</div><h1>Rhombus Explorer</h1><p>Browse the tip, blocks, and transactions on a Rhombus node.</p></header>
   <section class="panel">
     <div class="row">
-      <div class="field"><label for="endpoint">JSON-RPC endpoint</label><input id="endpoint" value="" placeholder="http://127.0.0.1:RPC_PORT/"></div>
+      <div class="field"><label for="endpoint">JSON-RPC endpoint</label><input id="endpoint" value="" readonly></div>
       <div class="field"><label for="token">Node RPC token</label><input id="token" type="password" autocomplete="off" placeholder="Copy from the node's rpc.token file"></div>
       <button id="connect">Connect</button>
     </div>
-    <p class="status" id="connection">The token stays in this tab and is sent to the endpoint you choose.</p>
+    <p class="status" id="connection">The token stays in this tab and is sent only to the node serving this page.</p>
     <div id="tip" class="stats"></div>
   </section>
   <section class="panel" aria-labelledby="metrics-title">
@@ -55,13 +56,13 @@
   const $ = (id) => document.getElementById(id);
   const endpoint = $('endpoint'), token = $('token'), connection = $('connection');
   const output = $('output'), result = $('result'), tip = $('tip');
+  const rpcUrl = new URL('/', location.href);
   let mode = 'block', requestId = 0, refreshTimer = null;
-  endpoint.value = location.origin;
+  endpoint.value = rpcUrl.href;
   function showError(error) { output.hidden = false; result.replaceChildren(); const p=document.createElement('p'); p.className='error'; p.textContent=String(error); result.append(p); }
   async function rpc(method, params=[]) {
-    const url = endpoint.value.trim();
-    if (!url) throw new Error('Isi endpoint JSON-RPC.');
-    const response = await fetch(url, {method:'POST', headers:{'content-type':'application/json','authorization':'Bearer '+token.value}, body:JSON.stringify({jsonrpc:'2.0',id:++requestId,method,params})});
+    if (rpcUrl.origin !== location.origin) throw new Error('RPC must use this page\'s origin.');
+    const response = await fetch(rpcUrl, {method:'POST', mode:'same-origin', redirect:'error', headers:{'content-type':'application/json','authorization':'Bearer '+token.value}, body:JSON.stringify({jsonrpc:'2.0',id:++requestId,method,params})});
     const body = await response.json();
     if (body.error) throw new Error(body.error.message || 'RPC error');
     return body.result;

@@ -28,10 +28,10 @@ must document:
 - activation by network and height, including reorg behavior;
 - test vectors and resource limits.
 
-For the proposed system-call design, changes must also update
-[`SYSTEM-CALL-SPEC.md`](SYSTEM-CALL-SPEC.md). A program must not write
-canonical chain state directly. The kernel validates proofs and effects,
-then applies them atomically.
+Transfers currently use native chain validation; there is no deployed
+system-call dispatcher. Update the relevant protocol document under `docs/`
+when changing these rules. Validation must check proofs and state effects
+before applying canonical chain updates atomically.
 
 Do not make two implementations valid at once without an explicit
 height-based consensus rule. Do not change a program artifact or verifier
@@ -57,6 +57,11 @@ results in the pull request. At minimum, Rust changes should be formatted
 and compile in the affected crate. Consensus and cryptography changes should
 include regression tests for both accepted and rejected cases. ABI changes
 must include canonical encoding, txid/sighash, and public-effect vectors.
+
+The repository CI checks formatting, all-target compilation, workspace tests,
+and dependency advisories. Use the pinned toolchain and commands in the
+[operations guide](docs/operations.md). Existing failures must remain visible;
+do not skip a failing test or broadly ignore advisories to make a change pass.
 
 Do not claim an implementation is audited or secure because tests pass.
 Record benchmark conditions when reporting proof-generation, verification,

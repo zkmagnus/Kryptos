@@ -29,7 +29,9 @@ use crate::encoding::{
     base_from_bytes, base_to_bytes, point_from_bytes, point_to_bytes, Encoded, ENCODED_LEN,
 };
 use crate::encryption::{ReceiverKey, TransmissionKey, KEM_SEED_LEN};
-use crate::hash::{blake2b_short, prf_expand, wide_to_base, wide_to_scalar, DK, KEM_SEED, OVK};
+use crate::hash::{
+    blake2b_short, prf_expand, wide_to_base, wide_to_scalar, DK, KEM_ADDRESS_SEED, KEM_SEED, OVK,
+};
 use crate::poseidon::ivk as poseidon_ivk;
 use crate::secret::{SecretBase, SecretScalar};
 use crate::{Error, Result};
@@ -344,15 +346,36 @@ impl FullViewingKey {
         OutgoingViewingKey(blake2b_short(OVK, &[&rivk, &ak, &nk]))
     }
 
-    /// The ML-KEM key pair derived from this full viewing key.
+    /// The legacy ML-KEM key pair derived from this full viewing key.
     ///
     /// The decapsulation key can detect incoming coins but cannot spend.
-    /// One encapsulation key is shared across the key's diversified addresses.
+    /// One encapsulation key is shared across all legacy diversified addresses.
+    /// New addresses use [`Self::receiver_key_for_diversifier`] instead.
     pub fn receiver_key(&self) -> (ReceiverKey, TransmissionKey) {
         let [rivk, ak, nk] = self.viewing_key_material();
         let mut key = blake2b_short(KEM_SEED, &[&rivk, &ak, &nk]);
         let mut seed = prf_expand(&key, &[KEM_TAG]);
         let pair = ReceiverKey::from_seed(&seed);
+        key.zeroize();
+        seed.zeroize();
+        pair
+    }
+
+    /// The ML-KEM key pair for one address diversifier.
+    ///
+    /// Different diversifiers use separate encapsulation keys, so the public
+    /// key does not link different addresses. The full viewing key can derive
+    /// these keys again after recovery; the diversifier alone cannot.
+    pub fn receiver_key_for_diversifier(
+        &self,
+        diversifier: &Diversifier,
+    ) -> (ReceiverKey, TransmissionKey) {
+        let mut material = self.viewing_key_material();
+        let [rivk, ak, nk] = &material;
+        let mut key = blake2b_short(KEM_ADDRESS_SEED, &[rivk, ak, nk, diversifier.as_bytes()]);
+        let mut seed = prf_expand(&key, &[KEM_TAG]);
+        let pair = ReceiverKey::from_seed(&seed);
+        material.zeroize();
         key.zeroize();
         seed.zeroize();
         pair
@@ -697,6 +720,45 @@ mod tests {
         let fvk = FullViewingKey::derive(&sk(22)).unwrap();
         let again = FullViewingKey::from_bytes(&fvk.to_bytes()).unwrap();
         assert_eq!(fvk.receiver_key().1, again.receiver_key().1);
+    }
+
+    #[test]
+    fn diversified_receiver_keys_are_distinct_and_survive_viewing_key_export() {
+        let fvk = FullViewingKey::derive(&sk(23)).unwrap();
+        let again = FullViewingKey::from_bytes(&fvk.to_bytes()).unwrap();
+        let other = FullViewingKey::derive(&sk(24)).unwrap();
+        let d0 = Diversifier::from_bytes([0; DIVERSIFIER_LEN]);
+        let d1 = Diversifier::from_bytes([1; DIVERSIFIER_LEN]);
+        let a = fvk.receiver_key_for_diversifier(&d0).1;
+        assert_eq!(a, again.receiver_key_for_diversifier(&d0).1);
+        assert_ne!(a, fvk.receiver_key_for_diversifier(&d1).1);
+        assert_ne!(a, other.receiver_key_for_diversifier(&d0).1);
+        assert_ne!(a, fvk.receiver_key().1);
+    }
+
+    #[test]
+    fn diversified_receiver_key_only_decapsulates_its_own_address() {
+        let fvk = FullViewingKey::derive(&sk(25)).unwrap();
+        let d0 = Diversifier::from_bytes([0; DIVERSIFIER_LEN]);
+        let d1 = Diversifier::from_bytes([1; DIVERSIFIER_LEN]);
+        let (receiver, public) = fvk.receiver_key_for_diversifier(&d0);
+        let (other, _) = fvk.receiver_key_for_diversifier(&d1);
+        let (legacy, _) = fvk.receiver_key();
+        let (ciphertext, shared) = public
+            .encapsulate(&mut ChaCha20Rng::seed_from_u64(25))
+            .unwrap();
+        assert_eq!(
+            receiver.decapsulate(&ciphertext).unwrap().as_bytes(),
+            shared.as_bytes()
+        );
+        assert_ne!(
+            other.decapsulate(&ciphertext).unwrap().as_bytes(),
+            shared.as_bytes()
+        );
+        assert_ne!(
+            legacy.decapsulate(&ciphertext).unwrap().as_bytes(),
+            shared.as_bytes()
+        );
     }
 
     #[test]

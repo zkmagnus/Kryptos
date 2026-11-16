@@ -17,20 +17,24 @@
 //! startup and persists in `rpc.token` in its data directory. Later starts
 //! reuse the file unless a token is explicitly given with `--rpc-token`.
 //! It is a shared secret, compared in constant
-//! time; the socket still belongs on localhost or a private network.
+//! time. Optional local RPC listeners bind only to IPv4 localhost; remote
+//! requests arrive directly on streams accepted by the embedded onion service.
 
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crypto::encoding::{from_hex, to_hex};
+use p2p::transport::{Stream, TorNetwork};
 use protocol::bytes::Encodable;
 use protocol::nullifier::Nullifier;
 use protocol::transaction::{Transaction, TxId};
 use rand_core::{CryptoRng, RngCore};
 use subtle::ConstantTimeEq;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::node::{Event, Request, Response, TxStatus};
@@ -39,7 +43,7 @@ use crate::{Error, Result};
 /// File name of the token in a node's data directory.
 pub const TOKEN_FILE: &str = "rpc.token";
 /// How long a client waits for one reply before giving up.
-const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 /// Largest reply a client will buffer. A full block's hex is tens of
 /// megabytes; past this the node is misbehaving and the client bails
 /// rather than allocating without bound.
@@ -116,10 +120,30 @@ impl Token {
     }
 }
 
+/// Binds a local RPC endpoint after enforcing the loopback-only boundary.
+///
+/// # Errors
+/// Rejects any address other than IPv4 localhost or a failed bind.
+pub async fn bind_local(addr: SocketAddr) -> Result<TcpListener> {
+    if addr.ip() != std::net::IpAddr::V4(Ipv4Addr::LOCALHOST) {
+        return Err(Error::Argument("local RPC must bind to 127.0.0.1".into()));
+    }
+    Ok(TcpListener::bind(addr).await?)
+}
+
 /// Serves requests forever, each session behind the token.
 pub async fn serve(listener: TcpListener, events: mpsc::Sender<Event>, token: Token) {
+    let slots = Arc::new(Semaphore::new(32));
     while let Ok((stream, _)) = listener.accept().await {
-        tokio::spawn(session(stream, events.clone(), token.clone()));
+        let Ok(permit) = slots.clone().try_acquire_owned() else {
+            continue;
+        };
+        let events = events.clone();
+        let token = token.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            serve_stream(stream, events, token).await;
+        });
     }
 }
 
@@ -176,25 +200,76 @@ impl Auth {
     }
 }
 
-async fn session(stream: TcpStream, events: mpsc::Sender<Event>, token: Token) {
-    let (read, mut write) = stream.into_split();
-    let mut lines = BufReader::new(read).lines();
+/// Serves one authenticated control connection over an already accepted stream.
+pub async fn serve_stream<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: S,
+    events: mpsc::Sender<Event>,
+    token: Token,
+) {
+    let (read, mut write) = tokio::io::split(stream);
+    let mut reader = BufReader::new(read);
     let mut auth = Auth::new(token);
-    while let Ok(Some(line)) = lines.next_line().await {
+    loop {
+        let limit = if auth.authorized {
+            32 * 1024 * 1024
+        } else {
+            256
+        };
+        let Ok(Ok(Some(line))) = tokio::time::timeout(
+            Duration::from_secs(30),
+            read_bounded_line(&mut reader, limit),
+        )
+        .await
+        else {
+            break;
+        };
         let (reply, close) = match auth.gate(&line) {
             Gate::Pass => (answer(&events, &line).await, false),
             Gate::Reply(text) => (text.to_string(), false),
             Gate::Close(text) => (text.to_string(), true),
         };
-        if write
-            .write_all(format!("{reply}\n").as_bytes())
-            .await
-            .is_err()
-            || close
+        if !matches!(
+            tokio::time::timeout(CALL_TIMEOUT, async {
+                write.write_all(format!("{reply}\n").as_bytes()).await?;
+                write.flush().await
+            })
+            .await,
+            Ok(Ok(()))
+        ) || close
         {
             break;
         }
     }
+}
+
+/// Reads at most `limit` bytes, rejecting an unfinished or oversized line.
+async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    limit: usize,
+) -> std::io::Result<Option<String>> {
+    let mut bytes = Vec::new();
+    let max_read = u64::try_from(limit)
+        .ok()
+        .and_then(|limit| limit.checked_add(1))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "RPC line limit is too large",
+            )
+        })?;
+    reader.take(max_read).read_until(b'\n', &mut bytes).await?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    if bytes.len() > limit || !bytes.ends_with(b"\n") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "RPC line too large or incomplete",
+        ));
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 /// Parses, dispatches and formats one authorized request line.
@@ -313,19 +388,21 @@ pub fn format(response: &Response) -> String {
     }
 }
 
-/// Where a node's control socket is and how to unlock it.
+/// Where a node's onion control service is and how to unlock it.
 #[derive(Clone, Debug)]
 pub struct Endpoint {
-    /// The socket address, as `host:port`.
+    /// The validated onion-service address, as `<v3 hostname>.onion:port`.
     pub addr: String,
     /// The node's token.
     pub token: Token,
+    /// Shared embedded Tor client for this application.
+    pub network: Arc<TorNetwork>,
 }
 
-/// A node reached over a socket or through its in-process event channel.
+/// A node reached over an onion stream or through its in-process event channel.
 #[derive(Clone)]
 pub enum Source {
-    /// An authenticated remote control socket.
+    /// An authenticated remote onion control service.
     Remote(Endpoint),
     /// A node owned by the same application.
     Embedded(mpsc::Sender<Event>),
@@ -348,6 +425,12 @@ impl Source {
 pub trait Control: Send {
     /// Sends a control command and returns its result without framing.
     fn call(&mut self, line: &str) -> impl std::future::Future<Output = Result<String>> + Send;
+
+    /// Ends a download session before private wallet processing. In-process
+    /// sources need no transport shutdown; socket implementations send EOF.
+    fn close(&mut self) -> impl std::future::Future<Output = Result<()>> + Send {
+        async { Ok(()) }
+    }
 }
 
 /// Looks up a transaction on the node's current chain or in its mempool.
@@ -373,13 +456,20 @@ pub async fn transaction_status(client: &mut impl Control, txid: TxId) -> Result
 
 /// A connection to a remote or embedded node.
 pub enum Connection {
-    /// An authenticated socket client.
+    /// An authenticated onion stream client.
     Remote(Client),
     /// A direct event channel; no token or socket is required.
     Embedded(mpsc::Sender<Event>),
 }
 
 impl Control for Connection {
+    async fn close(&mut self) -> Result<()> {
+        match self {
+            Self::Remote(client) => Control::close(client).await,
+            Self::Embedded(_) => Ok(()),
+        }
+    }
+
     async fn call(&mut self, line: &str) -> Result<String> {
         match self {
             Self::Remote(client) => client.call(line).await,
@@ -392,6 +482,11 @@ impl Control for Connection {
 }
 
 impl Control for Client {
+    async fn close(&mut self) -> Result<()> {
+        self.stream.get_mut().shutdown().await?;
+        Ok(())
+    }
+
     async fn call(&mut self, line: &str) -> Result<String> {
         Self::call(self, line).await
     }
@@ -408,31 +503,44 @@ fn decode_reply(reply: &str) -> Result<String> {
 }
 
 impl Endpoint {
+    /// Validates the onion service endpoint.
+    ///
+    /// # Errors
+    /// Rejects direct IP/DNS destinations, malformed onions, and port zero.
+    pub fn validate(&self) -> Result<()> {
+        p2p::address::NetAddr::parse_endpoint(&self.addr)?;
+        Ok(())
+    }
+
     /// Connects and authenticates.
     ///
     /// # Errors
     /// Fails if the socket cannot be reached, or with
     /// [`Error::Unauthorized`] if the token is refused.
     pub async fn connect(&self) -> Result<Client> {
-        Client::connect(&self.addr, &self.token).await
+        self.validate()?;
+        Client::connect(&self.network, &self.addr, &self.token).await
     }
 }
 
 /// A client for the control socket.
 pub struct Client {
-    stream: BufReader<TcpStream>,
+    // Keep the client lifecycle alive for this connection.
+    _network: Arc<TorNetwork>,
+    stream: BufReader<Stream>,
     timeout: Duration,
 }
 
 impl Client {
-    /// Connects to a node's control socket and presents the token.
+    /// Opens an isolated connection through the application's embedded Tor client.
     ///
     /// # Errors
-    /// Fails if the socket cannot be reached, or with
-    /// [`Error::Unauthorized`] if the token is refused.
-    pub async fn connect(addr: &str, token: &Token) -> Result<Self> {
+    /// Fails on unavailable Tor, an invalid onion endpoint, or a rejected token.
+    pub async fn connect(network: &Arc<TorNetwork>, addr: &str, token: &Token) -> Result<Self> {
+        let stream = network.connect(addr).await?;
         let mut client = Self {
-            stream: BufReader::new(TcpStream::connect(addr).await?),
+            _network: Arc::clone(network),
+            stream: BufReader::new(stream),
             timeout: CALL_TIMEOUT,
         };
         match client.call(&format!("auth {}", token.expose())).await {
@@ -448,10 +556,15 @@ impl Client {
     /// # Errors
     /// Returns [`Error::Argument`] carrying the node's error text.
     pub async fn call(&mut self, line: &str) -> Result<String> {
-        self.stream
-            .get_mut()
-            .write_all(format!("{line}\n").as_bytes())
-            .await?;
+        tokio::time::timeout(self.timeout, async {
+            self.stream
+                .get_mut()
+                .write_all(format!("{line}\n").as_bytes())
+                .await?;
+            self.stream.get_mut().flush().await
+        })
+        .await
+        .map_err(|_| Error::Argument("control request timed out".into()))??;
         let reply = tokio::time::timeout(self.timeout, self.read_reply())
             .await
             .map_err(|_| Error::Argument("control socket timed out".into()))??;
@@ -485,6 +598,96 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn control_endpoints_require_valid_onions() {
+        let onion = format!("{}:18444", p2p::address::NetAddr::TorV3([4; 32]));
+        let endpoint = Endpoint {
+            addr: onion,
+            token: Token::new("node").unwrap(),
+            network: p2p::transport::test_support::network(
+                p2p::address::NetAddr::TorV3([44; 32]),
+                &[],
+            )
+            .0,
+        };
+        assert!(endpoint.validate().is_ok());
+        for addr in [
+            "127.0.0.1:18444",
+            "localhost:18444",
+            "example.com:18444",
+            "bad.onion:18444",
+        ] {
+            assert!(Endpoint {
+                addr: addr.into(),
+                ..endpoint.clone()
+            }
+            .validate()
+            .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn closing_a_download_session_sends_eof_before_private_processing() {
+        let (client_stream, stream) = tokio::io::duplex(4096);
+        let server = tokio::spawn(async move {
+            let mut reader = BufReader::new(stream);
+            let mut auth = String::new();
+            reader.read_line(&mut auth).await.unwrap();
+            assert_eq!(auth, "auth test-token\n");
+            reader.get_mut().write_all(b"ok\n").await.unwrap();
+            let mut remaining = Vec::new();
+            reader.read_to_end(&mut remaining).await.unwrap()
+        });
+        let mut client = Client {
+            _network: p2p::transport::test_support::network(
+                p2p::address::NetAddr::TorV3([45; 32]),
+                &[],
+            )
+            .0,
+            stream: BufReader::new(Stream::Memory(client_stream)),
+            timeout: CALL_TIMEOUT,
+        };
+        client.call("auth test-token").await.unwrap();
+        Control::close(&mut client).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), server)
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        // The client object remains alive; EOF does not wait for scope exit.
+        drop(client);
+    }
+
+    #[tokio::test]
+    async fn bounded_lines_reject_oversized_data_without_waiting_for_newline() {
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        writer.write_all(&[b'x'; 257]).await.unwrap();
+        let mut reader = BufReader::new(reader);
+        let result =
+            tokio::time::timeout(Duration::from_secs(1), read_bounded_line(&mut reader, 256))
+                .await
+                .unwrap();
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        // Writer is still open: rejection did not depend on EOF.
+        drop(writer);
+    }
+
+    #[tokio::test]
+    async fn bounded_lines_preserve_pipelined_requests() {
+        let mut reader = BufReader::new(&b"auth secret\nstatus\n"[..]);
+        assert_eq!(
+            read_bounded_line(&mut reader, 256).await.unwrap().unwrap(),
+            "auth secret\n"
+        );
+        assert_eq!(
+            read_bounded_line(&mut reader, 256).await.unwrap().unwrap(),
+            "status\n"
+        );
+        assert!(read_bounded_line(&mut reader, 256).await.unwrap().is_none());
+    }
+
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
 
@@ -624,15 +827,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_silent_node_times_out_instead_of_hanging() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        // Accept and then stay silent.
-        tokio::spawn(async move {
-            let _held = listener.accept().await.unwrap();
-            tokio::time::sleep(Duration::from_secs(5)).await;
-        });
+        let (stream, _held) = tokio::io::duplex(4096);
         let mut client = Client {
-            stream: BufReader::new(TcpStream::connect(addr).await.unwrap()),
+            _network: p2p::transport::test_support::network(
+                p2p::address::NetAddr::TorV3([45; 32]),
+                &[],
+            )
+            .0,
+            stream: BufReader::new(Stream::Memory(stream)),
             timeout: Duration::from_millis(100),
         };
         assert!(matches!(
@@ -643,14 +845,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_closed_node_is_an_error_not_a_hang() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        // Accept then immediately close.
-        tokio::spawn(async move {
-            let _ = listener.accept().await.unwrap();
-        });
+        let (stream, server) = tokio::io::duplex(4096);
+        drop(server);
         let mut client = Client {
-            stream: BufReader::new(TcpStream::connect(addr).await.unwrap()),
+            _network: p2p::transport::test_support::network(
+                p2p::address::NetAddr::TorV3([45; 32]),
+                &[],
+            )
+            .0,
+            stream: BufReader::new(Stream::Memory(stream)),
             timeout: Duration::from_secs(2),
         };
         assert!(client.call("status").await.is_err());
@@ -658,21 +861,35 @@ mod tests {
 
     #[tokio::test]
     async fn sessions_need_the_token_and_clients_present_it() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
+        let identity = p2p::address::NetAddr::TorV3([43; 32]);
+        let (server_network, mut incoming) =
+            p2p::transport::test_support::network(identity, &[18444]);
+        let network =
+            p2p::transport::test_support::network(p2p::address::NetAddr::TorV3([46; 32]), &[]).0;
+        let addr = identity.endpoint(18444);
         let token = Token::new("hunter2").unwrap();
-        tokio::spawn(serve(listener, fake_node(), token.clone()));
+        let server_token = token.clone();
+        tokio::spawn(async move {
+            let _service = server_network;
+            while let Some(incoming) = incoming.recv().await {
+                tokio::spawn(serve_stream(
+                    incoming.stream,
+                    fake_node(),
+                    server_token.clone(),
+                ));
+            }
+        });
 
         assert!(matches!(
-            Client::connect(&addr, &Token::new("wrong").unwrap()).await,
+            Client::connect(&network, &addr, &Token::new("wrong").unwrap()).await,
             Err(Error::Unauthorized)
         ));
-        let mut client = Client::connect(&addr, &token).await.unwrap();
+        let mut client = Client::connect(&network, &addr, &token).await.unwrap();
         assert!(client.call("status").await.unwrap().contains("height=42"));
 
         // A raw session: commands before auth are refused, the third
         // refusal closes the connection.
-        let mut raw = BufReader::new(TcpStream::connect(&addr).await.unwrap());
+        let mut raw = BufReader::new(network.connect(&addr).await.unwrap());
         let mut line = String::new();
         for _ in 0..3 {
             raw.get_mut().write_all(b"status\n").await.unwrap();

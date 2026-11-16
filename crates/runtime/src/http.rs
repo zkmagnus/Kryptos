@@ -1,8 +1,7 @@
 //! The smallest HTTP/1.1 server the JSON-RPC and metrics
 //! endpoints need: read one request, answer one response, close.
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{Error, Result};
 
@@ -43,7 +42,22 @@ impl Request {
 /// # Errors
 /// Fails on a socket error, a head over [`MAX_HEAD`], a malformed
 /// request line, or a body over `max_body`.
-pub async fn read_request(stream: &mut TcpStream, max_body: usize) -> Result<Request> {
+pub async fn read_request<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    max_body: usize,
+) -> Result<Request> {
+    read_request_if(stream, max_body, |_| true).await
+}
+
+/// Reads the head first; a refused request is returned without reading its body.
+///
+/// # Errors
+/// Fails on socket errors, oversized headers/body, or a malformed request head.
+pub async fn read_request_if<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    max_body: usize,
+    accept: impl FnOnce(&Request) -> bool,
+) -> Result<Request> {
     let mut buffer = Vec::new();
     let head_end = loop {
         if let Some(end) = find_head_end(&buffer) {
@@ -61,6 +75,21 @@ pub async fn read_request(stream: &mut TcpStream, max_body: usize) -> Result<Req
     };
     let head = String::from_utf8_lossy(buffer.get(..head_end).unwrap_or(&[])).into_owned();
     let (method, path, headers) = parse_head(&head)?;
+    let request = Request {
+        method,
+        path,
+        headers,
+        body: Vec::new(),
+    };
+    if !accept(&request) {
+        return Ok(request);
+    }
+    let Request {
+        method,
+        path,
+        headers,
+        ..
+    } = request;
     let length: usize = headers
         .iter()
         .find(|(n, _)| n == "content-length")
@@ -124,7 +153,7 @@ fn parse_head(head: &str) -> Result<(String, String, Headers)> {
 ///
 /// # Errors
 /// Fails on a socket error.
-pub async fn read_get_path(stream: &mut TcpStream) -> Result<Option<String>> {
+pub async fn read_get_path<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Option<String>> {
     match read_request(stream, MAX_REQUEST).await {
         Ok(request) => Ok((request.method == "GET").then_some(request.path)),
         Err(Error::Io(error)) => Err(Error::Io(error)),
@@ -136,7 +165,11 @@ pub async fn read_get_path(stream: &mut TcpStream) -> Result<Option<String>> {
 ///
 /// # Errors
 /// Fails on a socket error.
-pub async fn respond(stream: &mut TcpStream, status: &str, body: &str) -> Result<()> {
+pub async fn respond<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    status: &str,
+    body: &str,
+) -> Result<()> {
     respond_with(stream, status, "text/plain; version=0.0.4", body.as_bytes()).await
 }
 
@@ -144,8 +177,8 @@ pub async fn respond(stream: &mut TcpStream, status: &str, body: &str) -> Result
 ///
 /// # Errors
 /// Fails on a socket error.
-pub async fn respond_with(
-    stream: &mut TcpStream,
+pub async fn respond_with<S: AsyncWrite + Unpin>(
+    stream: &mut S,
     status: &str,
     content_type: &str,
     body: &[u8],
@@ -154,13 +187,43 @@ pub async fn respond_with(
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
-    stream.write_all(head.as_bytes()).await?;
-    stream.write_all(body).await?;
+    tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        stream.write_all(head.as_bytes()).await?;
+        stream.write_all(body).await?;
+        stream.flush().await
+    })
+    .await
+    .map_err(|_| Error::Argument("HTTP response timed out".into()))??;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn refused_headers_do_not_wait_for_the_declared_body() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request_if(&mut stream, 32 * 1024 * 1024, |_| false)
+                .await
+                .unwrap()
+        });
+        let mut client = p2p::transport::connect_loopback_for_tests(addr)
+            .await
+            .unwrap();
+        client
+            .write_all(b"POST / HTTP/1.1\r\nContent-Length: 33554432\r\n\r\n")
+            .await
+            .unwrap();
+        let request = tokio::time::timeout(std::time::Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.body, [] as [u8; 0]);
+        assert_eq!(request.method, "POST");
+    }
+
     use tokio::net::TcpListener;
 
     use super::*;
@@ -185,7 +248,9 @@ mod tests {
             respond(&mut stream, "200 OK", "hi").await.unwrap();
             first
         });
-        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut client = p2p::transport::connect_loopback_for_tests(addr)
+            .await
+            .unwrap();
         client
             .write_all(
                 b"POST /rpc HTTP/1.1\r\nAuthorization: Bearer t\r\nContent-Length: 5\r\n\r\nhel",
@@ -207,7 +272,9 @@ mod tests {
             let (mut stream, _) = listener.accept().await.unwrap();
             read_request(&mut stream, 4).await
         });
-        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut client = p2p::transport::connect_loopback_for_tests(addr)
+            .await
+            .unwrap();
         client
             .write_all(b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello")
             .await
@@ -231,7 +298,9 @@ mod tests {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 read_get_path(&mut stream).await.unwrap()
             });
-            let mut client = TcpStream::connect(addr).await.unwrap();
+            let mut client = p2p::transport::connect_loopback_for_tests(addr)
+                .await
+                .unwrap();
             client.write_all(raw).await.unwrap();
             client.shutdown().await.unwrap();
             assert_eq!(server.await.unwrap().as_deref(), expected);

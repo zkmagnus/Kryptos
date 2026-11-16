@@ -35,6 +35,7 @@ pub mod paths;
 mod peers_file;
 pub mod rpc;
 pub mod shutdown;
+pub mod tor;
 pub mod walletd;
 
 pub use error::Error;

@@ -16,7 +16,7 @@ use crate::{Error, Result};
 /// Block requests kept in flight at once.
 pub const MAX_IN_FLIGHT: usize = 16;
 /// Seconds before an unanswered block request is retried.
-pub const REQUEST_TIMEOUT: u64 = 60;
+pub const REQUEST_TIMEOUT: u64 = 300;
 /// More headers are requested only while fewer than this are queued.
 pub const HEADERS_LOW_WATER: usize = 2 * MAX_HEADERS;
 /// Most headers queued for download at once: the low-water mark plus one
@@ -114,41 +114,55 @@ impl BlockSync {
         self.last_header.as_ref()
     }
 
-    /// Accepts a headers message. `known` says whether we already have
-    /// the block, so those are skipped; the rest must chain, from a known
-    /// parent or from the last accepted header.
+    /// Accepts a requested headers message. `known` says whether we already
+    /// have a block, so its body can be skipped. The first response starts
+    /// at a known parent; every subsequent header must directly extend the
+    /// last accepted header, even when both blocks are already known.
     ///
     /// # Errors
-    /// Returns [`Error::BadHeaders`] on a gap, an out-of-order header, or
-    /// more headers than the queue may hold.
+    /// Returns [`Error::BadHeaders`] on an unsolicited response, a gap,
+    /// an out-of-order header, or more headers than the queue may hold.
+    /// A rejected response leaves the download state unchanged.
     pub fn on_headers(
         &mut self,
         headers: &[BlockHeader],
         known: impl Fn(&BlockHash) -> bool,
     ) -> Result<Progress> {
-        self.headers_outstanding = false;
-        self.exhausted = headers.len() < MAX_HEADERS;
+        if !self.headers_outstanding {
+            return Err(Error::BadHeaders("unsolicited headers"));
+        }
+        if headers.len() > MAX_HEADERS {
+            return Err(Error::BadHeaders("too many headers"));
+        }
         if self.queue.len().saturating_add(headers.len()) > MAX_QUEUED_HEADERS {
             return Err(Error::BadHeaders("queue full"));
         }
-        let mut queued: usize = 0;
+        let mut pending = Vec::new();
+        let mut last = self.last_header.as_ref();
         for header in headers {
             let hash = header.hash();
-            let chains = known(&header.prev_hash)
-                || self.last_header.as_ref().is_some_and(|last| {
-                    last.hash() == header.prev_hash
-                        && last.height.saturating_add(1) == header.height
-                });
+            let chains = match last {
+                Some(parent) => {
+                    parent.hash() == header.prev_hash
+                        && parent.height.checked_add(1) == Some(header.height)
+                }
+                None => known(&header.prev_hash),
+            };
             if !chains {
                 return Err(Error::BadHeaders("gap"));
             }
-            self.last_header = Some(header.clone());
-            if known(&hash) {
-                continue;
+            last = Some(header);
+            if !known(&hash) {
+                pending.push(header.clone());
             }
-            self.queue.push_back(header.clone());
-            queued = queued.saturating_add(1);
         }
+        let queued = pending.len();
+        self.queue.extend(pending);
+        if let Some(header) = headers.last() {
+            self.last_header = Some(header.clone());
+        }
+        self.headers_outstanding = false;
+        self.exhausted = headers.len() < MAX_HEADERS;
         Ok(Progress {
             queued,
             exhausted: self.exhausted,
@@ -181,7 +195,23 @@ impl BlockSync {
         requests
     }
 
-    /// Records a received block; returns whether it was expected.
+    /// Whether this block is still awaiting successful import.
+    pub fn expects(&self, hash: &BlockHash) -> bool {
+        self.in_flight.contains_key(hash)
+    }
+
+    /// Restarts the deadline for an unresolved block requested again after
+    /// its missing parent becomes available. Returns whether it was expected.
+    pub fn retry(&mut self, hash: &BlockHash, now: u64) -> bool {
+        let Some(sent) = self.in_flight.get_mut(hash) else {
+            return false;
+        };
+        *sent = now;
+        true
+    }
+
+    /// Acknowledges a successfully imported block; returns whether it was
+    /// expected. Receipt alone must not remove an unresolved dependency.
     pub fn on_block(&mut self, hash: &BlockHash) -> bool {
         self.in_flight.remove(hash).is_some()
     }
@@ -282,29 +312,6 @@ mod tests {
             bad.on_headers(&headers[2..], |h| *h == headers[0].hash()),
             Err(Error::BadHeaders(_))
         ));
-        let mut continued = BlockSync::new();
-        continued
-            .on_headers(&headers[1..3], |h| *h == headers[0].hash())
-            .unwrap();
-        assert_eq!(
-            continued
-                .on_headers(&headers[3..], |_| false)
-                .unwrap()
-                .queued,
-            2
-        );
-    }
-
-    /// Feeds `headers` in full-size messages and returns the queue length
-    /// after each.
-    fn feed_full_messages(sync: &mut BlockSync, headers: &[BlockHeader]) -> Vec<usize> {
-        headers
-            .chunks(MAX_HEADERS)
-            .map(|chunk| {
-                sync.on_headers(chunk, |_| false).unwrap();
-                sync.queued()
-            })
-            .collect()
     }
 
     #[test]
@@ -323,7 +330,8 @@ mod tests {
         assert_eq!(from, headers[MAX_HEADERS].hash());
         assert_eq!(sync.next_headers_request(), None, "one at a time");
 
-        feed_full_messages(&mut sync, &headers[MAX_HEADERS + 1..]);
+        sync.on_headers(&headers[MAX_HEADERS + 1..], |_| false)
+            .unwrap();
         assert_eq!(sync.queued(), HEADERS_LOW_WATER);
         assert_eq!(sync.next_headers_request(), None, "queue at the mark");
 
@@ -335,17 +343,23 @@ mod tests {
     }
 
     #[test]
-    fn a_full_queue_rejects_further_headers_and_exhaustion_stops_requests() {
+    fn unsolicited_headers_cannot_overfill_queue_and_exhaustion_stops_requests() {
         let headers = chain(u32::try_from(MAX_QUEUED_HEADERS + 2).unwrap());
         let mut sync = BlockSync::new();
         sync.on_headers(&headers[1..=MAX_HEADERS], |h| *h == headers[0].hash())
             .unwrap();
-        let lengths = feed_full_messages(&mut sync, &headers[MAX_HEADERS + 1..=MAX_QUEUED_HEADERS]);
-        assert_eq!(lengths.last(), Some(&MAX_QUEUED_HEADERS));
+        assert!(sync.next_headers_request().is_some());
+        sync.on_headers(&headers[MAX_HEADERS + 1..=HEADERS_LOW_WATER], |_| false)
+            .unwrap();
+        assert_eq!(sync.queued(), HEADERS_LOW_WATER);
+        assert_eq!(sync.next_headers_request(), None);
         assert!(matches!(
-            sync.on_headers(&headers[MAX_QUEUED_HEADERS + 1..], |_| false),
-            Err(Error::BadHeaders("queue full"))
+            sync.on_headers(&headers[HEADERS_LOW_WATER + 1..=MAX_QUEUED_HEADERS], |_| {
+                false
+            }),
+            Err(Error::BadHeaders("unsolicited headers"))
         ));
+        assert_eq!(sync.queued(), HEADERS_LOW_WATER);
 
         let mut short = BlockSync::new();
         short
@@ -353,6 +367,108 @@ mod tests {
             .unwrap();
         assert!(short.exhausted());
         assert_eq!(short.next_headers_request(), None);
+    }
+
+    #[test]
+    fn repeated_known_headers_are_rejected_without_advancing_state() {
+        let headers = chain(3);
+        let repeated = vec![headers[1].clone(); MAX_HEADERS];
+        let mut sync = BlockSync::new();
+        assert!(matches!(
+            sync.on_headers(&repeated, |_| true),
+            Err(Error::BadHeaders("gap"))
+        ));
+        assert!(sync.is_idle());
+        assert!(!sync.exhausted());
+        assert!(sync.last_header().is_none());
+        // Rejection preserves the outstanding request, so an honest response
+        // can still fulfill it instead of being treated as unsolicited.
+        let progress = sync
+            .on_headers(&headers[1..], |hash| *hash == headers[0].hash())
+            .unwrap();
+        assert_eq!(progress.queued, 2);
+    }
+
+    #[test]
+    fn known_parents_do_not_allow_gaps_or_partial_queue_updates() {
+        let headers = chain(5);
+        let mut sync = BlockSync::new();
+        let disordered = [headers[1].clone(), headers[3].clone()];
+        assert!(matches!(
+            sync.on_headers(&disordered, |hash| {
+                *hash == headers[0].hash() || *hash == headers[2].hash()
+            }),
+            Err(Error::BadHeaders("gap"))
+        ));
+        // The first unknown header must not have leaked into the queue.
+        assert!(sync.is_idle());
+        assert!(sync.last_header().is_none());
+        assert!(!sync.exhausted());
+        let progress = sync
+            .on_headers(&headers[1..], |hash| *hash == headers[0].hash())
+            .unwrap();
+        assert_eq!(progress.queued, 4);
+    }
+
+    #[test]
+    fn continuation_must_extend_requested_hash_even_when_replayed_blocks_are_known() {
+        let headers = chain(u32::try_from(MAX_HEADERS + 3).unwrap());
+        let mut sync = BlockSync::new();
+        let progress = sync
+            .on_headers(&headers[1..=MAX_HEADERS], |_| true)
+            .unwrap();
+        assert_eq!(progress.queued, 0);
+        assert!(!progress.exhausted);
+        assert_eq!(
+            sync.next_headers_request(),
+            Some(headers[MAX_HEADERS].hash())
+        );
+        assert!(matches!(
+            sync.on_headers(&headers[1..=MAX_HEADERS], |_| true),
+            Err(Error::BadHeaders("gap"))
+        ));
+        assert_eq!(
+            sync.last_header().unwrap().hash(),
+            headers[MAX_HEADERS].hash()
+        );
+        assert!(!sync.exhausted());
+        assert!(sync.is_idle());
+
+        let progress = sync
+            .on_headers(&headers[MAX_HEADERS + 1..], |_| false)
+            .unwrap();
+        assert_eq!(progress.queued, 2);
+        assert!(progress.exhausted);
+        assert_eq!(sync.next_headers_request(), None);
+    }
+
+    #[test]
+    fn response_size_and_solicitation_are_enforced_atomically() {
+        let headers = chain(u32::try_from(MAX_HEADERS + 2).unwrap());
+        let mut sync = BlockSync::new();
+        assert!(matches!(
+            sync.on_headers(&headers[1..], |_| true),
+            Err(Error::BadHeaders("too many headers"))
+        ));
+        assert!(sync.last_header().is_none());
+        assert!(sync.is_idle());
+        assert!(!sync.exhausted());
+        sync.on_headers(&headers[1..=MAX_HEADERS], |_| true)
+            .unwrap();
+        assert!(matches!(
+            sync.on_headers(&[], |_| true),
+            Err(Error::BadHeaders("unsolicited headers"))
+        ));
+        assert!(!sync.exhausted());
+        assert!(sync.next_headers_request().is_some());
+        let done = sync.on_headers(&[], |_| true).unwrap();
+        assert_eq!(done.queued, 0);
+        assert!(done.exhausted);
+        assert!(sync.is_idle());
+        assert_eq!(
+            sync.last_header().unwrap().height,
+            u32::try_from(MAX_HEADERS).unwrap()
+        );
     }
 
     #[test]
@@ -369,5 +485,29 @@ mod tests {
         let expired = sync.timeouts(REQUEST_TIMEOUT);
         assert_eq!(expired.len(), MAX_IN_FLIGHT);
         assert_eq!(sync.in_flight(), 0);
+    }
+
+    #[test]
+    fn unresolved_bodies_remain_expected_and_retry_extends_the_deadline() {
+        let headers = chain(3);
+        let mut sync = BlockSync::new();
+        sync.on_headers(&headers[1..], |hash| *hash == headers[0].hash())
+            .unwrap();
+        sync.next_requests(0);
+        let parent = headers[1].hash();
+        let child = headers[2].hash();
+        assert!(sync.expects(&child));
+        // An out-of-order child has not been successfully imported, so it
+        // remains tracked while its parent is acknowledged.
+        assert!(sync.on_block(&parent));
+        assert!(!sync.expects(&parent));
+        assert!(sync.expects(&child));
+        assert!(!sync.is_idle());
+        assert!(sync.retry(&child, REQUEST_TIMEOUT - 1));
+        assert!(!sync.retry(&parent, REQUEST_TIMEOUT - 1));
+        assert_eq!(sync.timeouts(REQUEST_TIMEOUT), [] as [BlockHash; 0]);
+        assert_eq!(sync.timeouts(2 * REQUEST_TIMEOUT - 1), vec![child]);
+        assert!(!sync.expects(&child));
+        assert!(sync.is_idle());
     }
 }

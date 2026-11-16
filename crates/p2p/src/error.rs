@@ -15,9 +15,12 @@ pub enum Error {
     /// A list in a message exceeds its limit.
     #[error("list too long: {0}")]
     ListTooLong(&'static str),
-    /// The Noise handshake or transport failed.
-    #[error("noise: {0}")]
-    Noise(String),
+    /// An address is not a supported, valid Tor v3 service.
+    #[error("invalid peer address: {0}")]
+    BadAddress(&'static str),
+    /// The embedded Tor client or service failed.
+    #[error("embedded Tor failed: {0}")]
+    Tor(String),
     /// The socket failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -36,10 +39,4 @@ pub enum Error {
     /// A saved address book does not decode.
     #[error("bad address book snapshot: {0}")]
     BadSnapshot(&'static str),
-}
-
-impl From<snow::Error> for Error {
-    fn from(error: snow::Error) -> Self {
-        Self::Noise(error.to_string())
-    }
 }

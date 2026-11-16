@@ -1,4 +1,4 @@
-//! Networking: the wire protocol, encrypted transport, peer state, address
+//! Networking: the Tor-only wire protocol, peer state, address
 //! book, headers-first sync and Dandelion++ relay.
 //!
 //! Every protocol state machine here is pure: it takes messages, time and
@@ -7,12 +7,12 @@
 //!
 //! - [`message`]: the message set and its canonical encoding.
 //! - [`codec`]: length-prefixed framing of messages on a byte stream.
-//! - [`noise`]: the Noise NN encrypted session, chunked for large messages.
+//! - [`address`]: validated Tor v3 identities and address encoding.
 //! - [`peer`]: handshake, keepalive and misbehavior scoring for one peer.
 //! - [`addrbook`]: known addresses, bans and connection candidates.
 //! - [`sync`]: locators and headers-first block download.
 //! - [`dandelion`]: stem and fluff routing of transactions.
-//! - [`transport`]: a TCP connection running the encrypted framed protocol,
+//! - [`transport`]: a Tor stream running the framed application protocol,
 //!   split into reader and writer halves.
 #![cfg_attr(
     test,
@@ -25,11 +25,11 @@
 )]
 
 pub mod addrbook;
+pub mod address;
 pub mod codec;
 pub mod dandelion;
 mod error;
 pub mod message;
-pub mod noise;
 pub mod peer;
 mod random;
 pub mod sync;

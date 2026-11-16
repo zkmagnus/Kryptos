@@ -3,6 +3,7 @@
 //! a per-list limit. There is no user agent and no optional field: every
 //! node speaks exactly the same bytes.
 
+use crate::address::{NetAddr, PeerKey};
 use protocol::block::{Block, BlockHash, BlockHeader};
 use protocol::bytes::{Encodable, Reader, Writer};
 use protocol::consensus::MAX_BLOCK_TRANSACTIONS;
@@ -11,7 +12,7 @@ use protocol::transaction::{Transaction, TxId};
 use crate::{Error, Result};
 
 /// The only protocol version.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 3;
 /// Upper bound on one encoded message, large enough for a maximum-size block.
 pub const MAX_MESSAGE_LEN: usize = 50 * 1024 * 1024;
 /// Most inventory items in one message.
@@ -36,13 +37,17 @@ pub struct VersionInfo {
     pub genesis: BlockHash,
     /// Sender's clock, seconds since the epoch.
     pub timestamp: u64,
+    /// Advertised application capabilities; bit zero means full block service.
+    pub services: u64,
+    /// Claimed onion endpoint; inbound claims require a successful dial-back.
+    pub onion: Option<PeerKey>,
 }
 
-/// A network address: IPv6, with IPv4 mapped into it.
+/// A Tor v3 service endpoint and the last time it was seen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PeerAddr {
-    /// The address bytes.
-    pub ip: [u8; 16],
+    /// The onion service's identity.
+    pub addr: NetAddr,
     /// The port.
     pub port: u16,
     /// When the address was last seen alive, seconds since the epoch.
@@ -50,39 +55,30 @@ pub struct PeerAddr {
 }
 
 impl PeerAddr {
-    /// An IPv4 address, mapped.
-    pub fn v4(octets: [u8; 4], port: u16, last_seen: u64) -> Self {
-        let mut ip = [0u8; 16];
-        ip[10] = 0xff;
-        ip[11] = 0xff;
-        ip[12..].copy_from_slice(&octets);
+    /// A service endpoint with a gossip timestamp.
+    pub fn new(addr: NetAddr, port: u16, last_seen: u64) -> Self {
         Self {
-            ip,
+            addr,
             port,
             last_seen,
         }
     }
 
     /// The address without its timestamp, for use as a key.
-    pub fn key(&self) -> ([u8; 16], u16) {
-        (self.ip, self.port)
+    pub fn key(&self) -> PeerKey {
+        (self.addr, self.port)
     }
 
-    /// Appends `ip | port (u16 LE) | last_seen (u64 LE)`, the layout shared
-    /// by `Addr` messages and saved address books.
+    /// Appends the Tor-only addrv2 endpoint followed by its timestamp.
     pub(crate) fn write(&self, w: &mut Writer) {
-        w.put(&self.ip)
-            .put(&self.port.to_le_bytes())
-            .put_u64_le(self.last_seen);
+        self.addr.write(self.port, w);
+        w.put_u64_le(self.last_seen);
     }
 
     /// Reads the layout [`PeerAddr::write`] produces.
     pub(crate) fn read(r: &mut Reader<'_>) -> Result<Self> {
-        Ok(Self {
-            ip: r.take_array()?,
-            port: u16::from_le_bytes(r.take_array()?),
-            last_seen: r.take_u64_le()?,
-        })
+        let (addr, port) = NetAddr::read(r)?;
+        Ok(Self::new(addr, port, r.take_u64_le()?))
     }
 }
 
@@ -237,7 +233,12 @@ impl Message {
                     .put_u64_le(v.nonce)
                     .put(&v.best_height.to_le_bytes())
                     .put(v.genesis.as_bytes())
-                    .put_u64_le(v.timestamp);
+                    .put_u64_le(v.timestamp)
+                    .put_u64_le(v.services);
+                w.put_u8(u8::from(v.onion.is_some()));
+                if let Some((addr, port)) = v.onion {
+                    addr.write(port, &mut w);
+                }
             }
             Self::Verack | Self::GetAddr => {}
             Self::Ping(n) | Self::Pong(n) => {
@@ -317,6 +318,12 @@ impl Message {
                 best_height: u32::from_le_bytes(r.take_array()?),
                 genesis: BlockHash::from_bytes(r.take_array()?),
                 timestamp: r.take_u64_le()?,
+                services: r.take_u64_le()?,
+                onion: match r.take_u8()? {
+                    0 => None,
+                    1 => Some(NetAddr::read(&mut r)?),
+                    _ => return Err(Error::BadAddress("invalid onion claim flag")),
+                },
             }),
             tag::VERACK => Self::Verack,
             tag::PING => Self::Ping(r.take_u64_le()?),
@@ -441,12 +448,14 @@ mod tests {
                 best_height: 9,
                 genesis: BlockHash::from_bytes([4; 32]),
                 timestamp: 1_000,
+                services: 1,
+                onion: Some((NetAddr::TorV3([7; 32]), 19000)),
             }),
             Message::Verack,
             Message::Ping(1),
             Message::Pong(2),
             Message::GetAddr,
-            Message::Addr(vec![PeerAddr::v4([127, 0, 0, 1], 8333, 5)]),
+            Message::Addr(vec![PeerAddr::new(NetAddr::TorV3([1; 32]), 8333, 5)]),
             Message::GetHeaders {
                 locator: vec![BlockHash::from_bytes([3; 32])],
                 stop: BlockHash::ZERO,
@@ -520,9 +529,9 @@ mod tests {
     }
 
     #[test]
-    fn mapped_v4_addresses_have_the_standard_prefix() {
-        let a = PeerAddr::v4([10, 0, 0, 1], 1, 0);
-        assert_eq!(&a.ip[..12], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff]);
-        assert_eq!(a.key(), (a.ip, 1));
+    fn tor_addresses_use_the_identity_and_service_port_as_key() {
+        let addr = NetAddr::TorV3([1; 32]);
+        let a = PeerAddr::new(addr, 1, 0);
+        assert_eq!(a.key(), (addr, 1));
     }
 }

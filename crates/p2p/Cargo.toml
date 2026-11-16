@@ -1,6 +1,6 @@
 [package]
 name = "p2p"
-description = "Wire protocol, encrypted transport, peer management, sync and Dandelion++ relay"
+description = "Tor-only wire protocol, transport, peer management, sync and Dandelion++ relay"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,12 +8,30 @@ license.workspace = true
 
 [dependencies]
 protocol.workspace = true
-snow.workspace = true
-tokio.workspace = true
+arti-client.workspace = true
+tor-hsservice.workspace = true
+tor-hscrypto.workspace = true
+tor-rtcompat.workspace = true
+tor-cell.workspace = true
+tor-config.workspace = true
+tor-guardmgr.workspace = true
+tor-proto.workspace = true
+futures-util.workspace = true
+fs-mistrust.workspace = true
+safelog.workspace = true
+tokio = { workspace = true, features = ["macros"] }
 thiserror.workspace = true
 rand_core.workspace = true
 
+[features]
+# Explicit memory and local RPC fixtures; excluded from production builds.
+test-support = []
+
 [dev-dependencies]
+tracing = "=0.1.44"
+tempfile.workspace = true
+sha3.workspace = true
+data-encoding.workspace = true
 crypto.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true

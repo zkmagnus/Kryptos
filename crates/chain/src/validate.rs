@@ -25,7 +25,7 @@ use protocol::transaction::Transaction;
 use protocol::tree_order::tree_transactions;
 use protocol::validate as tx_validate;
 use rand_core::{CryptoRng, RngCore};
-use storage::store::Store;
+use storage::store::{BlockStateViolation, Store};
 use storage::tree::CommitmentTree;
 use transaction_proof::{ProofBatch, VerifyingKey};
 
@@ -210,8 +210,25 @@ impl Validator<'_> {
         rng: &mut (impl RngCore + CryptoRng),
     ) -> Result<CommitmentTree> {
         let batch = self.queue_block(block)?;
-        for tx in block.transactions() {
-            self.check_chain_state(store, tx)?;
+        let anchors: Vec<_> = block
+            .transactions()
+            .iter()
+            .map(|transaction| *transaction.anchor())
+            .collect();
+        let nullifiers: Vec<_> = block
+            .transactions()
+            .iter()
+            .flat_map(Transaction::nullifiers)
+            .copied()
+            .collect();
+        match store.check_block_state(&anchors, &nullifiers, self.params.anchor_max_age)? {
+            Some(BlockStateViolation::UnknownOrStaleAnchor) => {
+                return Err(Error::InvalidBlock("unknown or stale anchor"));
+            }
+            Some(BlockStateViolation::NullifierAlreadySpent) => {
+                return Err(Error::InvalidBlock("nullifier already spent"));
+            }
+            None => {}
         }
         batch.verify(self.vk, rng)?;
         let mut tree = store.tree()?;
@@ -232,23 +249,6 @@ impl Validator<'_> {
             batch.queue_transfer(tx, branch)?;
         }
         Ok(batch)
-    }
-
-    /// The checks that need the store: anchor age and nullifier freshness
-    /// against the chain.
-    fn check_chain_state(&self, store: &Store, tx: &Transaction) -> Result<()> {
-        if store
-            .anchor_height(tx.anchor(), self.params.anchor_max_age)?
-            .is_none()
-        {
-            return Err(Error::InvalidBlock("unknown or stale anchor"));
-        }
-        for nf in tx.nullifiers() {
-            if store.contains_nullifier(nf)? {
-                return Err(Error::InvalidBlock("nullifier already spent"));
-            }
-        }
-        Ok(())
     }
 }
 

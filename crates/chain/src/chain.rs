@@ -68,12 +68,14 @@ impl Chain {
             Some(recorded) if recorded == digest => {}
             Some(_) => return Err(Error::RulesMismatch),
         }
-        Ok(Self {
+        let chain = Self {
             store,
             params,
             pow: RandomXPow::new(params.randomx_key)?,
             vk,
-        })
+        };
+        chain.recover_reorg()?;
+        Ok(chain)
     }
 
     /// The store.
@@ -116,7 +118,8 @@ impl Chain {
         now: u64,
         rng: &mut (impl RngCore + CryptoRng),
     ) -> Result<Import> {
-        if self.store.block(&block.hash())?.is_some() {
+        self.recover_reorg()?;
+        if self.store.hash_at(block.header().height)? == Some(block.hash()) {
             return Ok(Import::AlreadyKnown);
         }
         let tip = self.tip()?;
@@ -199,6 +202,49 @@ impl Chain {
             .collect()
     }
 
+    /// Rolls an interrupted reorg back to its original, previously validated chain.
+    /// Each step is durable and repeatable if recovery itself is interrupted.
+    fn recover_reorg(&self) -> Result<()> {
+        let Some((original, fork)) = self.store.pending_reorg()? else {
+            return Ok(());
+        };
+        let fork_block = self
+            .store
+            .block(&fork)?
+            .ok_or(Error::InvalidBlock("reorg fork missing"))?;
+        let fork_height = fork_block.header().height;
+        let mut old = Vec::new();
+        let mut hash = original;
+        while hash != fork {
+            let block = self
+                .store
+                .block(&hash)?
+                .ok_or(Error::InvalidBlock("reorg original block missing"))?;
+            hash = block.header().prev_hash;
+            old.push(block);
+        }
+        while self.tip()?.height > fork_height {
+            self.store.revert()?;
+        }
+        if self.tip()?.hash != fork {
+            return Err(Error::InvalidBlock("reorg fork mismatch"));
+        }
+        let mut tree = self.store.tree()?;
+        for block in old.iter().rev() {
+            for tx in protocol::tree_order::tree_transactions(block)? {
+                for action in tx.actions() {
+                    tree.append(action.body().cmx())?;
+                }
+            }
+            if tree.root() != block.header().commitment_root {
+                return Err(Error::InvalidBlock("recovery commitment root mismatch"));
+            }
+            self.store.apply(block, &tree)?;
+        }
+        self.store.finish_reorg()?;
+        Ok(())
+    }
+
     /// Reverts to `fork_height`, applies `branch`, and restores the old
     /// chain if any branch block is invalid.
     fn reorganize(
@@ -208,6 +254,8 @@ impl Chain {
         now: u64,
         rng: &mut (impl RngCore + CryptoRng),
     ) -> Result<Import> {
+        let fork = self.store.hash_at(fork_height)?.ok_or(Error::Orphan)?;
+        self.store.begin_reorg(self.tip()?.hash, fork)?;
         let mut reverted = Vec::new();
         while self.tip()?.height > fork_height {
             reverted.push(self.store.revert()?);
@@ -216,15 +264,14 @@ impl Chain {
         let mut applied = 0u32;
         for block in branch {
             if let Err(error) = validator.validate_and_apply(&self.store, block, rng) {
-                for _ in 0..applied {
-                    self.store.revert()?;
-                }
-                for old in reverted.iter().rev() {
-                    validator.validate_and_apply(&self.store, old, rng)?;
-                }
+                self.recover_reorg()?;
                 return Err(error);
             }
             applied = applied.saturating_add(1);
+        }
+        self.store.finish_reorg()?;
+        if let Some(floor) = self.tip()?.height.checked_sub(self.params.max_reorg_depth) {
+            self.store.prune_frontiers_below(floor)?;
         }
         Ok(Import::Reorganized { reverted, applied })
     }
@@ -312,6 +359,68 @@ pub fn hash_at(chain: &Chain, height: u32) -> Result<Option<BlockHash>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reopening_recovers_every_interrupted_reorg_phase() {
+        // Model durable boundaries without proof generation: these empty blocks
+        // represent previously validated store state, not network imports.
+        for phase in 0..4 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("chain.redb");
+            let params = ChainParams::test();
+            let chain = Chain::new(
+                Store::open(&path).unwrap(),
+                params,
+                VerifyingKey::build().unwrap(),
+            )
+            .unwrap();
+            let fork = chain.tip().unwrap().hash;
+            let tree = chain.store.tree().unwrap();
+            let first = Block::new(protocol::block::empty_header(1, fork, tree.root()), vec![]);
+            chain.store.apply(&first, &tree).unwrap();
+            let second = Block::new(
+                protocol::block::empty_header(2, first.hash(), tree.root()),
+                vec![],
+            );
+            chain.store.apply(&second, &tree).unwrap();
+            chain.store.begin_reorg(second.hash(), fork).unwrap();
+            if phase >= 1 {
+                chain.store.revert().unwrap();
+            }
+            if phase >= 2 {
+                chain.store.revert().unwrap();
+            }
+            if phase >= 3 {
+                let mut header = first.header().clone();
+                header.timestamp += 1;
+                chain
+                    .store
+                    .apply(&Block::new(header, vec![]), &tree)
+                    .unwrap();
+            }
+            chain.store.prune_frontiers_below(100).unwrap();
+            assert!(chain.store.tree_at(0).unwrap().is_some());
+            drop(chain);
+            let recovered = Chain::new(
+                Store::open(&path).unwrap(),
+                params,
+                VerifyingKey::build().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(recovered.tip().unwrap().hash, second.hash());
+            assert_eq!(recovered.store.hash_at(1).unwrap(), Some(first.hash()));
+            assert_eq!(recovered.store.tree().unwrap().root(), tree.root());
+            assert!(recovered.store.pending_reorg().unwrap().is_none());
+            drop(recovered);
+            let again = Chain::new(
+                Store::open(&path).unwrap(),
+                params,
+                VerifyingKey::build().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(again.tip().unwrap().hash, second.hash());
+        }
+    }
+
     use protocol::consensus::BranchId;
 
     use super::*;

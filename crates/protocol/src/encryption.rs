@@ -5,11 +5,10 @@
 //! out plaintext   = pk_d(32) || ek(1184) || KEM shared secret(32)
 //! ```
 //!
-//! The receiver decrypts with `ivk`. The sender, or a holder of its `ovk`,
-//! decrypts the out ciphertext to recover `esk` and `pk_d` and then the coin.
-//! Both paths rebuild the coin and check it against the public commitment
-//! and ephemeral key, so a ciphertext can never claim a coin it does not
-//! match.
+//! The receiver decapsulates with its ML-KEM key and uses `ivk` to reconstruct
+//! the recipient. The sender, or a holder of its `ovk`, recovers the KEM shared
+//! secret and `pk_d` from the outgoing ciphertext. Both paths rebuild the coin
+//! and check it against the public commitment.
 
 use crypto::commitment::ValueCommitment;
 use crypto::encoding::ENCODED_LEN;
@@ -168,9 +167,11 @@ pub fn decrypt_coin_with_ivk(
 ) -> Result<Coin> {
     let shared_secret = receiver_key.decapsulate(&encrypted.kem_ciphertext)?;
     let key = shared_secret.coin_key(&encrypted.kem_ciphertext, &cmx.to_bytes());
-    let plaintext = CoinPlaintext::decode(&key.decrypt(&encrypted.enc_ciphertext)?)?;
-    let pk_d = ivk.transmission_key(&plaintext.diversifier)?;
-    finish_decryption(plaintext, pk_d, rho, cmx)
+    let plaintext = key
+        .decrypt(&encrypted.enc_ciphertext)
+        .map_err(Error::from)
+        .and_then(|bytes| CoinPlaintext::decode(&bytes));
+    finish_trial_decryption(plaintext, ivk, rho, cmx)
 }
 
 /// Detects and rebuilds a coin from the leading bytes of its ciphertext,
@@ -194,43 +195,38 @@ pub fn detect_coin_with_ivk(
     let shared_secret = receiver_key.decapsulate(kem_ciphertext)?;
     let key = shared_secret.coin_key(kem_ciphertext, &cmx.to_bytes());
     let lead = key.decrypt_lead(enc_lead);
-    let plaintext = CoinLead::decode(&lead)?;
-    let pk_d = ivk.transmission_key(&plaintext.diversifier)?;
-    let coin = Coin::new(
-        plaintext.diversifier,
-        pk_d,
-        plaintext.value,
-        rho,
-        plaintext.rseed,
-    );
-    if coin.cmx()? != *cmx {
-        return Err(Error::CoinDecryption("commitment mismatch"));
-    }
-    Ok(coin)
+    finish_trial_decryption(CoinPlaintext::decode(&lead), ivk, rho, cmx)
 }
 
-/// The fields of a coin plaintext.
-struct CoinLead {
-    diversifier: Diversifier,
-    value: RawCoin,
-    rseed: RandomSeed,
-}
-
-impl CoinLead {
-    fn decode(bytes: &[u8]) -> Result<Self> {
-        let mut r = Reader::new(bytes);
-        if r.take_u8()? != PLAINTEXT_VERSION {
-            return Err(Error::CoinDecryption("unknown plaintext version"));
-        }
-        let diversifier = Diversifier::from_bytes(r.take_array()?);
-        let value = RawCoin::from_raw(r.take_u64_le()?)?;
-        let rseed = RandomSeed::from_bytes(r.take_array()?);
-        r.finish()?;
-        Ok(Self {
-            diversifier,
-            value,
-            rseed,
-        })
+/// Every trial performs one recipient derivation and one commitment, even
+/// when authentication or parsing failed. Delaying that error also avoids
+/// doing a second stand-in reconstruction after a commitment mismatch.
+/// This balances expensive cryptographic work; it is not a constant-time API.
+fn finish_trial_decryption(
+    plaintext: Result<CoinPlaintext>,
+    ivk: &IncomingViewingKey,
+    rho: Rho,
+    cmx: &ExtractedCoinCommitment,
+) -> Result<Coin> {
+    let (candidate, error) = match plaintext {
+        Ok(plaintext) => (plaintext, None),
+        Err(error) => (
+            CoinPlaintext {
+                diversifier: Diversifier::from_bytes([0; DIVERSIFIER_LEN]),
+                value: RawCoin::ZERO,
+                rseed: RandomSeed::from_bytes([0; RANDOM_SEED_LEN]),
+            },
+            Some(error),
+        ),
+    };
+    let pk_d = ivk.transmission_key(&candidate.diversifier)?;
+    // Keep the reconstruction observable to the optimizer even when an earlier
+    // error means its result will be discarded. This is workload balancing,
+    // not a guarantee of constant-time execution.
+    let checked = std::hint::black_box(finish_decryption(candidate, pk_d, rho, cmx));
+    match error {
+        Some(error) => Err(error),
+        None => checked,
     }
 }
 
@@ -414,8 +410,8 @@ mod tests {
     fn party(rng: &mut ChaCha20Rng) -> Party {
         let fvk = FullViewingKey::derive(&SpendingKey::random(rng)).unwrap();
         let ivk = fvk.incoming_viewing_key().unwrap();
-        let (receiver_key, _) = fvk.receiver_key();
         let address = Address::derive(&fvk, Diversifier::random(rng)).unwrap();
+        let (receiver_key, _) = fvk.receiver_key_for_diversifier(address.diversifier());
         Party {
             ivk,
             receiver_key,
@@ -480,6 +476,47 @@ mod tests {
         assert_eq!(a.value(), b.value());
         assert_eq!(a.rho(), b.rho());
         assert_eq!(a.rseed().as_bytes(), b.rseed().as_bytes());
+    }
+
+    #[test]
+    fn authenticated_malformed_plaintext_is_rejected_after_trial_reconstruction() {
+        let s = scenario(31, true);
+        let key = s
+            .shared_secret
+            .coin_key(s.encrypted.kem_ciphertext(), &s.cmx.to_bytes());
+        let mut plaintext = CoinPlaintext::from_coin(&s.coin).encode();
+        plaintext[0] = 0xff;
+        let bad = EncryptedCoin::from_parts(
+            s.encrypted.kem_ciphertext().clone(),
+            fixed(key.encrypt(&plaintext)).unwrap(),
+            *s.encrypted.out_ciphertext(),
+        );
+        assert_eq!(
+            decrypt_coin_with_ivk(
+                &s.receiver.ivk,
+                &s.receiver.receiver_key,
+                &bad,
+                *s.coin.rho(),
+                &s.cmx
+            )
+            .unwrap_err(),
+            Error::CoinDecryption("unknown plaintext version")
+        );
+        let lead = bad.enc_ciphertext()[..COMPACT_COIN_LEAD]
+            .try_into()
+            .unwrap();
+        assert_eq!(
+            detect_coin_with_ivk(
+                &s.receiver.ivk,
+                &s.receiver.receiver_key,
+                bad.kem_ciphertext(),
+                &lead,
+                *s.coin.rho(),
+                &s.cmx
+            )
+            .unwrap_err(),
+            Error::CoinDecryption("unknown plaintext version")
+        );
     }
 
     #[test]

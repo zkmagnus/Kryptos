@@ -56,8 +56,9 @@ impl Wallet {
     pub fn new(rng: &mut ChaCha20Rng) -> Self {
         let sk = SpendingKey::random(rng);
         let fvk = FullViewingKey::derive(&sk).unwrap();
-        let (receiver_key, transmission_key) = fvk.receiver_key();
         let address = RhombusAddress::derive(&fvk, Diversifier::random(rng)).unwrap();
+        let (receiver_key, transmission_key) =
+            fvk.receiver_key_for_diversifier(address.diversifier());
         Self {
             sk,
             fvk,
@@ -100,8 +101,11 @@ impl Wallet {
         Self {
             sk: self.sk.clone(),
             fvk: FullViewingKey::derive(&self.sk).unwrap(),
-            receiver_key: self.fvk.receiver_key().0,
-            transmission_key: self.fvk.receiver_key().1,
+            receiver_key: self
+                .fvk
+                .receiver_key_for_diversifier(self.address.diversifier())
+                .0,
+            transmission_key: self.address.kem_key().clone(),
             address: self.address.clone(),
             tree: self.tree.clone(),
             coins,

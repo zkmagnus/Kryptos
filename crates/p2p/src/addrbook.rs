@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use protocol::bytes::{Reader, Writer};
 use rand_core::RngCore;
 
+use crate::address::{NetAddr, PeerKey};
 use crate::message::{put_count, take_count, PeerAddr, MAX_ADDRESSES};
 use crate::{Error, Result};
 
@@ -16,7 +17,7 @@ pub const MAX_FUTURE: u64 = 10 * 60;
 pub const MAX_AGE: u64 = 30 * 24 * 60 * 60;
 /// Default ban length in seconds.
 pub const BAN_SECONDS: u64 = 24 * 60 * 60;
-/// Banned IP addresses the book remembers at most.
+/// Service identities with remembered penalties at most.
 pub const MAX_BANS: usize = 10_000;
 /// Seconds a successful outbound handshake vouches for an address.
 pub const VERIFIED_SECONDS: u64 = 24 * 60 * 60;
@@ -32,10 +33,8 @@ const MAX_BACKOFF_DOUBLINGS: u32 = 6;
 /// when, or in which order, this node connected to each one.
 pub const SHARED_TIME_GRANULARITY: u64 = 60 * 60;
 
-/// An IP address as the book stores it: IPv4 as IPv4-mapped IPv6.
-pub type Ip = [u8; 16];
 /// Version byte of the [`Snapshot`] layout.
-pub const SNAPSHOT_VERSION: u8 = 1;
+pub const SNAPSHOT_VERSION: u8 = 2;
 
 #[derive(Clone, Copy, Debug)]
 struct Entry {
@@ -43,6 +42,12 @@ struct Entry {
     failures: u32,
     verified_at: Option<u64>,
     retry_at: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Penalty {
+    score: u32,
+    until: u64,
 }
 
 impl Entry {
@@ -56,11 +61,10 @@ impl Entry {
 /// The address book.
 #[derive(Debug, Default)]
 pub struct AddressBook {
-    entries: HashMap<(Ip, u16), Entry>,
-    /// Ban expiry per IP. Bans are per IP, not per address: an inbound
-    /// peer connects from a new ephemeral port every time, so a ban on
-    /// its port would never match again.
-    bans: HashMap<Ip, u64>,
+    entries: HashMap<PeerKey, Entry>,
+    /// Penalties apply to the service identity, across all virtual ports.
+    bans: HashMap<NetAddr, Penalty>,
+    own: Option<NetAddr>,
 }
 
 impl AddressBook {
@@ -85,7 +89,9 @@ impl AddressBook {
     /// address cannot keep it alive past [`MAX_AGE`]. A slightly future
     /// timestamp is stored as `now` for the same reason.
     pub fn add(&mut self, addr: PeerAddr, now: u64) -> bool {
-        if addr.last_seen > now.saturating_add(MAX_FUTURE)
+        if self.own == Some(addr.addr)
+            || addr.port == 0
+            || addr.last_seen > now.saturating_add(MAX_FUTURE)
             || now.saturating_sub(addr.last_seen) > MAX_AGE
             || self.entries.contains_key(&addr.key())
             || self.entries.len() >= MAX_KNOWN
@@ -117,30 +123,71 @@ impl AddressBook {
             .count()
     }
 
-    /// Bans every port of `ip` until `now + BAN_SECONDS`. When the ban
-    /// list is full, expired bans go first, then the one ending soonest.
-    pub fn ban(&mut self, ip: Ip, now: u64) {
-        if !self.bans.contains_key(&ip) && self.bans.len() >= MAX_BANS {
-            self.bans.retain(|_, until| *until > now);
+    /// Sets our own service identity and removes it from the peer table.
+    pub fn set_own(&mut self, own: Option<NetAddr>) {
+        self.own = own;
+        self.entries.retain(|(address, _), _| Some(*address) != own);
+        self.bans.retain(|address, _| Some(*address) != own);
+    }
+
+    fn penalty(&mut self, address: NetAddr) -> &mut Penalty {
+        if !self.bans.contains_key(&address) && self.bans.len() >= MAX_BANS {
             let soonest = self
                 .bans
                 .iter()
-                .min_by_key(|(_, until)| **until)
-                .map(|(ip, _)| *ip);
-            if let (true, Some(soonest)) = (self.bans.len() >= MAX_BANS, soonest) {
+                .min_by_key(|(address, penalty)| (penalty.until, **address))
+                .map(|(address, _)| *address);
+            if let Some(soonest) = soonest {
                 self.bans.remove(&soonest);
             }
         }
-        self.bans.insert(ip, now.saturating_add(BAN_SECONDS));
+        self.bans
+            .entry(address)
+            .or_insert(Penalty { score: 0, until: 0 })
     }
 
-    /// Whether `ip` is banned at `now`.
-    pub fn is_banned(&self, ip: &Ip, now: u64) -> bool {
-        self.bans.get(ip).is_some_and(|until| *until > now)
+    /// Bans a service identity, including its other ports.
+    pub fn ban(&mut self, address: NetAddr, now: u64) {
+        let penalty = self.penalty(address);
+        penalty.score = penalty.score.max(crate::peer::BAN_THRESHOLD);
+        penalty.until = now.saturating_add(BAN_SECONDS);
+    }
+
+    /// Accumulates behavior penalties across connections and restarts.
+    /// Reaching the standard peer threshold bans the service identity.
+    pub fn penalize(&mut self, address: NetAddr, points: u32, now: u64) {
+        let penalty = self.penalty(address);
+        penalty.score = penalty.score.saturating_add(points);
+        if penalty.score >= crate::peer::BAN_THRESHOLD {
+            penalty.until = now.saturating_add(BAN_SECONDS);
+        }
+    }
+
+    /// Remembered behavior score for a service identity.
+    pub fn score(&self, address: &NetAddr) -> u32 {
+        self.bans.get(address).map_or(0, |penalty| penalty.score)
+    }
+
+    /// Whether the service identity is banned at `now`.
+    pub fn is_banned(&self, address: &NetAddr, now: u64) -> bool {
+        self.bans
+            .get(address)
+            .is_some_and(|penalty| penalty.until > now)
+    }
+
+    /// Whether policy and retry backoff permit dialing this endpoint now.
+    /// An unknown endpoint may be admitted by explicit configuration.
+    pub fn dialable(&self, key: PeerKey, now: u64) -> bool {
+        self.own != Some(key.0)
+            && !self.is_banned(&key.0, now)
+            && self
+                .entries
+                .get(&key)
+                .is_none_or(|entry| entry.retry_at <= now)
     }
 
     /// Records a failed connection attempt.
-    pub fn failed(&mut self, key: ([u8; 16], u16)) {
+    pub fn failed(&mut self, key: PeerKey) {
         if let Some(e) = self.entries.get_mut(&key) {
             e.failures = e.failures.saturating_add(1);
             e.verified_at = None;
@@ -148,7 +195,7 @@ impl AddressBook {
     }
 
     /// Reserves an address while dialing and applies a bounded retry delay.
-    pub fn attempted(&mut self, key: (Ip, u16), now: u64) {
+    pub fn attempted(&mut self, key: PeerKey, now: u64) {
         if let Some(e) = self.entries.get_mut(&key) {
             let delay = RETRY_SECONDS
                 .saturating_mul(1u64 << e.failures.min(MAX_BACKOFF_DOUBLINGS))
@@ -158,9 +205,10 @@ impl AddressBook {
     }
 
     /// Records a successful connection at `now`.
-    pub fn connected(&mut self, key: ([u8; 16], u16), now: u64) {
+    pub fn connected(&mut self, key: PeerKey, now: u64) {
         if let Some(e) = self.entries.get_mut(&key) {
             e.failures = 0;
+            e.retry_at = 0;
             e.addr.last_seen = now;
             e.verified_at = Some(now);
         }
@@ -170,7 +218,7 @@ impl AddressBook {
     /// have failed less.
     pub fn candidate(
         &self,
-        exclude: &[([u8; 16], u16)],
+        exclude: &[PeerKey],
         now: u64,
         rng: &mut impl RngCore,
     ) -> Option<PeerAddr> {
@@ -180,7 +228,7 @@ impl AddressBook {
     /// An unverified candidate for a bounded reachability probe.
     pub fn unverified_candidate(
         &self,
-        exclude: &[(Ip, u16)],
+        exclude: &[PeerKey],
         now: u64,
         rng: &mut impl RngCore,
     ) -> Option<PeerAddr> {
@@ -189,7 +237,7 @@ impl AddressBook {
 
     fn select_candidate(
         &self,
-        exclude: &[(Ip, u16)],
+        exclude: &[PeerKey],
         now: u64,
         rng: &mut impl RngCore,
         unverified_only: bool,
@@ -201,19 +249,21 @@ impl AddressBook {
                 e.retry_at <= now
                     && (!unverified_only || !e.is_verified(now))
                     && now.saturating_sub(e.addr.last_seen) <= MAX_AGE
-                    && !self.is_banned(&e.addr.ip, now)
+                    && !self.is_banned(&e.addr.addr, now)
                     && !exclude.contains(&e.addr.key())
             })
             .collect();
         if pool.is_empty() {
             return None;
         }
-        pool.sort_by_key(|e| e.failures);
-        let best = pool.first().map_or(0, |e| e.failures);
+        pool.sort_by_key(|e| (self.score(&e.addr.addr), e.failures, e.addr.key()));
+        let best = pool
+            .first()
+            .map_or((0, 0), |e| (self.score(&e.addr.addr), e.failures));
         let good: Vec<&Entry> = pool
             .iter()
             .copied()
-            .filter(|e| e.failures == best)
+            .filter(|e| (self.score(&e.addr.addr), e.failures) == best)
             .collect();
         crate::random::index(rng, good.len())
             .and_then(|i| good.get(i))
@@ -221,7 +271,7 @@ impl AddressBook {
     }
 
     /// Whether a recent outbound handshake verified this address.
-    pub fn verified(&self, key: (Ip, u16), now: u64) -> bool {
+    pub fn verified(&self, key: PeerKey, now: u64) -> bool {
         self.entries.get(&key).is_some_and(|e| e.is_verified(now))
     }
 
@@ -235,7 +285,7 @@ impl AddressBook {
         let mut pool: Vec<PeerAddr> = self
             .entries
             .values()
-            .filter(|e| e.is_verified(now) && !self.is_banned(&e.addr.ip, now))
+            .filter(|e| e.is_verified(now) && !self.is_banned(&e.addr.addr, now))
             .map(|e| PeerAddr {
                 last_seen: shared_time,
                 ..e.addr
@@ -253,41 +303,92 @@ impl AddressBook {
     pub fn prune(&mut self, now: u64) {
         self.entries
             .retain(|_, e| now.saturating_sub(e.addr.last_seen) <= MAX_AGE);
-        self.bans.retain(|_, until| *until > now);
+        self.bans
+            .retain(|_, penalty| penalty.until > now || penalty.score != 0);
     }
 
-    /// The addresses worth keeping across a restart, in canonical order.
+    /// Recently verified, unbanned peers to retain as restart anchors.
+    /// Preference is by behavior, connection failures, and verification recency.
+    pub fn anchors(&self, count: usize, now: u64) -> Vec<PeerAddr> {
+        let mut entries: Vec<_> = self
+            .entries
+            .values()
+            .filter(|entry| entry.is_verified(now) && !self.is_banned(&entry.addr.addr, now))
+            .collect();
+        entries.sort_by_key(|entry| {
+            (
+                self.score(&entry.addr.addr),
+                entry.failures,
+                core::cmp::Reverse(entry.verified_at),
+                entry.addr.key(),
+            )
+        });
+        entries
+            .into_iter()
+            .take(count)
+            .map(|entry| entry.addr)
+            .collect()
+    }
+
+    /// Addresses, connection history, and behavior penalties in canonical order.
     pub fn snapshot(&self) -> Snapshot {
         let mut entries: Vec<SavedAddr> = self
             .entries
             .values()
-            .map(|e| SavedAddr {
-                addr: e.addr,
-                verified_at: e.verified_at,
+            .map(|entry| SavedAddr {
+                addr: entry.addr,
+                verified_at: entry.verified_at,
+                failures: entry.failures,
+                retry_at: entry.retry_at,
             })
             .collect();
-        entries.sort_by_key(|e| e.addr.key());
-        Snapshot(entries)
+        entries.sort_by_key(|entry| entry.addr.key());
+        let mut penalties: Vec<_> = self
+            .bans
+            .iter()
+            .map(|(address, penalty)| SavedPenalty {
+                addr: *address,
+                score: penalty.score,
+                until: penalty.until,
+            })
+            .collect();
+        penalties.sort_by_key(|penalty| penalty.addr);
+        Snapshot { entries, penalties }
     }
 
-    /// Loads saved addresses under the same rules as gossip: `keep` applies
-    /// the caller's network policy, [`AddressBook::add`] the timestamp
-    /// checks and the size bound, and known addresses stay as they are. A
-    /// verification time in the future is dropped, not trusted, since the
-    /// file may have been written by anyone. Returns how many were added.
+    /// Restores saved peer state under the normal timestamp and size limits.
+    /// Untrusted future verification, retry, and ban times are bounded.
     pub fn restore(
         &mut self,
         snapshot: Snapshot,
         now: u64,
         keep: impl Fn(&PeerAddr) -> bool,
     ) -> usize {
+        let own = self.own;
+        for saved in snapshot
+            .penalties
+            .into_iter()
+            .filter(|saved| Some(saved.addr) != own)
+        {
+            let penalty = self.penalty(saved.addr);
+            penalty.score = penalty.score.max(saved.score);
+            penalty.until = penalty
+                .until
+                .max(saved.until.min(now.saturating_add(BAN_SECONDS)));
+        }
         let mut added: usize = 0;
-        for saved in snapshot.0.into_iter().filter(|s| keep(&s.addr)) {
+        for saved in snapshot
+            .entries
+            .into_iter()
+            .filter(|saved| keep(&saved.addr))
+        {
             if !self.add(saved.addr, now) {
                 continue;
             }
-            if let Some(e) = self.entries.get_mut(&saved.addr.key()) {
-                e.verified_at = saved.verified_at.filter(|at| *at <= now);
+            if let Some(entry) = self.entries.get_mut(&saved.addr.key()) {
+                entry.verified_at = saved.verified_at.filter(|at| *at <= now);
+                entry.failures = saved.failures;
+                entry.retry_at = saved.retry_at.min(now.saturating_add(MAX_RETRY_SECONDS));
             }
             added = added.saturating_add(1);
         }
@@ -295,83 +396,133 @@ impl AddressBook {
     }
 }
 
-/// One saved address.
+/// One saved peer endpoint and its connection history.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SavedAddr {
     /// The address and when it was last seen alive.
     pub addr: PeerAddr,
-    /// When an outbound handshake last verified it, if one did.
+    /// Last verified outbound handshake, if any.
     pub verified_at: Option<u64>,
+    /// Consecutive failed attempts.
+    pub failures: u32,
+    /// Earliest permitted retry time.
+    pub retry_at: u64,
 }
 
-/// The part of an [`AddressBook`] that survives a restart: addresses and
-/// their verification times. Failure counts, retry delays and bans are not
-/// kept, so a restart still gives every address a fresh start.
-///
-/// Layout: [`SNAPSHOT_VERSION`], a `u32` LE count of at most [`MAX_KNOWN`],
-/// then per entry, in strictly ascending `(ip, port)` order,
-/// `ip (16) | port (u16 LE) | last_seen (u64 LE) | verified (0 or 1)`
-/// followed by `verified_at (u64 LE)` when the flag is 1.
+/// Persistent behavior associated with a Tor service identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SavedPenalty {
+    /// The service identity, applying across ports.
+    pub addr: NetAddr,
+    /// Accumulated misbehavior score.
+    pub score: u32,
+    /// Ban expiry, or zero when there is no active ban.
+    pub until: u64,
+}
+
+/// Restart state, versioned separately from chain storage.
+/// Entries and penalties are each stored in strictly ascending identity order.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Snapshot(Vec<SavedAddr>);
+pub struct Snapshot {
+    entries: Vec<SavedAddr>,
+    penalties: Vec<SavedPenalty>,
+}
 
 impl Snapshot {
-    /// The saved addresses, in ascending `(ip, port)` order.
+    /// Saved endpoints, in ascending identity/port order.
     pub fn entries(&self) -> &[SavedAddr] {
-        &self.0
+        &self.entries
     }
 
-    /// The canonical encoding.
+    /// Saved behavior scores and ban expirations.
+    pub fn penalties(&self) -> &[SavedPenalty] {
+        &self.penalties
+    }
+
+    /// The canonical peer-state encoding.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut w = Writer::default();
-        w.put_u8(SNAPSHOT_VERSION);
-        put_count(&mut w, self.0.len());
-        for saved in &self.0 {
-            saved.addr.write(&mut w);
+        let mut writer = Writer::default();
+        writer.put_u8(SNAPSHOT_VERSION);
+        put_count(&mut writer, self.entries.len());
+        for saved in &self.entries {
+            saved.addr.write(&mut writer);
             match saved.verified_at {
-                Some(at) => w.put_u8(1).put_u64_le(at),
-                None => w.put_u8(0),
+                Some(at) => writer.put_u8(1).put_u64_le(at),
+                None => writer.put_u8(0),
             };
+            writer
+                .put(&saved.failures.to_le_bytes())
+                .put_u64_le(saved.retry_at);
         }
-        w.into_bytes()
+        put_count(&mut writer, self.penalties.len());
+        for saved in &self.penalties {
+            let NetAddr::TorV3(key) = saved.addr;
+            writer
+                .put(&key)
+                .put(&saved.score.to_le_bytes())
+                .put_u64_le(saved.until);
+        }
+        writer.into_bytes()
     }
 
-    /// Decodes [`Snapshot::to_bytes`].
+    /// Decodes peer state, rejecting old IP-based snapshots and malformed data.
     ///
     /// # Errors
-    /// Fails on another version, more than [`MAX_KNOWN`] entries, entries
-    /// out of order or repeated, a flag other than 0 or 1, truncation or
-    /// trailing bytes.
+    /// Fails on unknown versions, unbounded counts, duplicates, out-of-order
+    /// identities, bad flags, truncation, or trailing bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let mut r = Reader::new(bytes);
-        if r.take_u8()? != SNAPSHOT_VERSION {
+        let mut reader = Reader::new(bytes);
+        if reader.take_u8()? != SNAPSHOT_VERSION {
             return Err(Error::BadSnapshot("unknown version"));
         }
-        let count = take_count(&mut r, MAX_KNOWN, "saved addresses")?;
+        let count = take_count(&mut reader, MAX_KNOWN, "saved addresses")?;
         let mut entries: Vec<SavedAddr> = Vec::with_capacity(count);
         for _ in 0..count {
-            let saved = read_saved(&mut r)?;
+            let saved = read_saved(&mut reader)?;
             if entries
                 .last()
-                .is_some_and(|prev| prev.addr.key() >= saved.addr.key())
+                .is_some_and(|previous| previous.addr.key() >= saved.addr.key())
             {
                 return Err(Error::BadSnapshot("addresses not strictly ascending"));
             }
             entries.push(saved);
         }
-        r.finish()?;
-        Ok(Self(entries))
+        let count = take_count(&mut reader, MAX_BANS, "saved penalties")?;
+        let mut penalties: Vec<SavedPenalty> = Vec::with_capacity(count);
+        for _ in 0..count {
+            let saved = SavedPenalty {
+                addr: NetAddr::TorV3(reader.take_array()?),
+                score: u32::from_le_bytes(reader.take_array()?),
+                until: reader.take_u64_le()?,
+            };
+            if penalties
+                .last()
+                .is_some_and(|previous| previous.addr >= saved.addr)
+            {
+                return Err(Error::BadSnapshot("penalties not strictly ascending"));
+            }
+            penalties.push(saved);
+        }
+        reader.finish()?;
+        Ok(Self { entries, penalties })
     }
 }
 
-fn read_saved(r: &mut Reader<'_>) -> Result<SavedAddr> {
-    let addr = PeerAddr::read(r)?;
-    let verified_at = match r.take_u8()? {
+fn read_saved(reader: &mut Reader<'_>) -> Result<SavedAddr> {
+    let addr = PeerAddr::read(reader)?;
+    let verified_at = match reader.take_u8()? {
         0 => None,
-        1 => Some(r.take_u64_le()?),
+        1 => Some(reader.take_u64_le()?),
         _ => return Err(Error::BadSnapshot("verified flag is not 0 or 1")),
     };
-    Ok(SavedAddr { addr, verified_at })
+    let failures = u32::from_le_bytes(reader.take_array()?);
+    let retry_at = reader.take_u64_le()?;
+    Ok(SavedAddr {
+        addr,
+        verified_at,
+        failures,
+        retry_at,
+    })
 }
 
 #[cfg(test)]
@@ -382,7 +533,7 @@ mod tests {
     use super::*;
 
     fn addr(last: u8, seen: u64) -> PeerAddr {
-        PeerAddr::v4([10, 0, 0, last], 1234, seen)
+        PeerAddr::new(NetAddr::TorV3([last; 32]), 1234, seen)
     }
 
     #[test]
@@ -428,24 +579,30 @@ mod tests {
     fn bans_exclude_candidates_and_samples_until_they_expire() {
         let mut book = AddressBook::new();
         book.add(addr(1, 100), 100);
-        book.ban(addr(1, 0).ip, 100);
+        book.ban(addr(1, 0).addr, 100);
         let mut rng = ChaCha20Rng::seed_from_u64(2);
-        assert!(book.is_banned(&addr(1, 0).ip, 100));
+        assert!(book.is_banned(&addr(1, 0).addr, 100));
         assert!(book.candidate(&[], 100, &mut rng).is_none());
         assert_eq!(book.sample(5, 100, &mut rng).len(), 0);
         assert!(book.candidate(&[], 100 + BAN_SECONDS, &mut rng).is_some());
         book.prune(100 + BAN_SECONDS);
-        assert!(!book.is_banned(&addr(1, 0).ip, 100 + BAN_SECONDS));
+        assert!(!book.is_banned(&addr(1, 0).addr, 100 + BAN_SECONDS));
     }
 
     #[test]
-    fn a_ban_covers_every_port_of_the_ip_and_adds_no_address() {
+    fn a_ban_covers_every_port_of_the_identity_and_adds_no_address() {
         let mut book = AddressBook::new();
-        let inbound = PeerAddr::v4([10, 0, 0, 9], 51_234, 100);
-        book.ban(inbound.ip, 100);
-        let reconnect = PeerAddr::v4([10, 0, 0, 9], 51_999, 100);
-        assert!(book.is_banned(&reconnect.ip, 100), "a new ephemeral port");
-        assert!(!book.is_banned(&addr(1, 0).ip, 100), "other IPs are fine");
+        let inbound = PeerAddr::new(NetAddr::TorV3([9; 32]), 51_234, 100);
+        book.ban(inbound.addr, 100);
+        let reconnect = PeerAddr::new(NetAddr::TorV3([9; 32]), 51_999, 100);
+        assert!(
+            book.is_banned(&reconnect.addr, 100),
+            "a different virtual port"
+        );
+        assert!(
+            !book.is_banned(&addr(1, 0).addr, 100),
+            "other service identities are fine"
+        );
         assert!(
             book.is_empty(),
             "a banned inbound port is not a dial candidate"
@@ -456,9 +613,9 @@ mod tests {
     fn the_ban_list_is_bounded_and_evicts_the_ban_ending_soonest() {
         let mut book = AddressBook::new();
         let ip = |i: usize| {
-            let mut ip = [0u8; 16];
-            ip[..8].copy_from_slice(&(i as u64).to_le_bytes());
-            ip
+            let mut key = [0u8; 32];
+            key[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            NetAddr::TorV3(key)
         };
         for i in 0..MAX_BANS {
             book.ban(ip(i), i as u64);
@@ -478,15 +635,15 @@ mod tests {
         let mut rng = ChaCha20Rng::seed_from_u64(3);
         for _ in 0..10 {
             assert_eq!(
-                book.candidate(&[], 100, &mut rng).unwrap().ip,
-                addr(2, 0).ip
+                book.candidate(&[], 100, &mut rng).unwrap().addr,
+                addr(2, 0).addr
             );
         }
         assert_eq!(
             book.candidate(&[addr(2, 0).key()], 100, &mut rng)
                 .unwrap()
-                .ip,
-            addr(1, 0).ip
+                .addr,
+            addr(1, 0).addr
         );
         book.connected(addr(1, 0).key(), 300);
         assert_eq!(book.add_many([addr(3, 300), addr(3, 300)], 300), 1);
@@ -591,38 +748,38 @@ mod tests {
         let bytes = snapshot.to_bytes();
         assert_eq!(Snapshot::from_bytes(&bytes).unwrap(), snapshot);
         assert_eq!(bytes, saved_book().snapshot().to_bytes(), "deterministic");
-        assert_eq!(bytes.len(), 1 + 4 + 3 * (16 + 2 + 8 + 1) + 8);
+        assert_eq!(bytes.len(), 1 + 4 + 3 * (36 + 8 + 1 + 4 + 8) + 8 + 4);
     }
 
     #[test]
     fn snapshots_reject_garbage() {
         let good = saved_book().snapshot().to_bytes();
         let mut bad_version = good.clone();
-        bad_version[0] = 2;
+        *bad_version.first_mut().unwrap() = 1;
         let mut bad_flag = good.clone();
-        bad_flag[1 + 4 + 26] = 2;
+        *bad_flag.get_mut(49).unwrap() = 2;
         let mut too_many = good.clone();
-        too_many[1..5].copy_from_slice(&u32::try_from(MAX_KNOWN + 1).unwrap().to_le_bytes());
-        let mut repeated = AddressBook::new();
-        repeated.add(addr(1, 100), 100);
-        let one = repeated.snapshot().to_bytes();
-        let mut twice = one.clone();
-        twice[1..5].copy_from_slice(&2u32.to_le_bytes());
-        twice.extend_from_slice(&one[5..]);
-        let mut reversed = good[..5].to_vec();
-        let entries = &good[5..];
-        reversed.extend_from_slice(&entries[27..54]);
-        reversed.extend_from_slice(&entries[..27]);
-        reversed.extend_from_slice(&entries[54..]);
+        too_many
+            .get_mut(1..5)
+            .unwrap()
+            .copy_from_slice(&u32::try_from(MAX_KNOWN + 1).unwrap().to_le_bytes());
+        let saved = saved_book().snapshot();
+        let duplicate = Snapshot {
+            entries: vec![saved.entries[0], saved.entries[0]],
+            penalties: Vec::new(),
+        }
+        .to_bytes();
+        let mut reversed = saved.clone();
+        reversed.entries.reverse();
         let trailing = [good.as_slice(), &[0]].concat();
         for (name, bytes) in [
             ("empty", Vec::new()),
             ("version", bad_version),
             ("flag", bad_flag),
             ("count", too_many),
-            ("duplicate", twice),
-            ("order", reversed),
-            ("truncated", good[..good.len() - 1].to_vec()),
+            ("duplicate", duplicate),
+            ("order", reversed.to_bytes()),
+            ("truncated", good[..good.len().saturating_sub(1)].to_vec()),
             ("trailing", trailing),
         ] {
             assert!(Snapshot::from_bytes(&bytes).is_err(), "{name} accepted");
@@ -630,10 +787,77 @@ mod tests {
     }
 
     #[test]
+    fn own_service_is_rejected_on_every_port_and_never_gossiped() {
+        let mut book = saved_book();
+        book.set_own(Some(addr(2, 0).addr));
+        assert_eq!(book.len(), 2);
+        assert!(!book.add(PeerAddr::new(addr(2, 0).addr, 5678, 200), 200));
+        assert_eq!(book.restore(saved_book().snapshot(), 200, |_| true), 0);
+        let mut rng = ChaCha20Rng::seed_from_u64(10);
+        assert!(book
+            .sample(100, 200, &mut rng)
+            .iter()
+            .all(|peer| peer.addr != addr(2, 0).addr));
+    }
+
+    #[test]
+    fn restart_retains_penalties_failures_and_retry_deadlines() {
+        let mut original = saved_book();
+        original.failed(addr(1, 0).key());
+        original.attempted(addr(1, 0).key(), 200);
+        original.penalize(addr(2, 0).addr, 40, 200);
+        original.penalize(addr(3, 0).addr, 100, 200);
+        let snapshot = Snapshot::from_bytes(&original.snapshot().to_bytes()).unwrap();
+        let mut restored = AddressBook::new();
+        assert_eq!(restored.restore(snapshot, 201, |_| true), 3);
+        assert_eq!(restored.score(&addr(2, 0).addr), 40);
+        assert!(restored.is_banned(&addr(3, 0).addr, 201));
+        assert_eq!(restored.entries.get(&addr(1, 0).key()).unwrap().failures, 1);
+        assert_eq!(
+            restored.entries.get(&addr(1, 0).key()).unwrap().retry_at,
+            320
+        );
+        restored.penalize(addr(2, 0).addr, 60, 201);
+        assert!(restored.is_banned(&addr(2, 0).addr, 201));
+    }
+
+    #[test]
+    fn successful_connection_clears_backoff_before_anchor_restart() {
+        let mut book = AddressBook::new();
+        let peer = addr(1, 100);
+        assert!(book.add(peer, 100));
+        book.failed(peer.key());
+        book.attempted(peer.key(), 100);
+        assert!(!book.dialable(peer.key(), 101));
+        book.connected(peer.key(), 101);
+        assert!(book.dialable(peer.key(), 101));
+        assert_eq!(book.anchors(3, 101), vec![addr(1, 101)]);
+
+        let saved = Snapshot::from_bytes(&book.snapshot().to_bytes()).unwrap();
+        let mut restored = AddressBook::new();
+        assert_eq!(restored.restore(saved, 102, |_| true), 1);
+        assert!(restored.dialable(peer.key(), 102));
+        assert_eq!(restored.anchors(3, 102), vec![addr(1, 101)]);
+    }
+
+    #[test]
+    fn restart_anchors_use_verified_behavior_and_exclude_bans() {
+        let mut book = saved_book();
+        book.connected(addr(1, 0).key(), 160);
+        book.connected(addr(3, 0).key(), 170);
+        book.penalize(addr(1, 0).addr, 20, 180);
+        book.ban(addr(3, 0).addr, 180);
+        assert_eq!(book.anchors(3, 200), vec![addr(2, 150), addr(1, 160)]);
+        let mut restored = AddressBook::new();
+        restored.restore(book.snapshot(), 200, |_| true);
+        assert_eq!(restored.anchors(2, 200), book.anchors(2, 200));
+    }
+
+    #[test]
     fn restored_books_keep_verification_under_gossip_rules() {
         let mut rng = ChaCha20Rng::seed_from_u64(8);
         let mut book = AddressBook::new();
-        let added = book.restore(saved_book().snapshot(), 200, |a| a.ip != addr(3, 0).ip);
+        let added = book.restore(saved_book().snapshot(), 200, |a| a.addr != addr(3, 0).addr);
         assert_eq!(added, 2, "the policy filter drops one");
         assert!(book.verified(addr(2, 0).key(), 200));
         assert!(!book.verified(addr(1, 0).key(), 200));

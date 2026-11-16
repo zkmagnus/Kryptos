@@ -21,6 +21,8 @@ license = "BSD-3-Clause"
 repository = "https://github.com/McFranko/randomx-bindings-sys"
 [build-dependencies.bindgen]
 version = "0.58.1"
+default-features = false
+features = ["runtime"]
 
 [build-dependencies.cmake]
 version = "0.1.45"

@@ -1,0 +1,56 @@
+# Changelog
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.13.0] - 2026-03-29
+
+* Removed `asm` feature in favor of automatic backend selection
+* Bumped MSRV to 1.85.0 (2025-02-20)
+
+## [0.12.0] - 2026-02-09
+
+* Renamed `std` feature to `kat`. This is not breaking because the features is only used for testing.
+
+## [0.11.0] - 2025-11-24
+
+* Removed `std` flag from all but testing use
+* Bumped MSRV to 1.81 (2024-09-04)
+
+## [0.10.0] - 2024-07-24
+
+* Added `asm` feature flag
+
+## [0.9.0] - 2024-07-24
+
+* Made `(meta_)recv_mac` inputs take a `&[u8; N]` rather than a `&mut [u8]`
+* Bumped MSRV to 1.60.0 (May 2022)
+
+## [0.8.1] - 2022-10-10
+
+### Changes
+* Improved docs and fixed docsrs build
+
+## [0.8.0] - 2022-10-10
+
+### Additions
+* Made `Strobe` struct impl `Zeroize`
+* Implemented `std::error::Error` for `AuthError`, when `std` is set
+
+### Changes
+* Made `Strobe::version_str` return a `[u8]` rather than a `String`, thus removing the need for allocation
+* Updated deps
+
+## [0.7.1] - 2022-02-13
+
+### Additions
+* Made `Strobe` struct impl `ZeroizeOnDrop` (PR [#4](https://github.com/rozbb/strobe-rs/pull/4))
+
+## [0.7.0] - 2021-12-29
+
+### Additions
+* Added `serialize_secret_state` feature, which impls `serde::Serialize` and `serde::Deserialize` for `Strobe` (PR [#3](https://github.com/rozbb/strobe-rs/pull/3))
+
+### Changes
+* Some light refactoring and improvement to tests

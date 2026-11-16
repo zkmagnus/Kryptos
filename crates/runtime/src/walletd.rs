@@ -23,7 +23,6 @@ use protocol::bytes::Encodable;
 use protocol::consensus::next_height;
 use protocol::transaction::{Transaction, TxId};
 use serde_json::{json, Value};
-use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use transaction_proof::ProvingKey;
 use wallet::operations::{Operation, OperationStatus};
@@ -54,6 +53,7 @@ const MAX_ATTEMPTS: u32 = 5;
 /// Every method, for `help` and for the reference in `docs/rpc.md`.
 pub const METHODS: &[&str] = &[
     "getwalletinfo",
+    "getreceiveaddress",
     "getnewaddress",
     "listaddresses",
     "getaddressinfo",
@@ -84,9 +84,12 @@ pub struct Args {
     /// Network the wallet is for.
     #[arg(long, default_value = "main")]
     pub network: Network,
-    /// The node's control socket.
-    #[arg(long, default_value = "127.0.0.1:18444")]
+    /// The node's onion control service, as `<v3 hostname>.onion:port`.
+    #[arg(long)]
     pub node: String,
+    /// Persistent embedded Tor client state directory.
+    #[arg(long)]
+    pub datadir: Option<PathBuf>,
     /// The node's token; also read from `RPC_TOKEN`.
     #[arg(
         long,
@@ -173,11 +176,12 @@ impl Service {
 
 /// Starts wallet synchronization without binding any sockets.
 pub fn start(config: ServiceConfig) -> Service {
-    let interval = config.sync_interval;
+    let interval = config.sync_interval.max(Duration::from_millis(1));
     let daemon = WalletDaemon::new(config);
     let (stop, mut stopped) = tokio::sync::oneshot::channel();
     let worker = daemon.clone();
     let task = tokio::spawn(async move {
+        let epoch = tokio::time::Instant::now();
         loop {
             if !matches!(
                 stopped.try_recv(),
@@ -192,12 +196,34 @@ pub fn start(config: ServiceConfig) -> Service {
             tokio::select! {
                 biased;
                 _ = &mut stopped => break,
-                () = tokio::time::sleep(interval) => {},
+                () = tokio::time::sleep_until(next_poll(epoch, interval, tokio::time::Instant::now())) => {},
                 () = worker.0.wake.notified() => {},
             }
         }
     });
     Service { daemon, stop, task }
+}
+
+/// Poll on a fixed grid, skipping missed slots. Sleeping one interval *after*
+/// scanning would expose its duration in the next connection's start time.
+/// A scan that overruns a slot still exposes coarse progress through skipped
+/// polls; this is scheduling isolation, not a constant-time wallet.
+fn next_poll(
+    epoch: tokio::time::Instant,
+    interval: Duration,
+    now: tokio::time::Instant,
+) -> tokio::time::Instant {
+    let remainder = now
+        .duration_since(epoch)
+        .as_nanos()
+        .checked_rem(interval.as_nanos())
+        .unwrap_or(0);
+    let remainder = Duration::new(
+        u64::try_from(remainder / 1_000_000_000).unwrap_or(u64::MAX),
+        u32::try_from(remainder % 1_000_000_000).unwrap_or(0),
+    );
+    now.checked_add(interval.saturating_sub(remainder))
+        .unwrap_or(now)
 }
 
 struct Inner {
@@ -270,10 +296,8 @@ fn node_token(text: Option<String>, file: Option<PathBuf>, network: Network) -> 
 /// Fails if the wallet cannot be opened or a socket bound.
 pub async fn main(args: Args) -> Result<()> {
     logging::init(args.log_level, args.log_file.as_deref())?;
-    let node = Endpoint {
-        addr: args.node,
-        token: node_token(args.node_token, args.node_token_file, args.network)?,
-    };
+    p2p::address::NetAddr::parse_endpoint(&args.node)?;
+    let node_token = node_token(args.node_token, args.node_token_file, args.network)?;
     let wallet_path = match args.wallet {
         Some(path) => path,
         None => paths::wallet_file(&paths::default_network_dir(args.network)?),
@@ -286,6 +310,16 @@ pub async fn main(args: Args) -> Result<()> {
             wallet_path.display()
         )));
     }
+    let datadir = args
+        .datadir
+        .unwrap_or_else(|| wallet_path.with_extension("tor-client"));
+    let (network, _incoming) = p2p::transport::TorNetwork::start(&datadir, false, &[])?;
+    network.wait_ready().await?;
+    let node = Endpoint {
+        addr: args.node,
+        token: node_token,
+        network,
+    };
     let genesis = genesis(&args.network.params()).hash();
     let wallet = Wallet::open(&wallet_path, genesis)?;
     let (token, generated) = match args.token {
@@ -324,7 +358,11 @@ pub async fn main(args: Args) -> Result<()> {
 /// # Errors
 /// Fails if the socket cannot be bound.
 pub async fn run(config: Config) -> Result<Handle> {
-    let listener = TcpListener::bind(config.listen).await?;
+    if config.listen.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST) {
+        return Err(Error::Argument("wallet RPC must bind to 127.0.0.1".into()));
+    }
+    config.node.validate()?;
+    let listener = crate::rpc::bind_local(config.listen).await?;
     let addr = listener.local_addr()?;
     let service = start(ServiceConfig {
         wallet: config.wallet,
@@ -388,8 +426,17 @@ impl WalletDaemon {
     pub(crate) async fn sync_once(&self) -> Result<()> {
         let _guard = self.0.sync_lock.lock().await;
         self.recover_interrupted_operations()?;
+        let mut scan_client = self.0.node.connect().await?;
+        let tip = self.scan(&mut scan_client).await?;
+        // A scan-only pass makes no further requests after private processing.
+        // Payment reconciliation uses a fresh session; replay may have exceeded
+        // the old connection's idle deadline.
+        if !self.0.wallet.operations()?.iter().any(|op| {
+            op.status.is_pending() || matches!(op.status, OperationStatus::Confirmed { .. })
+        }) {
+            return Ok(());
+        }
         let mut client = self.0.node.connect().await?;
-        let tip = self.scan(&mut client).await?;
         // Restore reservations for every removed confirmation before a queued
         // payment can select coins, including stale records from older writers.
         self.reconcile_operations(&mut client, tip).await?;
@@ -725,11 +772,11 @@ impl WalletDaemon {
         labels: &std::collections::HashMap<u64, String>,
         locked: &[u64],
     ) -> Result<Value> {
-        let address = RhombusAddress::from_parts(
-            *coin.coin.diversifier(),
-            *coin.coin.pk_d(),
-            self.0.wallet.keys().transmission_key().clone(),
-        );
+        let address = self
+            .0
+            .wallet
+            .keys()
+            .address_for_coin(&coin.coin, coin.legacy_address)?;
         let index = self.0.wallet.address_index_of(&address);
         Ok(json!({
             "position": coin.position,
@@ -816,8 +863,8 @@ fn parse_amount(value: Option<&Value>) -> core::result::Result<RawCoin, RpcError
 impl Dispatch for WalletDaemon {
     async fn call(&self, method: &str, params: &Params) -> core::result::Result<Value, RpcError> {
         match method {
-            "getwalletinfo" | "getnewaddress" | "listaddresses" | "getaddressinfo"
-            | "validateaddress" | "help" => self.wallet_methods(method, params),
+            "getwalletinfo" | "getreceiveaddress" | "getnewaddress" | "listaddresses"
+            | "getaddressinfo" | "validateaddress" | "help" => self.wallet_methods(method, params),
             "rescan" => {
                 let from: u32 = params.opt(0, "from_height")?.unwrap_or(0);
                 let _guard = self.0.sync_lock.lock().await;
@@ -843,6 +890,8 @@ impl WalletDaemon {
                 let scanned = self.scanned_height()?;
                 let node = self.node_height();
                 let coins = wallet.coins()?;
+                let receiving = wallet.current_receive_address()?;
+                let address_range = wallet.address_scan_range()?;
                 let pending = wallet
                     .operations()?
                     .iter()
@@ -857,7 +906,23 @@ impl WalletDaemon {
                     "unspent": coins.iter().filter(|n| n.spent_at.is_none()).count(),
                     "balance": wallet.balance()?.to_string(),
                     "pending_operations": pending,
+                    "address_scan_start": address_range.start,
+                    "address_scan_end_exclusive": address_range.end,
+                    "next_address_index": address_range.end,
+                    "receive_address": receiving.as_ref().map(|(_, address)| address.encode(prefix)),
+                    "receive_address_index": receiving.as_ref().map(|(index, _)| *index),
+                    "address_rotation_exhausted": receiving.is_none(),
+                    "legacy_address_scanning": true,
+                    "max_separate_address_keys": wallet::keys::MAX_SCAN_ADDRESSES,
                     "last_error": self.0.last_error.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone(),
+                }))
+            }
+            "getreceiveaddress" => {
+                let receiving = wallet.current_receive_address()?;
+                Ok(json!({
+                    "index": receiving.as_ref().map(|(index, _)| *index),
+                    "address": receiving.as_ref().map(|(_, address)| address.encode(prefix)),
+                    "exhausted": receiving.is_none(),
                 }))
             }
             "getnewaddress" => {
@@ -879,6 +944,7 @@ impl WalletDaemon {
                 let index = wallet.address_index_of(&address);
                 Ok(json!({
                     "is_mine": index.is_some(),
+                    "scan_covered": wallet.scans_address(&address)?,
                     "index": index,
                     "label": index.and_then(|i| self.labels().ok()?.get(&i).cloned()),
                 }))
@@ -1039,6 +1105,29 @@ fn parse_txid(text: &str) -> core::result::Result<TxId, RpcError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn poll_deadlines_do_not_shift_with_scan_duration() {
+        let epoch = tokio::time::Instant::now();
+        let interval = std::time::Duration::from_secs(5);
+        for milliseconds in [0, 79, 112, 4_999] {
+            assert_eq!(
+                super::next_poll(
+                    epoch,
+                    interval,
+                    epoch + std::time::Duration::from_millis(milliseconds)
+                ),
+                epoch + interval,
+            );
+        }
+        assert_eq!(
+            super::next_poll(epoch, interval, epoch + interval),
+            epoch + 2 * interval
+        );
+        assert_eq!(
+            super::next_poll(epoch, interval, epoch + std::time::Duration::from_secs(11)),
+            epoch + 3 * interval
+        );
+    }
     use std::collections::VecDeque;
 
     use chain::pow::RandomXPow;
@@ -1056,8 +1145,37 @@ mod tests {
 
     #[test]
     fn the_wallet_daemon_defaults_to_the_main_network() {
-        let args = Args::try_parse_from(["Rhombus-wallet-rpc"]).unwrap();
+        let target = format!("{}:18444", p2p::address::NetAddr::TorV3([1; 32]));
+        let args = Args::try_parse_from(["Rhombus-wallet-rpc", "--node", &target]).unwrap();
         assert_eq!(args.network, Network::Main);
+        assert!(args.datadir.is_none());
+        assert!(Args::try_parse_from(["Rhombus-wallet-rpc"]).is_err());
+    }
+
+    #[tokio::test]
+    async fn wallet_rpc_rejects_non_localhost_listeners_before_starting() {
+        for listen in ["0.0.0.0:18447", "[::1]:18447", "192.0.2.1:18447"] {
+            let (_directory, wallet) = wallet_file();
+            let result = run(Config {
+                wallet,
+                network: Network::Test,
+                node: Endpoint {
+                    addr: format!("{}:18444", p2p::address::NetAddr::TorV3([1; 32])),
+                    token: Token::new("node").unwrap(),
+                    network: p2p::transport::test_support::network(
+                        p2p::address::NetAddr::TorV3([32; 32]),
+                        &[],
+                    )
+                    .0,
+                },
+                listen: listen.parse().unwrap(),
+                token: Token::new("wallet").unwrap(),
+                sync_interval: Duration::from_secs(1),
+                light: false,
+            })
+            .await;
+            assert!(matches!(result, Err(Error::Argument(reason)) if reason.contains("127.0.0.1")));
+        }
     }
 
     fn wallet_file() -> (tempfile::TempDir, Wallet) {
@@ -1162,6 +1280,122 @@ mod tests {
 
     fn offline_daemon(wallet: Wallet) -> WalletDaemon {
         daemon(wallet, Source::Embedded(tokio::sync::mpsc::channel(1).0))
+    }
+
+    #[test]
+    fn receive_rpc_reuses_an_unused_address_and_manual_issuance_selects_a_new_one() {
+        let (_dir, wallet) = wallet_file();
+        let daemon = offline_daemon(wallet);
+        let params = Params::new(json!([]));
+        let first = daemon.wallet_methods("getreceiveaddress", &params).unwrap();
+        assert_eq!(first["exhausted"], false);
+        assert!(first["address"].is_string());
+        let range = daemon.wallet().address_scan_range().unwrap();
+        assert_eq!(
+            daemon.wallet_methods("getreceiveaddress", &params).unwrap(),
+            first
+        );
+        let info = daemon.wallet_methods("getwalletinfo", &params).unwrap();
+        assert_eq!(info["receive_address"], first["address"]);
+        assert_eq!(info["receive_address_index"], first["index"]);
+        assert_eq!(info["address_rotation_exhausted"], false);
+        daemon.wallet_methods("listaddresses", &params).unwrap();
+        assert_eq!(daemon.wallet().address_scan_range().unwrap(), range);
+        let manual = daemon
+            .wallet_methods("getnewaddress", &Params::new(json!(["deposit"])))
+            .unwrap();
+        let current = daemon.wallet_methods("getreceiveaddress", &params).unwrap();
+        assert_ne!(current["address"], first["address"]);
+        assert_eq!(current["address"], manual["address"]);
+        assert_eq!(current["index"], manual["index"]);
+    }
+
+    #[test]
+    fn exhausted_address_rotation_is_reported_without_hiding_wallet_info() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet = Wallet::restore(
+            dir.path().join("wallet.redb"),
+            &SpendingKey::from_bytes([77; 32]),
+            genesis(&Network::Test.params()).hash(),
+            wallet::keys::MAX_SCAN_ADDRESSES.checked_sub(1).unwrap(),
+            &mut ChaCha20Rng::seed_from_u64(77),
+        )
+        .unwrap();
+        let daemon = offline_daemon(wallet);
+        let params = Params::new(json!([]));
+        let current = daemon.wallet_methods("getreceiveaddress", &params).unwrap();
+        assert_eq!(
+            current,
+            json!({"index": null, "address": null, "exhausted": true})
+        );
+        let info = daemon.wallet_methods("getwalletinfo", &params).unwrap();
+        assert_eq!(info["address_rotation_exhausted"], true);
+        assert!(info["receive_address"].is_null());
+        assert!(info["receive_address_index"].is_null());
+        assert_eq!(info["next_address_index"], wallet::keys::MAX_SCAN_ADDRESSES);
+        assert!(daemon.wallet_methods("getnewaddress", &params).is_err());
+    }
+
+    #[tokio::test]
+    async fn rebroadcasting_recorded_bytes_preserves_the_receive_address_and_allocation() {
+        let (_dir, wallet) = wallet_file();
+        let operation = recorded_payment(&wallet);
+        let receiving = wallet.current_receive_address().unwrap();
+        let range = wallet.address_scan_range().unwrap();
+        let mut client = ScriptedControl::new([
+            Err(Error::Argument("reply lost".into())),
+            Ok("accepted".into()),
+        ]);
+        assert!(WalletDaemon::submit_recorded(&mut client, &operation)
+            .await
+            .is_err());
+        WalletDaemon::submit_recorded(&mut client, &operation)
+            .await
+            .unwrap();
+        assert_eq!(client.calls.len(), 2);
+        assert_eq!(client.calls.first(), client.calls.last());
+        assert_eq!(wallet.address_scan_range().unwrap(), range);
+        assert_eq!(wallet.current_receive_address().unwrap(), receiving);
+    }
+
+    #[test]
+    fn received_coin_json_preserves_the_actual_address_scheme() {
+        let (_dir, wallet) = wallet_file();
+        let (index, new_address) = wallet.new_address("separate key").unwrap();
+        let legacy = wallet.keys().legacy_address(index.into()).unwrap();
+        let daemon = offline_daemon(wallet);
+        let labels = daemon.labels().unwrap();
+        for (address, legacy_address) in [(&new_address, false), (&legacy, true)] {
+            let coin = protocol::coin::Coin::new(
+                *address.diversifier(),
+                *address.pk_d(),
+                RawCoin::from_raw(7).unwrap(),
+                protocol::coin::Rho::from_nullifier(
+                    &protocol::nullifier::Nullifier::from_bytes(&[0; 32]).unwrap(),
+                )
+                .unwrap(),
+                protocol::coin::RandomSeed::from_bytes([7; 32]),
+            );
+            let owned = OwnedCoin {
+                nullifier: coin
+                    .nullifier(daemon.0.wallet.keys().nullifier_key())
+                    .unwrap(),
+                coin,
+                position: 0,
+                height: 0,
+                spent_at: None,
+                txid: None,
+                spent_by: None,
+                legacy_address,
+            };
+            let json = daemon.coin_json(&owned, &labels, &[]).unwrap();
+            assert_eq!(
+                json["address"],
+                address.encode(Network::Test.address_prefix())
+            );
+            assert_eq!(json["address_index"], index);
+            assert_eq!(json["label"], "separate key");
+        }
     }
 
     fn payment(wallet: &Wallet) -> Operation {

@@ -444,8 +444,8 @@ mod tests {
     fn wallet(rng: &mut ChaCha20Rng) -> Wallet {
         let sk = SpendingKey::random(rng);
         let fvk = FullViewingKey::derive(&sk).unwrap();
-        let (receiver_key, _) = fvk.receiver_key();
         let address = Address::derive(&fvk, Diversifier::random(rng)).unwrap();
+        let (receiver_key, _) = fvk.receiver_key_for_diversifier(address.diversifier());
         Wallet {
             sk,
             fvk,
@@ -522,7 +522,16 @@ mod tests {
 
     #[test]
     fn payment_is_padded_to_two_actions_and_fully_verifies() {
+        use crate::bytes::Encodable;
+
         let (mut rng, _, _, tx) = payment(1);
+        let digest = crypto::hash::blake2b_short(crypto::hash::PIN, &[&tx.to_vec()]);
+        let digest = crypto::encoding::to_hex(&digest);
+        eprintln!("transaction build vector: {digest}");
+        assert_eq!(
+            digest,
+            "a858d3e77c7b7208c25a103c4571a8c61cfe9f9fe969637ec17ec0d4daf03435"
+        );
         assert_eq!(tx.actions().len(), 2);
         assert!(verify_regular(&tx, BRANCH, test_keys::verifying_key(), &mut rng).is_ok());
         assert!(

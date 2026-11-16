@@ -117,7 +117,7 @@ impl ProvingKey {
     /// The matching verifying key.
     pub fn verifying_key(&self) -> VerifyingKey {
         VerifyingKey {
-            params: params(),
+            params: self.params.clone(),
             vk: self.pk.get_vk().clone(),
         }
     }

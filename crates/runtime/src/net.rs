@@ -1,265 +1,433 @@
-//! Sockets: the listener, the dialer with optional SOCKS5 proxy, and the
-//! task that runs one connection and forwards its messages to the loop.
+//! Embedded Tor streams and bounded connection tasks.
 
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::mem::size_of;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use p2p::message::Message;
-use p2p::noise::Role;
+use p2p::address::{NetAddr, PeerKey};
+use p2p::message::{Message, MAX_MESSAGE_LEN};
 use p2p::peer::Direction;
-use p2p::transport::{establish_within, ConnectionReader, ConnectionWriter, HANDSHAKE_TIMEOUT};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use p2p::transport::{split, ConnectionReader, ConnectionWriter, Stream, TorNetwork, TorStatus};
+use protocol::action::{Action, ACTION_LEN};
+use protocol::block::{Block, BlockHeader, HEADER_LEN};
+use protocol::consensus::MAX_BLOCK_TRANSACTIONS;
+use protocol::transaction::Transaction;
+use tokio::sync::{mpsc, watch};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 
 use crate::node::{Event, PeerId};
-use crate::{Error, Result};
 
 /// Messages queued to a peer before it is considered stuck.
 const OUTBOX_CAPACITY: usize = 1_024;
-/// Bounds DNS, TCP and proxy setup, including slower Tor circuit creation.
-const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
-/// Inbound connections allowed in the handshake at once. The node's
-/// inbound cap only counts peers that finished the handshake, so without
-/// this a client could hold any number of sockets open by staying silent.
-pub const MAX_PENDING_INBOUND: usize = 32;
+/// Conservative memory charges for all queued and currently written messages.
+const PEER_OUTBOX_BYTES: usize = 384 * 1024 * 1024;
+const GLOBAL_OUTBOX_BYTES: usize = 1024 * 1024 * 1024;
+/// Leave room for control traffic while bulk serving is paused.
+const CONTROL_HEADROOM: usize = 512 * 1024;
+/// Conservative framing scratch allowance for each outbound message.
+const WRITE_SCRATCH: usize = 128 * 1024;
+/// A peer that cannot accept one message for this long is disconnected so
+/// outbound permits cannot be held indefinitely by a slow reader.
+const OUTBOUND_WRITE_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// What bounds the accept loop: how many connections may be mid-handshake
-/// and how long each may take.
-#[derive(Clone, Copy, Debug)]
-pub struct AcceptLimits {
-    /// Connections allowed in the handshake at once.
-    pub pending: usize,
-    /// Deadline for one handshake.
-    pub handshake_timeout: Duration,
+static OUTBOUND_BYTES: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+/// A peer's outbound queue, bounded by both message count and memory charges.
+/// Dropping its last clone cancels the connection and discards the backlog.
+#[derive(Clone, Debug)]
+pub struct Outbox {
+    sender: mpsc::Sender<Queued>,
+    state: Arc<OutboxState>,
 }
 
-impl Default for AcceptLimits {
-    fn default() -> Self {
-        Self {
-            pending: MAX_PENDING_INBOUND,
-            handshake_timeout: HANDSHAKE_TIMEOUT,
+#[derive(Debug)]
+struct OutboxState {
+    peer: Arc<Semaphore>,
+    global: Arc<Semaphore>,
+    // The connection watches channel closure; queued messages must not hold
+    // this sender, so even a blocked write is cancelled on the last Outbox drop.
+    _lifetime: watch::Sender<()>,
+}
+
+/// Capacity reserved before loading a stored block into memory.
+#[derive(Debug)]
+pub struct Reservation {
+    peer: Arc<Semaphore>,
+    bytes: usize,
+    _peer: OwnedSemaphorePermit,
+    _global: OwnedSemaphorePermit,
+}
+
+#[derive(Debug)]
+struct Queued {
+    message: Message,
+    _reservation: Reservation,
+}
+
+/// An outbound queue could not accept a message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SendError {
+    /// The peer's queue or a memory budget is full.
+    Full,
+    /// The connection is closed.
+    Closed,
+    /// The message exceeds the protocol limit or its reservation.
+    TooLarge,
+}
+
+impl Outbox {
+    fn channel(global: Arc<Semaphore>) -> (Self, mpsc::Receiver<Queued>, watch::Receiver<()>) {
+        Self::with_limits(global, PEER_OUTBOX_BYTES, OUTBOX_CAPACITY)
+    }
+
+    fn with_limits(
+        global: Arc<Semaphore>,
+        peer_bytes: usize,
+        capacity: usize,
+    ) -> (Self, mpsc::Receiver<Queued>, watch::Receiver<()>) {
+        let (sender, receiver) = mpsc::channel(capacity);
+        let (lifetime, closed) = watch::channel(());
+        let state = Arc::new(OutboxState {
+            peer: Arc::new(Semaphore::new(peer_bytes)),
+            global,
+            _lifetime: lifetime,
+        });
+        (Self { sender, state }, receiver, closed)
+    }
+
+    fn reserve(&self, bytes: usize, headroom: usize) -> Option<Reservation> {
+        if self.sender.is_closed() || self.sender.capacity() == 0 {
+            return None;
         }
+        let needed = bytes.checked_add(headroom)?;
+        // Acquire the headroom atomically as well: a separate availability
+        // check races with other connections sharing the global semaphore.
+        let permits = u32::try_from(needed).ok()?;
+        let mut peer = Arc::clone(&self.state.peer)
+            .try_acquire_many_owned(permits)
+            .ok()?;
+        let mut global = Arc::clone(&self.state.global)
+            .try_acquire_many_owned(permits)
+            .ok()?;
+        drop(peer.split(headroom)?);
+        drop(global.split(headroom)?);
+        Some(Reservation {
+            peer: Arc::clone(&self.state.peer),
+            bytes,
+            _peer: peer,
+            _global: global,
+        })
+    }
+
+    /// Reserves memory before decoding a stored body. `encoded_len` is the
+    /// stored block encoding length, excluding the network message tag.
+    /// Returns `None` while bulk serving should wait for a writable event.
+    pub fn try_reserve_block(&self, encoded_len: usize) -> Option<Reservation> {
+        self.reserve(block_charge(encoded_len)?, CONTROL_HEADROOM)
+    }
+
+    /// Queues a message using an existing reservation, releasing it on error.
+    ///
+    /// # Errors
+    /// Rejects a closed/full queue, an oversized message, or another peer's reservation.
+    pub fn try_send_reserved(
+        &self,
+        message: Message,
+        reservation: Reservation,
+    ) -> std::result::Result<(), SendError> {
+        let bytes = message_charge(&message).ok_or(SendError::TooLarge)?;
+        if !Arc::ptr_eq(&reservation.peer, &self.state.peer) || bytes > reservation.bytes {
+            return Err(SendError::TooLarge);
+        }
+        self.sender
+            .try_send(Queued {
+                message,
+                _reservation: reservation,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => SendError::Full,
+                mpsc::error::TrySendError::Closed(_) => SendError::Closed,
+            })
+    }
+
+    /// Queues a control or relay message without waiting for capacity.
+    ///
+    /// # Errors
+    /// Rejects a closed/full queue or a message beyond the protocol/byte limit.
+    pub fn try_send(&self, message: Message) -> std::result::Result<(), SendError> {
+        if self.sender.is_closed() {
+            return Err(SendError::Closed);
+        }
+        let bytes = message_charge(&message).ok_or(SendError::TooLarge)?;
+        let reservation = self.reserve(bytes, 0).ok_or(SendError::Full)?;
+        self.try_send_reserved(message, reservation)
     }
 }
 
-/// Accepts connections forever, spawning a connection task for each,
-/// under [`AcceptLimits::default`].
-pub async fn listen(listener: TcpListener, events: mpsc::Sender<Event>, next_id: PeerId) {
-    listen_within(listener, events, next_id, AcceptLimits::default()).await;
+// Charges include decoded allocations, spare Vec capacity, canonical encoding,
+// framing buffers. These are conservative admission budgets,
+// not an exact process-RSS measurement. No encoding or proof cloning is needed
+// to account for a message. Retaining permits through the write covers all
+// messages already removed from the channel as well as the queued backlog.
+fn charge(encoded: usize, retained: usize) -> Option<usize> {
+    if encoded > MAX_MESSAGE_LEN {
+        return None;
+    }
+    retained
+        .checked_mul(2)?
+        .checked_add(encoded.checked_mul(4)?)?
+        .checked_add(WRITE_SCRATCH)
 }
 
-/// [`listen`] with explicit limits. A connection is accepted only once a
-/// pending slot is free; the slot is held until its handshake ends.
-pub async fn listen_within(
-    listener: TcpListener,
-    events: mpsc::Sender<Event>,
-    mut next_id: PeerId,
-    limits: AcceptLimits,
-) {
-    let pending = Arc::new(Semaphore::new(limits.pending));
-    loop {
-        let Ok(permit) = Arc::clone(&pending).acquire_owned().await else {
-            return;
-        };
-        let Ok((stream, addr)) = listener.accept().await else {
-            return;
-        };
-        let id = next_id;
-        next_id = next_id.saturating_add(1);
-        let target = addr.to_string();
-        tokio::spawn(run_connection(
-            Accepted {
-                stream,
-                role: Role::Responder,
-                direction: Direction::Inbound,
-                id,
-                addr,
-                target,
-                permit: Some(permit),
-                handshake_timeout: limits.handshake_timeout,
-            },
-            events.clone(),
-        ));
+fn transaction_usage(tx: &Transaction) -> Option<(usize, usize)> {
+    let actions = tx.actions().len();
+    let proof = tx.proof().as_bytes().len();
+    let encoded = (1usize + 1 + 32 + 8 + 1 + 4 + 64)
+        .checked_add(actions.checked_mul(ACTION_LEN)?)?
+        .checked_add(proof)?;
+    let heap = actions
+        .checked_mul(size_of::<Action>())?
+        .checked_add(proof)?;
+    Some((encoded, heap))
+}
+
+fn transactions_usage(transactions: &[Transaction]) -> Option<(usize, usize)> {
+    let mut encoded = 0usize;
+    let mut retained = transactions.len().checked_mul(size_of::<Transaction>())?;
+    for tx in transactions {
+        let (wire, heap) = transaction_usage(tx)?;
+        encoded = encoded.checked_add(wire)?;
+        retained = retained.checked_add(heap)?;
     }
+    Some((encoded, retained))
+}
+
+fn message_charge(message: &Message) -> Option<usize> {
+    let (payload, heap) = match message {
+        Message::Version(_) => (4 + 8 + 4 + 32 + 8 + 8 + 1 + 36, 0),
+        Message::Verack | Message::GetAddr => (0, 0),
+        Message::Ping(_) | Message::Pong(_) => (8, 0),
+        Message::Addr(items) => (
+            4usize.checked_add(items.len().checked_mul(44)?)?,
+            items
+                .capacity()
+                .checked_mul(size_of::<p2p::message::PeerAddr>())?,
+        ),
+        Message::GetHeaders { locator, .. } => (
+            36usize.checked_add(locator.len().checked_mul(32)?)?,
+            locator.capacity().checked_mul(32)?,
+        ),
+        Message::Headers(items) => (
+            4usize.checked_add(items.len().checked_mul(HEADER_LEN)?)?,
+            items.capacity().checked_mul(size_of::<BlockHeader>())?,
+        ),
+        Message::Inv(items) | Message::GetData(items) | Message::NotFound(items) => (
+            4usize.checked_add(items.len().checked_mul(33)?)?,
+            items
+                .capacity()
+                .checked_mul(size_of::<p2p::message::Inventory>())?,
+        ),
+        Message::Block(block) => {
+            let (wire, heap) = transactions_usage(block.transactions())?;
+            (
+                (HEADER_LEN + 4).checked_add(wire)?,
+                size_of::<Block>().checked_add(heap)?,
+            )
+        }
+        Message::Tx(tx) | Message::StemTx(tx) => {
+            let (wire, heap) = transaction_usage(tx)?;
+            (wire, size_of::<Transaction>().checked_add(heap)?)
+        }
+        Message::CompactBlock(block) => {
+            let (wire, heap) = transaction_usage(&block.coinbase)?;
+            (
+                (HEADER_LEN + 4)
+                    .checked_add(wire)?
+                    .checked_add(block.txids.len().checked_mul(32)?)?,
+                size_of::<p2p::message::CompactBlock>()
+                    .checked_add(heap)?
+                    .checked_add(block.txids.capacity().checked_mul(32)?)?,
+            )
+        }
+        Message::GetBlockTxn { indices, .. } => (
+            36usize.checked_add(indices.len().checked_mul(4)?)?,
+            indices.capacity().checked_mul(size_of::<u32>())?,
+        ),
+        Message::BlockTxn { transactions, .. } => {
+            let (wire, heap) = transactions_usage(transactions)?;
+            // Unlike a Block's private vector, this vector's capacity is
+            // visible, so include any caller-reserved excess directly.
+            let spare = transactions.capacity().saturating_sub(transactions.len());
+            (
+                36usize.checked_add(wire)?,
+                heap.checked_add(spare.checked_mul(size_of::<Transaction>())?)?,
+            )
+        }
+    };
+    charge(
+        payload.checked_add(1)?,
+        size_of::<Message>().checked_add(heap)?,
+    )
+}
+
+fn block_charge(encoded_len: usize) -> Option<usize> {
+    // Every action occupies ACTION_LEN encoded bytes; this bounds their
+    // extra decoded point representation without inspecting the stored body.
+    let action_overhead = size_of::<Action>().saturating_sub(ACTION_LEN);
+    let retained = encoded_len
+        .checked_add((encoded_len / ACTION_LEN).checked_mul(action_overhead)?)?
+        .checked_add(MAX_BLOCK_TRANSACTIONS.checked_mul(size_of::<Transaction>())?)?
+        .checked_add(size_of::<Block>().checked_add(size_of::<Message>())?)?;
+    charge(encoded_len.checked_add(1)?, retained)
+}
+/// Bounds onion circuit creation.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(120);
+/// Connections waiting for admission to the node actor at once.
+/// Application handshake and inbound-slot limits are enforced by the node.
+pub const MAX_PENDING_INBOUND: usize = 8;
+
+/// Admits one anonymous onion stream to the node actor.
+pub async fn accept(stream: Stream, events: mpsc::Sender<Event>, id: PeerId) {
+    run_connection(
+        Accepted {
+            stream,
+            direction: Direction::Inbound,
+            id,
+            target: "inbound onion stream".into(),
+            endpoint: None,
+            permit: None,
+        },
+        events,
+    )
+    .await;
 }
 
 /// A socket about to be handshaken and run.
 struct Accepted {
-    stream: TcpStream,
-    role: Role,
+    stream: Stream,
     direction: Direction,
     id: PeerId,
-    addr: SocketAddr,
     target: String,
-    /// The pending-inbound slot, released once the handshake ends.
+    endpoint: Option<PeerKey>,
+    /// The admission slot, released once the node receives the connection.
     permit: Option<OwnedSemaphorePermit>,
-    handshake_timeout: Duration,
 }
 
-/// Where a dial goes and how it gets there.
+/// An onion destination and its shared embedded Tor client.
 pub struct Route {
-    /// `host:port` to reach.
+    /// Validated onion endpoint, including virtual port.
     pub target: String,
-    /// SOCKS5 proxy for outbound connections.
-    pub proxy: Option<SocketAddr>,
-    /// This node's listen address, never dialed when a name resolves to it.
-    pub own: Option<SocketAddr>,
+    /// Shared embedded Tor network.
+    pub network: Arc<TorNetwork>,
+    /// Our onion identity, excluded from all outbound destinations.
+    pub own: Option<NetAddr>,
+    /// Readiness gate; a Tor outage cancels even an in-progress dial.
+    pub readiness: watch::Receiver<TorStatus>,
 }
 
-/// Dials `route.target` through the proxy or directly. A direct
-/// dial whose name resolves only to this node's own listener reports
-/// [`Event::DialedSelf`] instead of connecting.
+/// Dials through an isolated stream on the embedded Tor client.
 pub fn dial(route: Route, id: PeerId, events: mpsc::Sender<Event>) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let stream = tokio::time::timeout(DIAL_TIMEOUT, connect_route(&route)).await;
-        let target = route.target;
-        match stream {
-            Ok(Ok(Some(stream))) => {
-                let addr = stream
-                    .peer_addr()
-                    .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
+        let endpoint = NetAddr::parse_endpoint(&route.target);
+        let Ok(endpoint) = endpoint else {
+            let _ = events
+                .send(Event::DialFailed {
+                    id,
+                    target: route.target,
+                })
+                .await;
+            return;
+        };
+        if route.own == Some(endpoint.0) {
+            let _ = events
+                .send(Event::DialedSelf {
+                    id,
+                    target: route.target,
+                })
+                .await;
+            return;
+        }
+        let mut readiness = route.readiness;
+        if readiness.has_changed().is_err()
+            || !readiness.borrow().client_ready
+            || readiness.borrow().onion.is_none()
+        {
+            let _ = events
+                .send(Event::DialFailed {
+                    id,
+                    target: route.target,
+                })
+                .await;
+            return;
+        }
+        let connected = tokio::select! {
+            biased;
+            () = unavailable(&mut readiness) => {
+                let _ = events.send(Event::DialFailed { id, target: route.target }).await;
+                return;
+            }
+            connected = tokio::time::timeout(
+                DIAL_TIMEOUT,
+                route.network.connect(&route.target),
+            ) => connected,
+        };
+        match connected {
+            Ok(Ok(stream)) => {
                 run_connection(
                     Accepted {
                         stream,
-                        role: Role::Initiator,
                         direction: Direction::Outbound,
                         id,
-                        addr,
-                        target,
+                        target: route.target,
+                        endpoint: Some(endpoint),
                         permit: None,
-                        handshake_timeout: HANDSHAKE_TIMEOUT,
                     },
                     events,
                 )
                 .await;
             }
-            Ok(Ok(None)) => {
-                let _ = events.send(Event::DialedSelf { id, target }).await;
-            }
             _ => {
-                let _ = events.send(Event::DialFailed { id, target }).await;
+                let _ = events
+                    .send(Event::DialFailed {
+                        id,
+                        target: route.target,
+                    })
+                    .await;
             }
         }
     })
 }
 
-async fn connect_route(route: &Route) -> Result<Option<TcpStream>> {
-    match route.proxy {
-        Some(proxy) => socks5_connect(proxy, &route.target).await.map(Some),
-        None => connect_direct(&route.target, route.own).await,
-    }
-}
-
-/// Resolves `target` and connects to the first of its addresses that is not
-/// this node's listener, or returns `None` when every address is ours: a
-/// seed node finding its own name in the seed list.
-async fn connect_direct(target: &str, own: Option<SocketAddr>) -> Result<Option<TcpStream>> {
-    let resolved: Vec<SocketAddr> = tokio::net::lookup_host(target).await?.collect();
-    let others = not_own(&resolved, own);
-    if others.is_empty() && !resolved.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(TcpStream::connect(others.as_slice()).await?))
-}
-
-/// The addresses in `resolved` that are not this node's listener `own`. A
-/// listener on an unspecified address (`0.0.0.0`) is also reachable over
-/// loopback on its port; its other interface addresses are unknown here and
-/// are caught by the handshake's self-connection check instead.
-pub fn not_own(resolved: &[SocketAddr], own: Option<SocketAddr>) -> Vec<SocketAddr> {
-    resolved
-        .iter()
-        .copied()
-        .filter(|addr| !own.is_some_and(|own| is_own(*addr, own)))
-        .collect()
-}
-
-fn is_own(addr: SocketAddr, own: SocketAddr) -> bool {
-    addr == own
-        || (own.ip().is_unspecified() && addr.port() == own.port() && addr.ip().is_loopback())
-}
-
-/// Opens a TCP connection to `target` through a SOCKS5 proxy without
-/// authentication, passing the hostname to the proxy so it resolves it.
-/// This is how Tor reaches `.onion` peers.
-///
-/// # Errors
-/// Fails on a socket error or a proxy refusal.
-pub async fn socks5_connect(proxy: SocketAddr, target: &str) -> Result<TcpStream> {
-    let (host, port) = target
-        .rsplit_once(':')
-        .ok_or_else(|| Error::Argument(format!("bad target {target}")))?;
-    let port: u16 = port
-        .parse()
-        .map_err(|_| Error::Argument(format!("bad port in {target}")))?;
-    let host_len =
-        u8::try_from(host.len()).map_err(|_| Error::Argument("hostname too long".into()))?;
-    let mut stream = TcpStream::connect(proxy).await?;
-
-    stream.write_all(&[5, 1, 0]).await?;
-    let mut reply = [0u8; 2];
-    stream.read_exact(&mut reply).await?;
-    if reply != [5, 0] {
-        return Err(Error::Argument("proxy refused the handshake".into()));
-    }
-
-    let mut request = vec![5, 1, 0, 3, host_len];
-    request.extend_from_slice(host.as_bytes());
-    request.extend_from_slice(&port.to_be_bytes());
-    stream.write_all(&request).await?;
-    let mut head = [0u8; 4];
-    stream.read_exact(&mut head).await?;
-    if head.get(1) != Some(&0) {
-        return Err(Error::Argument(format!(
-            "proxy connect failed with code {}",
-            head.get(1).copied().unwrap_or(0)
-        )));
-    }
-    let bound_len = match head.get(3) {
-        Some(1) => 4,
-        Some(4) => 16,
-        Some(3) => {
-            let mut len = [0u8; 1];
-            stream.read_exact(&mut len).await?;
-            usize::from(len[0])
+async fn unavailable(status: &mut watch::Receiver<TorStatus>) {
+    loop {
+        let ready = {
+            let state = status.borrow_and_update();
+            state.client_ready && state.onion.is_some()
+        };
+        if !ready || status.changed().await.is_err() {
+            return;
         }
-        _ => return Err(Error::Argument("proxy reply malformed".into())),
-    };
-    let mut bound = vec![0u8; bound_len.saturating_add(2)];
-    stream.read_exact(&mut bound).await?;
-    Ok(stream)
+    }
 }
 
-/// Handshakes, then pumps messages both ways until either side closes.
 async fn run_connection(accepted: Accepted, events: mpsc::Sender<Event>) {
     let Accepted {
         stream,
-        role,
         direction,
         id,
-        addr,
         target,
+        endpoint,
         permit,
-        handshake_timeout,
     } = accepted;
-    let local = stream.local_addr().ok();
-    let established = establish_within(stream, role, handshake_timeout).await;
-    drop(permit);
-    let Ok((writer, reader)) = established else {
-        let _ = events.send(Event::DialFailed { id, target }).await;
-        return;
-    };
-    let (outbox, inbox) = mpsc::channel::<Message>(OUTBOX_CAPACITY);
+    let (writer, reader) = split(stream);
+    let global = OUTBOUND_BYTES.get_or_init(|| Arc::new(Semaphore::new(GLOBAL_OUTBOX_BYTES)));
+    let (outbox, inbox, mut closed) = Outbox::channel(Arc::clone(global));
     if events
         .send(Event::Connected {
             id,
             direction,
-            addr,
-            local,
+            addr: endpoint,
             target,
             outbox,
         })
@@ -268,21 +436,41 @@ async fn run_connection(accepted: Accepted, events: mpsc::Sender<Event>) {
     {
         return;
     }
-    let mut writer_task = tokio::spawn(write_loop(writer, inbox));
-    // Reading ends when the peer closes; writing ends when the node drops
-    // the outbox. Either way the connection is over.
+    drop(permit);
+    // All futures are owned here: ending any branch cancels socket work and
+    // drops the buffered messages immediately, including a stalled write.
     tokio::select! {
-        () = read_loop(reader, id, &events) => writer_task.abort(),
-        _ = &mut writer_task => {}
+        biased;
+        _ = closed.changed() => {}
+        () = read_loop(reader, id, &events) => {}
+        () = write_loop(writer, inbox, id, &events) => {}
     }
     let _ = events.send(Event::Disconnected { id }).await;
 }
 
-async fn write_loop(mut writer: ConnectionWriter, mut inbox: mpsc::Receiver<Message>) {
-    while let Some(message) = inbox.recv().await {
-        if writer.send(&message).await.is_err() {
-            break;
+async fn write_loop(
+    writer: ConnectionWriter,
+    inbox: mpsc::Receiver<Queued>,
+    id: PeerId,
+    events: &mpsc::Sender<Event>,
+) {
+    write_loop_within(writer, inbox, id, events, OUTBOUND_WRITE_TIMEOUT).await;
+}
+
+async fn write_loop_within(
+    mut writer: ConnectionWriter,
+    mut inbox: mpsc::Receiver<Queued>,
+    id: PeerId,
+    events: &mpsc::Sender<Event>,
+    deadline: Duration,
+) {
+    while let Some(queued) = inbox.recv().await {
+        match tokio::time::timeout(deadline, writer.send(&queued.message)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) | Err(_) => break,
         }
+        drop(queued);
+        let _ = events.try_send(Event::Writable { id });
     }
 }
 
@@ -303,160 +491,257 @@ async fn read_loop(mut reader: ConnectionReader, id: PeerId, events: &mpsc::Send
 
 #[cfg(test)]
 mod tests {
+    use p2p::message::Inventory;
+    use p2p::transport::test_support;
+    use protocol::block::{empty_header, BlockHash};
+    use protocol::bytes::Encodable;
+    use protocol::transaction::Anchor;
     use tokio::net::TcpListener;
 
     use super::*;
 
-    /// With one pending slot, a silent client blocks the next accept until
-    /// its handshake deadline passes; then a real client gets through.
+    #[test]
+    fn outbound_budgets_include_messages_removed_from_the_channel() {
+        let bytes = message_charge(&Message::Ping(1)).unwrap();
+        let global = Arc::new(Semaphore::new(10 * bytes));
+        let (outbox, mut inbox, _) = Outbox::with_limits(global, 2 * bytes, 8);
+        outbox.try_send(Message::Ping(1)).unwrap();
+        outbox.try_send(Message::Ping(2)).unwrap();
+        let writing = inbox.try_recv().unwrap();
+        assert_eq!(outbox.try_send(Message::Ping(3)), Err(SendError::Full));
+        drop(writing);
+        outbox.try_send(Message::Ping(3)).unwrap();
+        drop(inbox);
+        assert_eq!(outbox.state.peer.available_permits(), 2 * bytes);
+        assert_eq!(outbox.try_send(Message::Ping(4)), Err(SendError::Closed));
+    }
+
+    #[test]
+    fn outbound_budget_is_shared_between_peers() {
+        let bytes = message_charge(&Message::Ping(1)).unwrap();
+        let global = Arc::new(Semaphore::new(2 * bytes));
+        let (first, first_inbox, _) = Outbox::with_limits(Arc::clone(&global), 4 * bytes, 8);
+        let (second, second_inbox, _) = Outbox::with_limits(Arc::clone(&global), 4 * bytes, 8);
+        first.try_send(Message::Ping(1)).unwrap();
+        second.try_send(Message::Ping(2)).unwrap();
+        assert_eq!(second.try_send(Message::Ping(3)), Err(SendError::Full));
+        assert_eq!(second.state.peer.available_permits(), 3 * bytes);
+        drop(first_inbox);
+        second.try_send(Message::Ping(3)).unwrap();
+        drop(second_inbox);
+        assert_eq!(global.available_permits(), 2 * bytes);
+    }
+
+    #[test]
+    fn outbound_message_count_remains_bounded() {
+        let bytes = message_charge(&Message::Verack).unwrap();
+        let global = Arc::new(Semaphore::new(10 * bytes));
+        let (outbox, _inbox, _) = Outbox::with_limits(global, 10 * bytes, 2);
+        outbox.try_send(Message::Verack).unwrap();
+        outbox.try_send(Message::Verack).unwrap();
+        assert_eq!(outbox.try_send(Message::Verack), Err(SendError::Full));
+        assert_eq!(outbox.state.peer.available_permits(), 8 * bytes);
+    }
+
+    #[test]
+    fn block_preflight_allows_protocol_limit_and_preserves_control_capacity() {
+        // Reserving is independent of loading/allocating the body itself.
+        let global = Arc::new(Semaphore::new(GLOBAL_OUTBOX_BYTES));
+        let (outbox, _inbox, _) = Outbox::channel(global);
+        let reservation = outbox.try_reserve_block(MAX_MESSAGE_LEN - 1).unwrap();
+        assert!(reservation.bytes < PEER_OUTBOX_BYTES - CONTROL_HEADROOM);
+        outbox.try_send(Message::Ping(1)).unwrap();
+        assert!(outbox.try_reserve_block(MAX_MESSAGE_LEN).is_none());
+        drop(reservation);
+    }
+
+    #[test]
+    fn block_preflight_reservation_covers_decoded_block_and_rejects_misuse() {
+        let root = Anchor::from_base(crypto::pallas::Base::from(0));
+        let block = Block::new(empty_header(0, BlockHash::ZERO, root), Vec::new());
+        let encoded_len = block.to_vec().len();
+        let global = Arc::new(Semaphore::new(GLOBAL_OUTBOX_BYTES));
+        let (outbox, mut inbox, _) = Outbox::channel(Arc::clone(&global));
+        let (other, _other_inbox, _) = Outbox::channel(global);
+        let reserved = outbox.try_reserve_block(encoded_len).unwrap();
+        outbox
+            .try_send_reserved(Message::Block(Box::new(block.clone())), reserved)
+            .unwrap();
+        assert!(matches!(
+            inbox.try_recv().unwrap().message,
+            Message::Block(_)
+        ));
+        let wrong_peer = other.try_reserve_block(encoded_len).unwrap();
+        assert_eq!(
+            outbox.try_send_reserved(Message::Block(Box::new(block)), wrong_peer),
+            Err(SendError::TooLarge)
+        );
+    }
+
     #[tokio::test]
-    async fn silent_clients_hold_a_pending_slot_only_until_the_deadline() {
+    async fn dropping_last_outbox_cancels_even_with_a_buffered_backlog() {
+        let global = Arc::new(Semaphore::new(GLOBAL_OUTBOX_BYTES));
+        let (outbox, mut inbox, mut closed) = Outbox::channel(global);
+        let clone = outbox.clone();
+        outbox.try_send(Message::Ping(1)).unwrap();
+        let writing = inbox.recv().await.unwrap();
+        outbox.try_send(Message::Ping(2)).unwrap();
+        drop(outbox);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), closed.changed())
+                .await
+                .is_err()
+        );
+        drop(clone);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), closed.changed())
+                .await
+                .unwrap()
+                .is_err()
+        );
+        // Queue entries and the active write cannot hold the lifetime sender.
+        drop(writing);
+        drop(inbox);
+    }
+
+    #[tokio::test]
+    async fn dropping_outbox_cancels_a_slow_socket_writer_and_releases_budgets() {
+        slow_writer_releases_budgets(true).await;
+    }
+
+    #[tokio::test]
+    async fn slow_socket_writer_times_out_and_releases_budgets_without_outbox_drop() {
+        slow_writer_releases_budgets(false).await;
+    }
+
+    async fn slow_writer_releases_budgets(cancel: bool) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let (events, mut inbox) = mpsc::channel(8);
-        let limits = AcceptLimits {
-            pending: 1,
-            handshake_timeout: Duration::from_millis(200),
-        };
-        tokio::spawn(listen_within(listener, events, 0, limits));
-
-        let _silent = TcpStream::connect(addr).await.unwrap();
-        let honest = TcpStream::connect(addr).await.unwrap();
-        let client = tokio::spawn(establish_within(
-            honest,
-            Role::Initiator,
-            Duration::from_secs(5),
-        ));
-
-        assert!(matches!(
-            inbox.recv().await,
-            Some(Event::DialFailed { id: 0, .. })
-        ));
-        assert!(matches!(
-            inbox.recv().await,
-            Some(Event::Connected { id: 1, .. })
-        ));
-        assert!(client.await.unwrap().is_ok());
-    }
-
-    /// A minimal SOCKS5 server that accepts one CONNECT to any host and
-    /// then echoes bytes, so the client side can be tested end to end.
-    async fn fake_proxy(listener: TcpListener) -> Vec<u8> {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut greeting = [0u8; 3];
-        stream.read_exact(&mut greeting).await.unwrap();
-        assert_eq!(greeting, [5, 1, 0]);
-        stream.write_all(&[5, 0]).await.unwrap();
-        let mut head = [0u8; 5];
-        stream.read_exact(&mut head).await.unwrap();
-        assert_eq!(&head[..4], &[5, 1, 0, 3]);
-        let mut host = vec![0u8; usize::from(head[4])];
-        stream.read_exact(&mut host).await.unwrap();
-        let mut port = [0u8; 2];
-        stream.read_exact(&mut port).await.unwrap();
-        stream
-            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 1])
-            .await
+        let global = Arc::new(Semaphore::new(GLOBAL_OUTBOX_BYTES));
+        let global_for_server = Arc::clone(&global);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (writer, _reader) = split(stream);
+            let (outbox, inbox, mut closed) = Outbox::channel(global_for_server);
+            let bytes = message_charge(&Message::GetData(vec![
+                Inventory::Block(BlockHash::ZERO);
+                p2p::message::MAX_INVENTORY
+            ]))
             .unwrap();
-        let mut payload = [0u8; 5];
-        stream.read_exact(&mut payload).await.unwrap();
-        stream.write_all(&payload).await.unwrap();
-        host
-    }
-
-    #[tokio::test]
-    async fn socks5_connect_sends_the_hostname_and_returns_a_usable_stream() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy = listener.local_addr().unwrap();
-        let server = tokio::spawn(fake_proxy(listener));
-        let mut stream = socks5_connect(proxy, "example.onion:8333").await.unwrap();
-        stream.write_all(b"hello").await.unwrap();
-        let mut echoed = [0u8; 5];
-        stream.read_exact(&mut echoed).await.unwrap();
-        assert_eq!(&echoed, b"hello");
-        assert_eq!(server.await.unwrap(), b"example.onion");
-    }
-
-    #[tokio::test]
-    async fn socks5_connect_rejects_bad_targets_and_refusals() {
-        assert!(socks5_connect("127.0.0.1:1".parse().unwrap(), "no-port")
-            .await
-            .is_err());
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut greeting = [0u8; 3];
-            stream.read_exact(&mut greeting).await.unwrap();
-            stream.write_all(&[5, 0xff]).await.unwrap();
+            for _ in 0..20 {
+                outbox
+                    .try_send(Message::GetData(vec![
+                        Inventory::Block(BlockHash::ZERO);
+                        p2p::message::MAX_INVENTORY
+                    ]))
+                    .unwrap();
+            }
+            let reserved = 20usize.checked_mul(bytes).unwrap();
+            assert!(
+                outbox.state.peer.available_permits()
+                    <= PEER_OUTBOX_BYTES.checked_sub(reserved).unwrap()
+            );
+            let (events, _events_inbox) = mpsc::channel(8);
+            let task = tokio::spawn(async move {
+                tokio::select! {
+                    biased;
+                    _ = closed.changed() => {}
+                    () = write_loop_within(writer, inbox, 1, &events, Duration::from_millis(200)) => {}
+                }
+            });
+            // The client deliberately never reads. Enough data is queued to
+            // exceed a normal TCP send buffer, so the writer cannot drain it.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!task.is_finished());
+            if cancel {
+                drop(outbox);
+            }
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap();
         });
-        assert!(socks5_connect(proxy, "host:1").await.is_err());
-    }
-
-    fn addr(text: &str) -> SocketAddr {
-        text.parse().unwrap()
-    }
-
-    #[test]
-    fn only_our_exact_listener_is_filtered() {
-        let resolved = [addr("46.19.141.66:19000"), addr("46.19.141.67:19000")];
-        assert_eq!(
-            not_own(&resolved, Some(addr("46.19.141.66:19000"))),
-            [addr("46.19.141.67:19000")]
-        );
-        assert_eq!(not_own(&resolved, None), resolved);
-        assert_eq!(
-            not_own(&resolved, Some(addr("46.19.141.66:19001"))),
-            resolved,
-            "another port on our host is another node"
-        );
-    }
-
-    #[test]
-    fn an_unspecified_listener_is_also_our_loopback_on_its_port() {
-        let own = Some(addr("0.0.0.0:19000"));
-        let resolved = [
-            addr("127.0.0.1:19000"),
-            addr("127.0.0.1:19001"),
-            addr("46.19.141.66:19000"),
-        ];
-        assert_eq!(
-            not_own(&resolved, own),
-            [addr("127.0.0.1:19001"), addr("46.19.141.66:19000")]
-        );
-    }
-
-    #[tokio::test]
-    async fn a_name_resolving_only_to_ourselves_is_not_dialed() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let own = listener.local_addr().unwrap();
-        let skipped = connect_direct(&own.to_string(), Some(own)).await.unwrap();
-        assert!(skipped.is_none());
-        // Nothing connected: accepting would wait forever.
-        let accept = tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
-        assert!(accept.is_err());
-
-        let other = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let dialed = connect_direct(&other.local_addr().unwrap().to_string(), Some(own))
+        let client = p2p::transport::connect_loopback_for_tests(addr)
             .await
             .unwrap();
-        assert!(dialed.is_some());
+        let (_writer, _reader) = split(client);
+        server.await.unwrap();
+        assert_eq!(global.available_permits(), GLOBAL_OUTBOX_BYTES);
     }
 
     #[tokio::test]
-    async fn dialing_ourselves_reports_it_instead_of_connecting() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let own = listener.local_addr().unwrap();
+    async fn own_onion_is_not_dialed_even_on_another_service_port() {
+        let own = NetAddr::TorV3([79; 32]);
+        let (network, mut incoming) = test_support::network(own, &[19001]);
         let (events, mut inbox) = mpsc::channel(8);
-        let route = Route {
-            target: own.to_string(),
-            proxy: None,
-            own: Some(own),
-        };
-        dial(route, 7, events).await.unwrap();
+        let target = own.endpoint(19001);
+        dial(
+            Route {
+                readiness: network.status(),
+                network,
+                target: target.clone(),
+                own: Some(own),
+            },
+            7,
+            events,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(inbox.recv().await, Some(Event::DialedSelf { id: 7, target: got }) if got == target)
+        );
+        assert!(incoming.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn direct_and_dns_destinations_are_rejected_before_tor_dial() {
+        let (network, mut incoming) = test_support::network(NetAddr::TorV3([80; 32]), &[19000]);
+        for target in [
+            "127.0.0.1:19000",
+            "example.com:19000",
+            "invalid.onion:19000",
+        ] {
+            let (events, mut inbox) = mpsc::channel(8);
+            dial(
+                Route {
+                    readiness: network.status(),
+                    network: Arc::clone(&network),
+                    target: target.into(),
+                    own: None,
+                },
+                9,
+                events,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                inbox.recv().await,
+                Some(Event::DialFailed { id: 9, .. })
+            ));
+        }
+        assert!(incoming.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn unavailable_tor_blocks_dials() {
+        let (network, _incoming) = test_support::network(NetAddr::TorV3([81; 32]), &[19000]);
+        test_support::set_ready(&network, false);
+        let (events, mut inbox) = mpsc::channel(8);
+        dial(
+            Route {
+                readiness: network.status(),
+                network,
+                target: NetAddr::TorV3([82; 32]).endpoint(19000),
+                own: None,
+            },
+            1,
+            events,
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             inbox.recv().await,
-            Some(Event::DialedSelf { id: 7, target }) if target == own.to_string()
+            Some(Event::DialFailed { id: 1, .. })
         ));
     }
 }

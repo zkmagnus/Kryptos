@@ -110,7 +110,7 @@ pub struct Built {
 }
 
 /// Builds `payment` from the wallet's unspent coins, returning change to
-/// its default address. The anchor is the wallet's current tree root, so
+/// a newly reserved diversified address. The anchor is the wallet's current tree root, so
 /// the wallet must be scanned up to a recent block first.
 ///
 /// # Errors
@@ -174,12 +174,9 @@ fn build_selected(
         .checked_sub(amount.raw())
         .and_then(|value| value.checked_sub(fee.raw()))
         .ok_or(protocol::Error::RawCoinOutOfRange)?;
-    if change > 0 {
-        builder.add_output(OutputInfo::new(
-            keys.default_address()?,
-            RawCoin::from_raw(change)?,
-            ovk,
-        ))?;
+    let change_address = wallet.reserve_send_address(change > 0)?;
+    if let Some(address) = change_address {
+        builder.add_output(OutputInfo::new(address, RawCoin::from_raw(change)?, ovk))?;
     }
     let transaction = builder.build_with_fee(fee, pk, branch, rng)?;
     Ok(Built {
@@ -211,6 +208,7 @@ mod tests {
         );
         let nullifier = Nullifier::from_base(&pallas::Base::from(u64::from(position)));
         OwnedCoin {
+            legacy_address: false,
             coin,
             position: u64::from(position),
             nullifier,

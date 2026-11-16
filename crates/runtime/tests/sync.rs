@@ -11,13 +11,13 @@ mod common;
 
 use std::time::{Duration, Instant};
 
+use common::TorFixture;
 use crypto::keys::SpendingKey;
 use protocol::amount::RawCoin;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 use runtime::config::{Config, Network};
-use runtime::node::{spawn, Handle, Request, Response};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use runtime::node::{Handle, Request, Response};
 use transaction_proof::ProvingKey;
 use wallet::keys::WalletKeys;
 use wallet::spend::{build_payment, Payment};
@@ -40,6 +40,7 @@ async fn wait_for(deadline: Duration, mut check: impl AsyncFnMut() -> bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn follower_syncs_from_miner_and_relays_a_payment() {
+    let network = TorFixture::new();
     let mut rng = ChaCha20Rng::seed_from_u64(1);
     let miner_sk = SpendingKey::random(&mut rng);
     let miner_keys = WalletKeys::from_spending_key(miner_sk.clone()).unwrap();
@@ -47,44 +48,25 @@ async fn follower_syncs_from_miner_and_relays_a_payment() {
     let receiver = WalletKeys::from_spending_key(SpendingKey::random(&mut rng)).unwrap();
     let test_dir = tempfile::tempdir().unwrap();
 
-    let miner = spawn(Config {
-        network: Network::Test,
-        datadir: test_dir.path().join("miner"),
-        cleanup_datadir: false,
-        listen: Some("127.0.0.1:0".parse().unwrap()),
-        advertise: None,
-        connect: Vec::new(),
-        proxy: None,
-        mine_to: Some(miner_address),
-        mining_threads: 1,
-        rpc: None,
-        rpc_http: None,
-        rpc_token: None,
-        block_notify: None,
-        metrics: None,
-        max_inbound: 125,
-    })
-    .await
-    .unwrap();
-    let follower = spawn(Config {
-        network: Network::Test,
-        datadir: test_dir.path().join("follower"),
-        cleanup_datadir: false,
-        listen: None,
-        advertise: None,
-        connect: vec![miner.listen_addr.unwrap().to_string()],
-        proxy: None,
-        mine_to: None,
-        mining_threads: 1,
-        rpc: None,
-        rpc_http: None,
-        rpc_token: None,
-        block_notify: None,
-        metrics: None,
-        max_inbound: 125,
-    })
-    .await
-    .unwrap();
+    let miner = network
+        .spawn(Config {
+            datadir: test_dir.path().join("miner"),
+            cleanup_datadir: false,
+            p2p: true,
+            mine_to: Some(miner_address),
+            max_inbound: 125,
+            ..Config::test()
+        })
+        .await;
+    let follower = network
+        .spawn(Config {
+            datadir: test_dir.path().join("follower"),
+            cleanup_datadir: false,
+            connect: vec![network.endpoint(&miner)],
+            max_inbound: 125,
+            ..Config::test()
+        })
+        .await;
 
     // The follower catches up with the miner.
     // The first reward is spendable once block 1 is in the tree.
@@ -155,35 +137,97 @@ async fn follower_syncs_from_miner_and_relays_a_payment() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn inbound_connections_are_capped() {
-    let node = spawn(Config {
-        listen: Some("127.0.0.1:0".parse().unwrap()),
-        max_inbound: 2,
-        ..Config::test()
-    })
-    .await
-    .unwrap();
-    let addr = node.listen_addr.unwrap();
+    let network = TorFixture::new();
+    let node = network
+        .spawn(Config {
+            p2p: true,
+            max_inbound: 2,
+            ..Config::test()
+        })
+        .await;
+    let addr = network.endpoint(&node);
     let genesis = node_genesis(&node).await;
-    // Three dialers complete the transport handshake; only two get a peer
-    // slot, so the third never sees a Version message.
+    // Complete the application handshake for two healthy peers. A third
+    // connection must not evict them merely by opening another onion stream.
     let mut versions = 0;
     let mut kept = Vec::new();
-    for _ in 0..3 {
-        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let (mut writer, mut reader) =
-            p2p::transport::establish(stream, p2p::noise::Role::Initiator)
-                .await
-                .unwrap();
+    for attempt in 0..3u64 {
+        let stream = network.connect(&addr).await.unwrap();
+        let (mut writer, mut reader) = p2p::transport::split(stream);
         let hello = p2p::message::Message::Version(p2p::peer::version_info(7, 0, genesis, 0));
-        writer.send(&hello).await.unwrap();
+        if writer.send(&hello).await.is_err() {
+            continue;
+        }
         let got = tokio::time::timeout(Duration::from_secs(2), reader.recv()).await;
         if matches!(got, Ok(Ok(p2p::message::Message::Version(_)))) {
             versions += 1;
+            writer.send(&p2p::message::Message::Verack).await.unwrap();
+            writer
+                .send(&p2p::message::Message::Ping(attempt))
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while reader.recv().await.unwrap() != p2p::message::Message::Pong(attempt) {}
+            })
+            .await
+            .unwrap();
+            kept.push((writer, reader));
         }
-        kept.push((writer, reader));
     }
     assert_eq!(versions, 2);
     drop(kept);
+    node.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_incomplete_inbound_handshake_is_evicted_before_a_healthy_peer() {
+    use p2p::message::Message;
+    let network = TorFixture::new();
+    let node = network
+        .spawn(Config {
+            p2p: true,
+            max_inbound: 1,
+            ..Config::test()
+        })
+        .await;
+    let endpoint = network.endpoint(&node);
+    let silent = network.connect(&endpoint).await.unwrap();
+    let (_silent_writer, mut silent_reader) = p2p::transport::split(silent);
+    // A node request acts as an actor barrier after the connection is admitted.
+    wait_for(Duration::from_secs(10), async || {
+        matches!(node.request(Request::Peers).await.unwrap(), Response::Peers(peers) if peers.len() == 1)
+    })
+    .await;
+    let stream = network.connect(&endpoint).await.unwrap();
+    let (mut writer, mut reader) = p2p::transport::split(stream);
+    writer
+        .send(&Message::Version(p2p::peer::version_info(
+            19,
+            0,
+            node_genesis(&node).await,
+            0,
+        )))
+        .await
+        .unwrap();
+    assert!(matches!(reader.recv().await.unwrap(), Message::Version(_)));
+    writer.send(&Message::Verack).await.unwrap();
+    writer.send(&Message::Ping(88)).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while reader.recv().await.unwrap() != Message::Pong(88) {}
+    })
+    .await
+    .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), silent_reader.recv())
+            .await
+            .unwrap()
+            .is_err()
+    );
+    let Response::Peers(peers) = node.request(Request::Peers).await.unwrap() else {
+        panic!("peers")
+    };
+    assert_eq!(peers.len(), 1);
+    assert!(peers.first().unwrap().ready);
     node.shutdown().await;
 }
 
@@ -196,6 +240,7 @@ async fn node_genesis(node: &Handle) -> protocol::block::BlockHash {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_node_resumes_its_chain_after_a_restart() {
+    let network = TorFixture::new();
     let dir = tempfile::tempdir().unwrap();
     let miner_keys =
         WalletKeys::from_spending_key(SpendingKey::random(&mut ChaCha20Rng::seed_from_u64(9)))
@@ -206,7 +251,7 @@ async fn a_node_resumes_its_chain_after_a_restart() {
         mine_to: Some(miner_keys.default_address().unwrap()),
         ..Config::test()
     };
-    let node = spawn(config.clone()).await.unwrap();
+    let node = network.spawn(config.clone()).await;
     wait_for(Duration::from_secs(120), async || height(&node).await >= 2).await;
     let tip = match node.request(Request::Status).await.unwrap() {
         Response::Status { height, hash, .. } => (height, hash),
@@ -214,13 +259,13 @@ async fn a_node_resumes_its_chain_after_a_restart() {
     };
     node.shutdown().await;
 
-    let reopened = spawn(Config {
-        mine_to: None,
-        cleanup_datadir: false,
-        ..config
-    })
-    .await
-    .unwrap();
+    let reopened = network
+        .spawn(Config {
+            mine_to: None,
+            cleanup_datadir: false,
+            ..config
+        })
+        .await;
     let after = match reopened.request(Request::Status).await.unwrap() {
         Response::Status { height, hash, .. } => (height, hash),
         other => panic!("unexpected {other:?}"),
@@ -230,16 +275,16 @@ async fn a_node_resumes_its_chain_after_a_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn metrics_endpoint_reports_mined_blocks_and_the_status_line_counts_them() {
+async fn metrics_snapshot_reports_mined_blocks_and_the_status_line_counts_them() {
+    let network = TorFixture::new();
     let mut rng = ChaCha20Rng::seed_from_u64(9);
     let keys = WalletKeys::from_spending_key(SpendingKey::random(&mut rng)).unwrap();
-    let miner = spawn(Config {
-        mine_to: Some(keys.default_address().unwrap()),
-        metrics: Some("127.0.0.1:0".parse().unwrap()),
-        ..Config::test()
-    })
-    .await
-    .unwrap();
+    let miner = network
+        .spawn(Config {
+            mine_to: Some(keys.default_address().unwrap()),
+            ..Config::test()
+        })
+        .await;
     wait_for(Duration::from_secs(120), async || height(&miner).await >= 2).await;
 
     let (found, in_chain) = match miner.request(Request::Status).await.unwrap() {
@@ -253,30 +298,13 @@ async fn metrics_endpoint_reports_mined_blocks_and_the_status_line_counts_them()
     assert!(found >= 2);
     assert_eq!(found, in_chain, "a lone miner has no stale blocks");
 
-    let mut stream = tokio::net::TcpStream::connect(miner.metrics_addr.unwrap())
-        .await
-        .unwrap();
-    stream
-        .write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n")
-        .await
-        .unwrap();
-    let mut body = String::new();
-    stream.read_to_string(&mut body).await.unwrap();
-    assert!(body.starts_with("HTTP/1.1 200 OK"));
+    let Response::Metrics(metrics) = miner.request(Request::Metrics).await.unwrap() else {
+        panic!("metrics")
+    };
+    let body = runtime::metrics::render(&metrics);
     assert!(body.contains("blocks_mined{state=\"found\"} "));
     assert!(body.contains("height "));
     assert!(body.contains("uptime_seconds "));
-
-    let mut stream = tokio::net::TcpStream::connect(miner.metrics_addr.unwrap())
-        .await
-        .unwrap();
-    stream
-        .write_all(b"GET /other HTTP/1.1\r\n\r\n")
-        .await
-        .unwrap();
-    let mut body = String::new();
-    stream.read_to_string(&mut body).await.unwrap();
-    assert!(body.starts_with("HTTP/1.1 404"));
     miner.shutdown().await;
 }
 
@@ -289,31 +317,32 @@ async fn peer_count(handle: &Handle) -> usize {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_node_discovers_a_peer_it_was_never_configured_with() {
+    let network = TorFixture::new();
     // A listens. B connects to A and listens, so it learns A's address.
     // C connects only to B and must reach A through gossiped addresses.
-    let seed = spawn(Config {
-        listen: Some("127.0.0.1:0".parse().unwrap()),
-        ..Config::test()
-    })
-    .await
-    .unwrap();
-    let seed_addr = seed.listen_addr.unwrap().to_string();
+    let seed = network
+        .spawn(Config {
+            p2p: true,
+            ..Config::test()
+        })
+        .await;
+    let seed_addr = network.endpoint(&seed);
 
-    let relay = spawn(Config {
-        listen: Some("127.0.0.1:0".parse().unwrap()),
-        connect: vec![seed_addr.clone()],
-        ..Config::test()
-    })
-    .await
-    .unwrap();
-    let relay_addr = relay.listen_addr.unwrap().to_string();
+    let relay = network
+        .spawn(Config {
+            p2p: true,
+            connect: vec![seed_addr.clone()],
+            ..Config::test()
+        })
+        .await;
+    let relay_addr = network.endpoint(&relay);
 
-    let far = spawn(Config {
-        connect: vec![relay_addr],
-        ..Config::test()
-    })
-    .await
-    .unwrap();
+    let far = network
+        .spawn(Config {
+            connect: vec![relay_addr],
+            ..Config::test()
+        })
+        .await;
 
     // C starts with one configured peer (B) and must find a second (A).
     wait_for(Duration::from_secs(60), async || {

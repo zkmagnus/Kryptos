@@ -92,9 +92,19 @@ fn two_action_proof_roundtrips_and_rejects_wrong_inputs() {
 
     let started = Instant::now();
     let proof = Proof::create(&pk, &[w1, w2], &[p1, p2], &mut rng).unwrap();
+    let proved = started.elapsed();
+    let proof_digest = crypto::encoding::to_hex(&crypto::hash::blake2b_short(
+        crypto::hash::PIN,
+        &[proof.as_bytes()],
+    ));
+    assert_eq!(
+        proof_digest,
+        "aa15d30d93a017d94087cde3fc47482915b847906bedbb25bd987a4aba033e17"
+    );
+    eprintln!("proof vector: {}", proof_digest);
     eprintln!(
         "prove 2 actions: {:?}, {} bytes",
-        started.elapsed(),
+        proved,
         proof.as_bytes().len()
     );
 
@@ -151,6 +161,32 @@ fn mismatched_counts_are_rejected_before_proving() {
         Proof::create(&pk, &[], &[], &mut rng),
         Err(Error::CountMismatch)
     ));
+}
+
+/// Measures extracting a verifying key from an already-built proving key.
+/// Run with `cargo test --release -p circuit --test prove verifying_key_extraction_cost -- --ignored --nocapture`.
+#[test]
+#[ignore = "measurement, not a check"]
+fn verifying_key_extraction_cost() {
+    let pk = ProvingKey::build().unwrap();
+    let mut samples = Vec::new();
+    let mut expected = None;
+    for _ in 0..7 {
+        let started = Instant::now();
+        let vk = std::hint::black_box(pk.verifying_key());
+        samples.push(started.elapsed());
+        let description = vk.pinned_description();
+        if let Some(expected) = &expected {
+            assert_eq!(&description, expected);
+        } else {
+            expected = Some(description);
+        }
+    }
+    samples.sort_unstable();
+    eprintln!(
+        "verifying key extraction: median {:?}; samples {samples:?}",
+        samples[3]
+    );
 }
 
 /// Prints proof size and timing per action class. Run with

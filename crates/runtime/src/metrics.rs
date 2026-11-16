@@ -1,15 +1,9 @@
-//! A Prometheus text endpoint: `GET /metrics` on its own listener.
-//!
-//! It is unauthenticated, since it exposes nothing a peer could not
-//! infer and monitoring systems expect to scrape it plainly, so it
-//! binds where `--metrics` says and nowhere by default.
+//! Node metrics snapshots and Prometheus text rendering.
 
 use std::fmt::Write as _;
 
-use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::http::{read_get_path, respond};
 use crate::node::{Event, NotReady, Request, Response};
 use crate::{Error, Result};
 
@@ -87,29 +81,6 @@ pub fn render(m: &Metrics) -> String {
         format!("mining_ready {}", u8::from(m.mining_waits.is_none())),
     );
     out
-}
-
-/// Serves `GET /metrics` forever.
-pub async fn serve(listener: TcpListener, events: mpsc::Sender<Event>) {
-    while let Ok((stream, _)) = listener.accept().await {
-        let events = events.clone();
-        tokio::spawn(async move {
-            let mut stream = stream;
-            let _ = handle(&mut stream, &events).await;
-        });
-    }
-}
-
-async fn handle(stream: &mut tokio::net::TcpStream, events: &mpsc::Sender<Event>) -> Result<()> {
-    let (status, body) = match read_get_path(stream).await?.as_deref() {
-        Some("/metrics") => match snapshot(events).await {
-            Ok(metrics) => ("200 OK", render(&metrics)),
-            Err(error) => ("500 Internal Server Error", format!("{error}\n")),
-        },
-        Some(_) => ("404 Not Found", "GET /metrics\n".to_string()),
-        None => ("400 Bad Request", "malformed request\n".to_string()),
-    };
-    respond(stream, status, &body).await
 }
 
 /// Asks the node loop for a snapshot.

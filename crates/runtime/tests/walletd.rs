@@ -25,12 +25,13 @@ use runtime::rpc::{Endpoint, Token};
 use runtime::walletd;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use wallet::keys::WalletKeys;
 use wallet::wallet::Wallet;
 
 async fn post(addr: SocketAddr, token: &str, body: &str) -> Value {
-    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut stream = p2p::transport::connect_loopback_for_tests(addr)
+        .await
+        .unwrap();
     let request = format!(
         "POST / HTTP/1.1\r\nHost: wallet\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
@@ -90,12 +91,30 @@ async fn the_wallet_daemon_serves_an_exchange() {
     drop(Wallet::create(&path, &miner_sk, genesis_hash, &mut rng).unwrap());
     let wallet = Wallet::open(&path, genesis_hash).unwrap();
     let token = Token::new("wallet").unwrap();
+    let identity = p2p::address::NetAddr::TorV3([31; 32]);
+    let (server_network, mut incoming) = p2p::transport::test_support::network(identity, &[18444]);
+    let network =
+        p2p::transport::test_support::network(p2p::address::NetAddr::TorV3([32; 32]), &[]).0;
+    let node_onion = identity.endpoint(18444);
+    let events = node.events();
+    let server_token = node_token.clone();
+    let rpc_server = tokio::spawn(async move {
+        let _service = server_network;
+        while let Some(incoming) = incoming.recv().await {
+            tokio::spawn(runtime::rpc::serve_stream(
+                incoming.stream,
+                events.clone(),
+                server_token.clone(),
+            ));
+        }
+    });
     let daemon = walletd::run(walletd::Config {
         wallet,
         network: Network::Test,
         node: Endpoint {
-            addr: node.rpc_addr.unwrap().to_string(),
+            addr: node_onion,
             token: node_token,
+            network,
         },
         listen: "127.0.0.1:0".parse().unwrap(),
         token: token.clone(),
@@ -136,13 +155,20 @@ async fn the_wallet_daemon_serves_an_exchange() {
 
     // Deposit addresses with labels.
     let alice = call(addr, t, "getnewaddress", json!(["alice"])).await;
-    assert_eq!(alice["index"], 1);
+    let alice_index = alice["index"].as_u64().unwrap();
+    assert!(alice_index > info["receive_address_index"].as_u64().unwrap());
     let alice_address = alice["address"].as_str().unwrap().to_string();
     let bob = call(addr, t, "getnewaddress", json!({"label": "bob"})).await;
-    assert_eq!(bob["index"], 2);
+    assert!(bob["index"].as_u64().unwrap() > alice_index);
+    let receiving = call(addr, t, "getreceiveaddress", json!([])).await;
+    assert_eq!(receiving["address"], bob["address"]);
+    assert_eq!(receiving["index"], bob["index"]);
     let listed = call(addr, t, "listaddresses", json!([])).await;
-    assert_eq!(listed.as_array().unwrap().len(), 3);
-    assert_eq!(listed[1]["label"], "alice");
+    assert!(listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["index"] == alice["index"] && item["label"] == "alice"));
     let info = call(addr, t, "getaddressinfo", json!([alice_address])).await;
     assert_eq!(info["is_mine"], true);
     assert_eq!(info["label"], "alice");
@@ -187,6 +213,12 @@ async fn the_wallet_daemon_serves_an_exchange() {
         "only the change"
     );
     assert_eq!(view["spent"].as_array().unwrap().len(), 1);
+    let next_receive = call(addr, t, "getreceiveaddress", json!([])).await;
+    assert_ne!(next_receive["address"], bob["address"]);
+    assert_ne!(view["received"][0]["address"], bob["address"]);
+    assert_ne!(view["received"][0]["address"], next_receive["address"]);
+    assert!(view["received"][0]["address_index"].as_u64().unwrap() > 0);
+
     let fee = view["spent"][0]["amount"]
         .as_str()
         .unwrap()
@@ -271,5 +303,6 @@ async fn the_wallet_daemon_serves_an_exchange() {
     }
 
     daemon.shutdown_and_wait().await;
+    rpc_server.abort();
     node.shutdown().await;
 }

@@ -1,0 +1,19 @@
+# Only build inputs belong in the Docker context.
+**
+!Dockerfile
+!.dockerignore
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!.cargo
+!.cargo/config.toml
+!crates
+!crates/**
+!vendor
+!vendor/**
+# Exclude runtime state even when nested beneath a source directory.
+**/target
+**/.git
+**/tor
+**/*.redb
+**/*.token

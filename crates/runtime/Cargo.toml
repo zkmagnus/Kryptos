@@ -35,11 +35,12 @@ rand_core.workspace = true
 subtle.workspace = true
 zeroize.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
-socket2.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
+tracing = "=0.1.44"
 rand_chacha.workspace = true
-tempfile.workspace = true
+p2p = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

@@ -20,7 +20,7 @@ randomx-bindings-sys = { path = "vendor/randomx-bindings-sys" }
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.100"
 license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
@@ -43,7 +43,7 @@ blake2b_simd = "1"
 subtle = "2"
 zeroize = { version = "1", features = ["derive"] }
 rand_core = "0.6"
-reddsa = "0.5"
+reddsa = { version = "0.5", default-features = false, features = ["alloc", "zeroize"] }
 halo2_proofs = "0.3"
 halo2_gadgets = "0.5"
 halo2_poseidon = "0.1"
@@ -68,9 +68,20 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # networking
-snow = { version = "0.10", default-features = false, features = ["default-resolver", "use-chacha20poly1305", "use-blake2", "use-curve25519", "use-getrandom", "std"] }
-tokio = { version = "1", default-features = false, features = ["rt", "net", "io-util", "time", "sync"] }
-socket2 = "0.6"
+sha3 = "0.10"
+data-encoding = "2"
+arti-client = { version = "=0.48.0", default-features = false, features = ["tokio", "native-tls", "compression", "onion-service-client", "onion-service-service", "vanguards"] }
+tor-hsservice = "=0.48.0"
+tor-hscrypto = "=0.48.0"
+tor-rtcompat = { version = "=0.48.0", features = ["tokio", "native-tls"] }
+tor-cell = "=0.48.0"
+tor-config = "=0.48.0"
+tor-guardmgr = "=0.48.0"
+tor-proto = "=0.48.0"
+futures-util = { version = "0.3", features = ["std", "async-await"] }
+fs-mistrust = "=0.16.1"
+safelog = "=0.10.1"
+tokio = { version = "1", default-features = false, features = ["rt", "net", "io-util", "time", "sync", "process"] }
 
 # testing
 rand = "0.8"
@@ -95,6 +106,8 @@ module_name_repetitions = "allow"
 must_use_candidate = "allow"
 
 [profile.release]
+# Fat LTO and one codegen unit trade longer clean builds for smaller/faster
+# release code. Keep until runtime measurements justify a different balance.
 lto = "fat"
 codegen-units = 1
 opt-level = 3

@@ -2,13 +2,13 @@
 //! restart or upgrade keeps the reachable nodes this one has verified
 //! instead of relearning them from scratch.
 //!
-//! The file is not kept when the node routes through a proxy, since it would
-//! record which endpoints the privacy-routed node verified.
+//! The private snapshot preserves onion identities, behavior penalties, and
+//! recently verified peers used as restart anchors.
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use p2p::addrbook::{AddressBook, Snapshot, MAX_KNOWN};
+use p2p::addrbook::{AddressBook, Snapshot, MAX_BANS, MAX_KNOWN};
 use p2p::message::PeerAddr;
 
 use crate::config::Config;
@@ -18,15 +18,11 @@ use crate::{logging, paths, Result};
 pub const PEERS_FILE: &str = "peers.dat";
 /// Largest file [`load`] reads: [`MAX_KNOWN`] entries of the biggest size
 /// plus the header. Anything larger is not a book this node wrote.
-const MAX_FILE_BYTES: u64 = 1 + 4 + MAX_KNOWN as u64 * (16 + 2 + 8 + 1 + 8);
+const MAX_FILE_BYTES: u64 = 9 + MAX_KNOWN as u64 * 65 + MAX_BANS as u64 * 44;
 
-/// Where `config` keeps its address book, or `None` when it routes through
-/// a proxy.
-pub(crate) fn path(config: &Config) -> Option<PathBuf> {
-    if config.proxy.is_some() {
-        return None;
-    }
-    Some(config.datadir.join(PEERS_FILE))
+/// Where `config` keeps its onion address book.
+pub(crate) fn path(config: &Config) -> PathBuf {
+    config.datadir.join(PEERS_FILE)
 }
 
 /// Reads the saved book at `path`, keeping only addresses `keep` accepts.
@@ -73,7 +69,7 @@ pub(crate) fn save(path: &Path, book: &AddressBook) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
+    use p2p::address::NetAddr;
 
     use super::*;
 
@@ -87,7 +83,7 @@ mod tests {
     }
 
     fn public(last: u8) -> PeerAddr {
-        PeerAddr::v4([8, 8, 8, last], 19_000, 100)
+        PeerAddr::new(NetAddr::TorV3([last; 32]), 19_000, 100)
     }
 
     #[test]
@@ -135,13 +131,27 @@ mod tests {
     }
 
     #[test]
-    fn only_direct_nodes_with_a_datadir_keep_a_book() {
-        let proxy: SocketAddr = "127.0.0.1:9050".parse().unwrap();
+    fn tor_nodes_keep_their_peer_book() {
         let mut config = Config::test();
-        assert_eq!(path(&config), Some(config.datadir.join(PEERS_FILE)));
+        assert_eq!(path(&config), config.datadir.join(PEERS_FILE));
         config.datadir = PathBuf::from("/data");
-        assert_eq!(path(&config), Some(PathBuf::from("/data/peers.dat")));
-        config.proxy = Some(proxy);
-        assert_eq!(path(&config), None, "proxy");
+        assert_eq!(path(&config), PathBuf::from("/data/peers.dat"));
+        config.tor = crate::tor::TorConfig::default();
+        assert_eq!(path(&config), PathBuf::from("/data/peers.dat"));
+    }
+
+    #[test]
+    fn restart_preserves_behavior_bans_and_three_anchors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PEERS_FILE);
+        let peers = [public(1), public(2), public(3), public(4)];
+        let mut book = book_with(&peers, 100);
+        book.ban(peers[3].addr, 100);
+        save(&path, &book).unwrap();
+        let restored = load(&path, 200, |_| true);
+        assert!(restored.is_banned(&peers[3].addr, 200));
+        assert!(restored.score(&peers[3].addr) > 0);
+        let anchors = restored.anchors(3, 200);
+        assert_eq!(anchors, peers[..3]);
     }
 }

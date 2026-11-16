@@ -1,0 +1,135 @@
+
+stages:
+  - check
+  - test
+  - comprehensive
+
+variables:
+  # See arti.git:.gitlab-ci.yml, `cargo-miri:` for how to update this.
+  # (Or just copy the value and +nightly date from there.)
+  NIGHTLY_RUST_IMAGE: rustlang/rust@sha256:26897f428c9e97bba6a734473115608461f3f01cb9ce7ed4c4b568ac83c769a1
+  # ^ this is from tags.2025-10-24T13:08+00:00.gz (see arti.git:HACKING.md)
+
+default:
+  before_script:
+    # Print version info for debugging
+    - rustc --version ||true
+    - cargo --version ||true
+
+# Official language image. Look for the different tagged releases at:
+# https://hub.docker.com/r/library/rust/tags/
+image: "rust:latest"
+
+cargo-test:
+  stage: check
+  script:
+    - mv Cargo.lock.example Cargo.lock
+    - cargo test --locked --workspace --features=full
+
+cargo-fmt:
+  stage: check
+  script:
+    - rustup component add rustfmt
+    - cargo fmt --check
+
+# Check for FIXMEs.  This is in "comprehensive" so you can sabotage
+# the CI, but still get it all to run - useful for iterating through CI.
+maint-check-todos:
+  stage: test
+  script:
+    - maint/check-blocking-todos
+
+lmock:
+  stage: check
+  image: $NIGHTLY_RUST_IMAGE
+  script:
+    - mv Cargo.lock.example Cargo.lock
+    - maint/ci-test-including-lmock
+
+clippy:
+  stage: check
+  allow_failure: true
+  image: $NIGHTLY_RUST_IMAGE
+  script:
+    - mv Cargo.lock.example Cargo.lock
+    - maint/ci-clippy-nightly
+
+miri:
+  stage: test
+  image: $NIGHTLY_RUST_IMAGE
+  script:
+    - rustup +nightly component add miri
+    - mv Cargo.lock.example Cargo.lock
+    - maint/ci-test-miri
+
+# Check that the complete docs build without any warnings
+cargo-doc:
+  stage: test
+  script:
+    - maint/common/apt-install jq
+    - mv Cargo.lock.example Cargo.lock
+    - cargo doc --locked --workspace --features=full --document-private-items --message-format=json >rustdoc.json
+    - jq --raw-output '. | select(.message.level) | .message.rendered' <rustdoc.json |tee rustdoc.errors
+    - test ! -s rustdoc.errors
+
+# Test our MSRV and Cargo.toml minimal versions
+minimal-versions:
+  stage: test
+  image: "rust:1.56.0"
+  script:
+    - mv Cargo.lock.minimal Cargo.lock
+    - cargo +1.56.0 test --locked --workspace --features=full
+
+# Test every commit
+every-commit:
+  stage: comprehensive
+  image: $NIGHTLY_RUST_IMAGE
+  script:
+    - maint/common/apt-install libtoml-perl git
+    - rustup +nightly component add miri
+    - maint/common/for-every-commit sh -ec 'cp Cargo.lock.example Cargo.lock && maint/ci-test-including-lmock && maint/ci-test-miri'
+
+nightly:
+  stage: comprehensive
+  image: rustlang/rust:nightly-bullseye-slim
+  allow_failure: true
+  script:
+    - mv Cargo.lock.example Cargo.lock
+    - rustup +nightly component add miri
+    - maint/ci-test-including-lmock
+    - maint/ci-test-miri
+
+nightly-clippy:
+  stage: check
+  allow_failure: true
+  image: $NIGHTLY_RUST_IMAGE
+  script:
+    - mv Cargo.lock.example Cargo.lock
+    - maint/ci-clippy-nightly
+
+portability-linux-i386:
+  stage: comprehensive
+  script:
+    - maint/ci-check-portability i686-unknown-linux-gnu
+
+portability-macos:
+  stage: comprehensive
+  script:
+    - maint/ci-check-portability x86_64-apple-darwin
+
+portability-netbsd:
+  stage: comprehensive
+  script:
+    - maint/ci-check-portability x86_64-unknown-netbsd
+
+# Currently, the code is broken so this test fails
+portability-linux-arm64:
+  stage: comprehensive
+  script:
+    - maint/ci-check-portability aarch64-unknown-linux-gnu
+
+# The entire crate is supposed to vanish, so it should build an empty crate.
+portability-windows:
+  stage: comprehensive
+  script:
+    - maint/ci-check-portability x86_64-pc-windows-gnu

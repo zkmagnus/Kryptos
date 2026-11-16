@@ -1,9 +1,11 @@
 //! The event loop. One task owns every piece of state and reacts to
 //! events from connections, the clock, the miner and the RPC.
 
+use p2p::transport::{Incoming, TorNetwork, TorStatus};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use chain::chain::{Chain, Import};
 use chain::mempool::Mempool;
@@ -11,8 +13,11 @@ use chain::params::ChainParams;
 use chain::target::{Target, U256};
 use chain::validate::{header_lookback, recent_headers};
 use p2p::addrbook::AddressBook;
+use p2p::address::{NetAddr, PeerKey};
 use p2p::dandelion::{Dandelion, Route};
-use p2p::message::{CompactBlock, Inventory, Message, PeerAddr, VersionInfo, MAX_HEADERS};
+use p2p::message::{
+    CompactBlock, Inventory, Message, PeerAddr, VersionInfo, MAX_HEADERS, MAX_INVENTORY,
+};
 use p2p::peer::{version_info, Direction, Event as PeerEvent, Peer, SELF_CONNECTION};
 use p2p::sync::{locator, BlockSync};
 use protocol::address::RhombusAddress;
@@ -30,7 +35,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use transaction_proof::VerifyingKey;
 
-use crate::config::{Config, Network, MEMPOOL_CAPACITY, OUTBOUND_TARGET};
+use crate::config::{Config, Network, MEMPOOL_CAPACITY};
 use crate::discovery::{self, EXCHANGE_SECONDS, MAX_PROBES, REPLY_SECONDS, SAMPLE_SIZE};
 use crate::logging;
 use crate::metrics::Metrics;
@@ -49,17 +54,23 @@ pub type PeerId = u64;
 const PENDING_BLOCK_SECONDS: u64 = 60;
 /// Compact blocks awaiting transactions at once; more are ignored.
 const MAX_PENDING_BLOCKS: usize = 16;
+/// Pending hashes only, preserving the protocol's valid inventory batch size.
+const MAX_DATA_REQUEST_ITEMS: usize = MAX_INVENTORY;
+/// Storage lookups per serving turn, before returning to other node events.
+const DATA_ITEMS_PER_TURN: usize = 16;
 /// Mined blocks remembered for the stale-block counters; older ones are
 /// forgotten first.
 const MAX_MINED_RECORDS: usize = 100_000;
-/// Seconds a sync may go without a new header or block before the node
+/// Seconds a sync may go without new download work or an imported block before the node
 /// gives up on its peer, so a peer that claims a long chain and never
 /// sends it cannot hold the node in sync, and its miners idle, forever.
-const SYNC_STALL_SECONDS: u64 = 120;
+const SYNC_STALL_SECONDS: u64 = 600;
 
 /// Why the node hands out no mining work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NotReady {
+    /// The embedded Tor client or onion service is not ready.
+    TorUnavailable,
     /// No peer has finished its handshake, on a network that needs one.
     NoPeers,
     /// Blocks are downloading, or a peer reported a longer chain.
@@ -69,6 +80,7 @@ pub enum NotReady {
 impl std::fmt::Display for NotReady {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
+            Self::TorUnavailable => "embedded Tor is not ready",
             Self::NoPeers => "no peers yet",
             Self::Syncing => "catching up with the network",
         })
@@ -103,14 +115,12 @@ pub enum Event {
         id: PeerId,
         /// Who dialed.
         direction: Direction,
-        /// Remote socket address; the proxy's when one is used.
-        addr: SocketAddr,
-        /// Local interface address, used to advertise wildcard listeners.
-        local: Option<SocketAddr>,
+        /// Authenticated outbound onion endpoint; inbound callers are anonymous.
+        addr: Option<PeerKey>,
         /// What was dialed, or the remote address for inbound peers.
         target: String,
         /// Where to queue messages for it.
-        outbox: mpsc::Sender<Message>,
+        outbox: crate::net::Outbox,
     },
     /// A message arrived.
     Message {
@@ -121,6 +131,11 @@ pub enum Event {
     },
     /// A connection ended.
     Disconnected {
+        /// Connection id.
+        id: PeerId,
+    },
+    /// A peer's writer released capacity for more requested data.
+    Writable {
         /// Connection id.
         id: PeerId,
     },
@@ -138,6 +153,8 @@ pub enum Event {
         /// What was dialed.
         target: String,
     },
+    /// The daemon's readiness changed; unavailable means no new dialing.
+    TorState(Option<NetAddr>),
     /// One second passed.
     Tick,
     /// The miner found a block.
@@ -259,8 +276,8 @@ pub struct Located {
 pub struct PeerSummary {
     /// Connection id.
     pub id: PeerId,
-    /// Remote socket address; the proxy's when one is used.
-    pub addr: SocketAddr,
+    /// Authenticated outbound onion endpoint; inbound callers are anonymous.
+    pub addr: Option<PeerKey>,
     /// What was dialed, or the remote address for inbound peers.
     pub target: String,
     /// Who dialed.
@@ -331,10 +348,11 @@ pub enum Response {
 
 struct PeerHandle {
     peer: Peer,
-    outbox: mpsc::Sender<Message>,
-    addr: SocketAddr,
+    outbox: crate::net::Outbox,
+    /// Requested data waiting for a byte reservation before storage reads.
+    data_requests: VecDeque<Inventory>,
+    addr: Option<PeerKey>,
     target: String,
-    local: Option<SocketAddr>,
     /// Tick of the last `GetAddr` we answered, for [`REPLY_SECONDS`].
     last_getaddr: Option<u64>,
     /// Gossiped addresses still accepted from this peer until the next
@@ -369,7 +387,7 @@ struct OwnEndpoints {
     /// Dial targets (`host:port`) that reached this node.
     targets: HashSet<String>,
     /// Address-book keys that reached this node.
-    addrs: HashSet<([u8; 16], u16)>,
+    addrs: HashSet<PeerKey>,
 }
 
 /// The node state, owned by the loop task.
@@ -384,23 +402,29 @@ pub struct Node {
     dandelion: Dandelion<PeerId>,
     sync: BlockSync,
     sync_peer: Option<PeerId>,
-    /// When the current sync last received a header or block.
+    /// Expected orphan hashes waiting for their parent to be imported.
+    /// Bodies are discarded and requested again, bounding this by the window.
+    sync_deferred: HashMap<BlockHash, BlockHash>,
+    /// When the current sync last queued new work or imported a block.
     sync_progress_at: u64,
     /// The last reason miners were refused work, logged when it changes.
     mining_blocked: Option<NotReady>,
     peers: HashMap<PeerId, PeerHandle>,
     dialing: HashMap<PeerId, String>,
+    dial_tasks: HashMap<PeerId, JoinHandle<()>>,
     /// Short reachability checks when all regular outbound slots are occupied.
     probes: HashSet<PeerId>,
     configured: Vec<String>,
-    /// Our bound listen address, never dialed.
-    listen_addr: Option<SocketAddr>,
-    /// Whether the listener takes IPv4 too; see [`discovery::accepts_ipv4`].
-    listen_accepts_ipv4: bool,
-    advertise: Option<SocketAddr>,
+    /// Whether incoming P2P streams are accepted.
+    p2p: bool,
+    /// Ready onion identity; absent while embedded Tor is unavailable.
+    onion: Option<NetAddr>,
+    tor_status: Option<watch::Receiver<TorStatus>>,
+    tor: Option<Arc<TorNetwork>>,
+    p2p_port: u16,
     /// Targets and addresses that turned out to be this node; never redialed.
     own: OwnEndpoints,
-    proxy: Option<SocketAddr>,
+    max_outbound: usize,
     max_inbound: usize,
     pending_blocks: HashMap<BlockHash, PendingBlock>,
     next_id: PeerId,
@@ -421,22 +445,31 @@ pub struct Node {
     block_notify: Option<String>,
 }
 
+impl Drop for Node {
+    fn drop(&mut self) {
+        for task in self.dial_tasks.values() {
+            task.abort();
+        }
+    }
+}
+
 /// A running node.
 pub struct Handle {
     events: mpsc::Sender<Event>,
     tip: watch::Sender<BlockHash>,
-    /// Where the node accepts peers, if listening.
-    pub listen_addr: Option<SocketAddr>,
+    /// The service identity available when startup returned; observe `tor_status` for changes.
+    pub onion_addr: Option<NetAddr>,
     /// Where the control socket listens, if enabled.
     pub rpc_addr: Option<SocketAddr>,
     /// Where the JSON-RPC endpoint listens, if enabled.
     pub rpc_http_addr: Option<SocketAddr>,
     /// The control socket's token, if enabled.
     pub rpc_token: Option<Token>,
-    /// Where the metrics endpoint listens, if enabled.
-    pub metrics_addr: Option<SocketAddr>,
     task: JoinHandle<()>,
     tasks: JoinSet<()>,
+    /// Embedded Tor status, including the current ready service identity.
+    pub tor_status: Option<watch::Receiver<TorStatus>>,
+    _tor: Option<Arc<TorNetwork>>,
     _cleanup_datadir: Option<CleanupDatadir>,
 }
 
@@ -488,6 +521,25 @@ impl Handle {
 /// # Errors
 /// Fails if the store or a socket cannot be opened or key generation fails.
 pub async fn spawn(config: Config) -> Result<Handle> {
+    spawn_inner(config, None).await
+}
+
+/// Starts a node using an already-created embedded Tor service.
+///
+/// # Errors
+/// Returns configuration, database, or local RPC startup errors.
+pub async fn spawn_with_network(
+    config: Config,
+    network: Arc<TorNetwork>,
+    incoming: mpsc::Receiver<Incoming>,
+) -> Result<Handle> {
+    spawn_inner(config, Some((network, incoming))).await
+}
+
+async fn spawn_inner(
+    config: Config,
+    supplied: Option<(Arc<TorNetwork>, mpsc::Receiver<Incoming>)>,
+) -> Result<Handle> {
     config.validate()?;
     let cleanup_datadir = config
         .cleanup_datadir
@@ -498,25 +550,21 @@ pub async fn spawn(config: Config) -> Result<Handle> {
     let genesis = chain.store().hash_at(0)?.ok_or(Error::Stopped)?;
     let (events, receiver) = mpsc::channel(4_096);
     let tip = watch::Sender::new(chain.tip()?.hash);
+    let (peers_path, mut book) = saved_book(&config);
+    let configured = starting_peers(&config, &mut book);
 
-    let (listen_addr, listen_accepts_ipv4) = match bind(config.listen).await? {
-        Some((listener, local)) => {
-            let accepts_ipv4 = discovery::accepts_ipv4(&listener);
-            tasks.spawn(crate::net::listen(listener, events.clone(), 1 << 40));
-            (Some(local), accepts_ipv4)
-        }
-        None => (None, false),
-    };
     let (rpc_addr, rpc_http_addr, rpc_token) = serve_rpc(&config, &events, &mut tasks).await?;
-    let metrics_addr = match bind(config.metrics).await? {
-        Some((listener, local)) => {
-            tasks.spawn(crate::metrics::serve(listener, events.clone()));
-            Some(local)
-        }
-        None => None,
-    };
+    let (tor, onion) = start_network(
+        &config,
+        !configured.is_empty(),
+        supplied,
+        [rpc_addr, rpc_http_addr],
+        rpc_token.clone(),
+        &events,
+        &mut tasks,
+    )?;
     if let Some(payout) = config.mine_to.clone() {
-        spawn_miner(&mut tasks, payout, &config, &events, &tip);
+        spawn_miner(&mut tasks, payout, &config, &events, &tip, tor.as_ref());
     }
     let clock = events.clone();
     tasks.spawn(async move {
@@ -529,8 +577,7 @@ pub async fn spawn(config: Config) -> Result<Handle> {
         }
     });
 
-    let rng = StdRng::from_entropy();
-    let (peers_path, book) = saved_book(&config);
+    book.set_own(onion);
     let node = Node {
         network: config.network,
         params,
@@ -541,23 +588,27 @@ pub async fn spawn(config: Config) -> Result<Handle> {
         dandelion: Dandelion::new(now()),
         sync: BlockSync::new(),
         sync_peer: None,
+        sync_deferred: HashMap::new(),
         sync_progress_at: 0,
         mining_blocked: None,
         peers: HashMap::new(),
         dialing: HashMap::new(),
+        dial_tasks: HashMap::new(),
         probes: HashSet::new(),
-        configured: config.connect.clone(),
-        listen_addr,
-        listen_accepts_ipv4,
-        advertise: config.advertise,
+        configured,
+        p2p: config.p2p,
+        onion,
+        tor_status: tor.as_ref().map(|tor| tor.status()),
+        tor: tor.clone(),
+        p2p_port: config.tor.p2p_port,
         own: OwnEndpoints::default(),
-        proxy: config.proxy,
+        max_outbound: config.max_outbound,
         max_inbound: config.max_inbound,
         pending_blocks: HashMap::new(),
         next_id: 1,
         handshakes: HashMap::new(),
         tip: tip.clone(),
-        rng,
+        rng: StdRng::from_entropy(),
         events: events.clone(),
         genesis,
         ticks: 0,
@@ -565,19 +616,170 @@ pub async fn spawn(config: Config) -> Result<Handle> {
         started_at: now(),
         block_notify: config.block_notify.clone(),
     };
-    let task = tokio::spawn(node.run(receiver));
     Ok(Handle {
         events,
         tip,
-        listen_addr,
+        onion_addr: onion,
         rpc_addr,
         rpc_http_addr,
         rpc_token,
-        metrics_addr,
-        task,
+        task: tokio::spawn(node.run(receiver)),
         tasks,
+        tor_status: tor.as_ref().map(|tor| tor.status()),
+        _tor: tor,
         _cleanup_datadir: cleanup_datadir,
     })
+}
+
+fn start_network(
+    config: &Config,
+    has_peers: bool,
+    supplied: Option<(Arc<TorNetwork>, mpsc::Receiver<Incoming>)>,
+    listeners: [Option<SocketAddr>; 2],
+    rpc_token: Option<Token>,
+    events: &mpsc::Sender<Event>,
+    tasks: &mut JoinSet<()>,
+) -> Result<(Option<Arc<TorNetwork>>, Option<NetAddr>)> {
+    let [rpc_addr, rpc_http_addr] = listeners;
+    let needs_tor = !config.offline
+        && (config.p2p || has_peers || rpc_addr.is_some() || rpc_http_addr.is_some());
+    let mut ports = Vec::new();
+    if config.p2p {
+        ports.push(config.tor.p2p_port);
+    }
+    ports.extend(rpc_addr.map(|addr| addr.port()));
+    ports.extend(rpc_http_addr.map(|addr| addr.port()));
+    ports.sort_unstable();
+    if ports.windows(2).any(|pair| pair.first() == pair.get(1)) {
+        return Err(Error::Argument(
+            "onion virtual service ports must be distinct".into(),
+        ));
+    }
+    let network = match supplied {
+        Some(network) => Some(network),
+        None if needs_tor => Some(TorNetwork::start(&config.datadir, true, &ports)?),
+        None => None,
+    };
+    let tor = network.as_ref().map(|(network, _)| Arc::clone(network));
+    let onion = tor
+        .as_ref()
+        .and_then(|network| network.status().borrow().onion);
+    if let Some((network, incoming)) = network {
+        let mut status = network.status();
+        let notifications = events.clone();
+        tasks.spawn(async move {
+            loop {
+                let ready = {
+                    let state = status.borrow_and_update();
+                    if state.client_ready {
+                        state.onion
+                    } else {
+                        None
+                    }
+                };
+                if notifications.send(Event::TorState(ready)).await.is_err()
+                    || status.changed().await.is_err()
+                {
+                    break;
+                }
+            }
+            let _ = notifications.send(Event::TorState(None)).await;
+        });
+        tasks.spawn(serve_onion(
+            incoming,
+            events.clone(),
+            OnionPorts {
+                p2p: config.p2p.then_some(config.tor.p2p_port),
+                rpc: rpc_addr.map(|addr| addr.port()),
+                http: rpc_http_addr.map(|addr| addr.port()),
+                max_inbound: config.max_inbound,
+            },
+            rpc_token,
+            config.network,
+        ));
+    }
+    Ok((tor, onion))
+}
+
+/// Seeds and verified restart anchors, in explicit dialing preference order.
+fn starting_peers(config: &Config, book: &mut AddressBook) -> Vec<String> {
+    let mut configured = config.connect.clone();
+    configured.extend(config.addnode.clone());
+    if !config.no_seeds && config.connect.is_empty() {
+        configured.extend(config.network.seeds().iter().map(ToString::to_string));
+    }
+    for target in &configured {
+        if let Some((addr, port)) = dialed_key(target) {
+            book.add(PeerAddr::new(addr, port, now()), now());
+        }
+    }
+    for anchor in book.anchors(3, now()) {
+        let target = anchor.addr.endpoint(anchor.port);
+        if !configured.contains(&target) {
+            configured.insert(0, target);
+        }
+    }
+    configured
+}
+
+/// Virtual service ports and the inbound P2P connection limit.
+struct OnionPorts {
+    p2p: Option<u16>,
+    rpc: Option<u16>,
+    http: Option<u16>,
+    max_inbound: usize,
+}
+
+/// Dispatches accepted onion streams without opening local forwarding sockets.
+async fn serve_onion(
+    mut incoming: mpsc::Receiver<Incoming>,
+    events: mpsc::Sender<Event>,
+    ports: OnionPorts,
+    token: Option<Token>,
+    network: Network,
+) {
+    let mut connections = JoinSet::new();
+    let rpc_slots = Arc::new(tokio::sync::Semaphore::new(16));
+    let p2p_slots = Arc::new(tokio::sync::Semaphore::new(
+        ports
+            .max_inbound
+            .saturating_add(crate::net::MAX_PENDING_INBOUND),
+    ));
+    let context = crate::jsonrpc::Context::new(events.clone(), network);
+    let mut next_id = 1u64 << 40;
+    loop {
+        tokio::select! {
+            Some(_) = connections.join_next(), if !connections.is_empty() => {},
+            incoming = incoming.recv() => {
+                let Some(Incoming { port, mut stream }) = incoming else { break; };
+                if Some(port) == ports.p2p {
+                    let Ok(permit) = Arc::clone(&p2p_slots).try_acquire_owned() else { continue; };
+                    let Some(id) = next_id.checked_add(1) else { break; };
+                    next_id = id;
+                    let events = events.clone();
+                    connections.spawn(async move {
+                        let _permit = permit;
+                        crate::net::accept(stream, events, id).await;
+                    });
+                } else if Some(port) == ports.rpc || Some(port) == ports.http {
+                    let Some(token) = token.clone() else { continue; };
+                    let Ok(permit) = Arc::clone(&rpc_slots).try_acquire_owned() else { continue; };
+                    let events = events.clone();
+                    let context = context.clone();
+                    let line_rpc = Some(port) == ports.rpc;
+                    connections.spawn(async move {
+                        let _permit = permit;
+                        if line_rpc {
+                            crate::rpc::serve_stream(stream, events, token).await;
+                        } else {
+                            let _ = crate::jsonrpc::serve_stream(&mut stream, &context, &token).await;
+                        }
+                    });
+                }
+            }
+        }
+    }
+    connections.shutdown().await;
 }
 
 /// Starts the control socket and the JSON-RPC endpoint, whichever are
@@ -646,7 +848,7 @@ async fn open_chain(config: &Config, params: ChainParams) -> Result<Chain> {
 async fn bind(addr: Option<SocketAddr>) -> Result<Option<(TcpListener, SocketAddr)>> {
     match addr {
         Some(addr) => {
-            let listener = TcpListener::bind(addr).await?;
+            let listener = crate::rpc::bind_local(addr).await?;
             let local = listener.local_addr()?;
             Ok(Some((listener, local)))
         }
@@ -659,29 +861,9 @@ fn closed_by_peer(id: PeerId, who: &str, lasted_seconds: u64) -> String {
     format!("peer {id} ({who}) closed the connection after {lasted_seconds} s")
 }
 
-/// Whether banning `addr`'s IP stops only the peer that misbehaved. Not
-/// for outbound peers reached through the proxy or the SAM bridge, whose
-/// address is the transport's, nor for loopback: every inbound peer of a
-/// Tor hidden service arrives from 127.0.0.1, so one bad onion peer would
-/// lock out all of them. Such peers are still disconnected.
-fn bannable(addr: SocketAddr, via_transport: bool) -> bool {
-    !via_transport && !addr.ip().is_loopback()
-}
-
-fn addr_key(addr: SocketAddr) -> ([u8; 16], u16) {
-    let ip = match addr.ip() {
-        std::net::IpAddr::V4(v4) => v4.to_ipv6_mapped().octets(),
-        std::net::IpAddr::V6(v6) => v6.octets(),
-    };
-    (ip, addr.port())
-}
-
-/// The address-book key of a dialed `target`, or `None` for a hostname,
-/// which the book never holds. Attempts and failures are recorded under
-/// this key, never under the socket address, which is the proxy's when
-/// one is used.
-fn dialed_key(target: &str) -> Option<([u8; 16], u16)> {
-    target.parse::<SocketAddr>().ok().map(addr_key)
+/// Canonical onion identity and virtual port of a dialed endpoint.
+fn dialed_key(target: &str) -> Option<PeerKey> {
+    NetAddr::parse_endpoint(target).ok()
 }
 
 /// Starts the `--mine` miner as one of the node's tasks; it stops with them.
@@ -691,13 +873,15 @@ fn spawn_miner(
     config: &Config,
     events: &mpsc::Sender<Event>,
     tip: &watch::Sender<BlockHash>,
+    tor: Option<&Arc<TorNetwork>>,
 ) {
-    let miner = crate::miner::start(
+    let miner = crate::miner::start_with_tor(
         payout,
         config.network.params(),
         config.mining_threads,
         events.clone(),
         tip.subscribe(),
+        tor.map(|network| network.status()),
     );
     tasks.spawn(async move {
         if let Err(error) = miner.wait().await {
@@ -710,20 +894,8 @@ fn spawn_miner(
 /// book filtered by this network's gossip policy, or an empty one.
 fn saved_book(config: &Config) -> (Option<PathBuf>, AddressBook) {
     let path = peers_file::path(config);
-    let book = path.as_deref().map_or_else(AddressBook::new, |path| {
-        peers_file::load(path, now(), |a| {
-            discovery::allowed(key_addr(a.key()), config.network)
-        })
-    });
-    (path, book)
-}
-
-fn key_addr(key: ([u8; 16], u16)) -> SocketAddr {
-    let ip = std::net::Ipv6Addr::from(key.0);
-    ip.to_ipv4_mapped().map_or_else(
-        || SocketAddr::from((ip, key.1)),
-        |v4| SocketAddr::from((v4, key.1)),
-    )
+    let book = peers_file::load(&path, now(), |a| a.port != 0);
+    (Some(path), book)
 }
 
 impl Node {
@@ -738,6 +910,10 @@ impl Node {
             }
         }
         self.save_peers();
+        for (_, task) in self.dial_tasks.drain() {
+            task.abort();
+            let _ = task.await;
+        }
     }
 
     /// Writes the address book to disk when this node keeps one. A failure
@@ -756,10 +932,9 @@ impl Node {
                 id,
                 direction,
                 addr,
-                local,
                 target,
                 outbox,
-            } => self.on_connected(id, direction, addr, local, target, outbox),
+            } => self.on_connected(id, direction, addr, target, outbox),
             Event::Message { id, message } => self.on_message(id, *message),
             Event::Disconnected { id } => {
                 // A peer still here was not dropped by us: the other side
@@ -773,6 +948,7 @@ impl Node {
                 self.remove_peer(id);
                 Ok(())
             }
+            Event::Writable { id } => self.serve_data(id),
             Event::DialedSelf { id, target } => {
                 self.dialing.remove(&id);
                 self.probes.remove(&id);
@@ -783,6 +959,33 @@ impl Node {
                 self.dialing.remove(&id);
                 self.probes.remove(&id);
                 self.fail_target(&target);
+                Ok(())
+            }
+            Event::TorState(ready) => {
+                if self.onion != ready {
+                    if let Some(addr) = ready {
+                        log(&format!(
+                            "embedded Tor ready: {}",
+                            addr.endpoint(self.p2p_port)
+                        ));
+                    } else {
+                        log("embedded Tor unavailable; peer connections suspended");
+                    }
+                }
+                self.onion = ready;
+                self.book.set_own(ready);
+                if ready.is_none() {
+                    let ids: Vec<_> = self.peers.keys().copied().collect();
+                    for id in ids {
+                        self.remove_peer(id);
+                    }
+                    self.dialing.clear();
+                    for task in self.dial_tasks.values() {
+                        task.abort();
+                    }
+                } else {
+                    self.dial_configured();
+                }
                 Ok(())
             }
             Event::Tick => {
@@ -814,32 +1017,60 @@ impl Node {
     }
 
     fn our_version(&self, nonce: u64) -> Result<VersionInfo> {
-        Ok(version_info(
-            nonce,
-            self.chain.tip()?.height,
-            self.genesis,
-            now(),
-        ))
+        let mut info = version_info(nonce, self.chain.tip()?.height, self.genesis, now());
+        info.onion = (self.p2p && self.max_inbound > 0)
+            .then_some(self.onion)
+            .flatten()
+            .map(|addr| (addr, self.p2p_port));
+        Ok(info)
     }
 
     fn on_connected(
         &mut self,
         id: PeerId,
         direction: Direction,
-        addr: SocketAddr,
-        local: Option<SocketAddr>,
+        addr: Option<PeerKey>,
         target: String,
-        outbox: mpsc::Sender<Message>,
+        outbox: crate::net::Outbox,
     ) -> Result<()> {
         self.dialing.remove(&id);
+        if !self.tor_ready() {
+            return Ok(());
+        }
+        if addr.is_some_and(|(addr, _)| self.book.is_banned(&addr, now())) {
+            return Ok(());
+        }
         if direction == Direction::Inbound {
+            let pending = self
+                .peers
+                .values()
+                .filter(|handle| {
+                    handle.peer.direction() == Direction::Inbound && !handle.peer.is_ready()
+                })
+                .count();
+            if pending >= crate::net::MAX_PENDING_INBOUND || self.max_inbound == 0 {
+                return Ok(());
+            }
             let inbound = self
                 .peers
                 .values()
                 .filter(|h| h.peer.direction() == Direction::Inbound)
                 .count();
-            if inbound >= self.max_inbound || self.book.is_banned(&addr_key(addr).0, now()) {
-                return Ok(());
+            if inbound >= self.max_inbound {
+                // Evict a misbehaving or incomplete connection first. Healthy
+                // established peers are protected from anonymous reconnect churn.
+                let victim = self
+                    .peers
+                    .iter()
+                    .filter(|(_, h)| h.peer.direction() == Direction::Inbound)
+                    .filter(|(_, h)| h.peer.score() > 0 || !h.peer.is_ready())
+                    .max_by_key(|(id, h)| (h.peer.score(), std::cmp::Reverse(**id)))
+                    .map(|(id, _)| *id);
+                if let Some(id) = victim {
+                    self.remove_peer(id);
+                } else {
+                    return Ok(());
+                }
             }
         }
         let nonce = self.rng.next_u64();
@@ -852,9 +1083,9 @@ impl Node {
             PeerHandle {
                 peer,
                 outbox,
+                data_requests: VecDeque::new(),
                 addr,
                 target,
-                local,
                 last_getaddr: None,
                 addr_allowance: 0,
                 connected_at: std::time::Instant::now(),
@@ -889,21 +1120,18 @@ impl Node {
         }
     }
 
-    /// Whether outbound peers are reached through the proxy. Their socket
-    /// address is then the transport's, so it must
-    /// not be gossiped, banned or announced.
-    fn private_transport(&self) -> bool {
-        self.proxy.is_some()
-    }
-
     fn remove_peer(&mut self, id: PeerId) {
         self.peers.remove(&id);
+        if let Some(task) = self.dial_tasks.get(&id) {
+            task.abort();
+        }
         self.probes.remove(&id);
         self.handshakes.retain(|_, peer| *peer != id);
         self.dandelion.remove_peer(&id);
         if self.sync_peer == Some(id) {
             self.sync_peer = None;
             self.sync = BlockSync::new();
+            self.sync_deferred.clear();
         }
     }
 
@@ -941,16 +1169,12 @@ impl Node {
         }
     }
 
-    /// Bans a peer's IP for every port, unless that IP is shared by other
-    /// peers (see [`bannable`]).
+    /// Only an outbound onion destination has an authenticated identity.
+    /// Inbound callers are anonymous; never ban their shared loopback socket.
     fn ban(&mut self, id: PeerId) {
-        let Some(handle) = self.peers.get(&id) else {
-            return;
-        };
-        let via_transport =
-            handle.peer.direction() == Direction::Outbound && self.private_transport();
-        if bannable(handle.addr, via_transport) {
-            self.book.ban(addr_key(handle.addr).0, now());
+        if let Some((addr, _)) = self.peers.get(&id).and_then(|h| h.addr) {
+            self.book.ban(addr, now());
+            self.save_peers();
         }
     }
 
@@ -965,27 +1189,20 @@ impl Node {
             "peer {id} ready ({direction:?} {}), height {}",
             handle.target, info.best_height
         ));
-        if direction == Direction::Outbound {
-            // Record the peer we dialed so it can be gossiped onward,
-            // unless it was reached through the proxy or the SAM bridge,
-            // where `addr` is the transport's rather than the peer's. It
-            // is shared only in `GetAddr` replies, never pushed as it is
-            // verified: an immediate push would show every peer whom
-            // this node just dialed, the topology Dandelion++ hides.
-            if !self.private_transport() && discovery::allowed(addr, self.network) {
-                let (ip, port) = addr_key(addr);
-                let address = PeerAddr {
-                    ip,
-                    port,
-                    last_seen: now(),
-                };
-                self.book.add(address, now());
-                self.book.connected((ip, port), now());
-            }
+        if let Some((addr, port)) = addr {
+            self.book.add(PeerAddr::new(addr, port, now()), now());
+            self.book.connected((addr, port), now());
+            self.save_peers();
         }
         if self.probes.contains(&id) {
             self.remove_peer(id);
             return;
+        }
+        if direction == Direction::Inbound {
+            if let Some((claim, port)) = info.onion.filter(|(claim, _)| Some(*claim) != self.onion)
+            {
+                self.book.add(PeerAddr::new(claim, port, now()), now());
+            }
         }
         self.exchange_addresses(id);
         let ours = self.chain.tip().map_or(0, |t| t.height);
@@ -1007,7 +1224,17 @@ impl Node {
             return Ok(());
         };
         let was_ready = handle.peer.is_ready();
+        let before_score = handle.peer.score();
         let events = handle.peer.handle(&message, now());
+        let penalty = handle.peer.score().saturating_sub(before_score);
+        if let Some((addr, _)) = handle.addr.filter(|_| penalty > 0) {
+            self.book.penalize(addr, penalty, now());
+            self.save_peers();
+            if self.book.is_banned(&addr, now()) {
+                self.remove_peer(id);
+                return Ok(());
+            }
+        }
         self.apply_peer_events(id, events);
         if !was_ready || !self.peers.contains_key(&id) {
             return Ok(());
@@ -1052,8 +1279,7 @@ impl Node {
             .into_iter()
             .take(taken)
             .filter(|a| {
-                discovery::allowed(key_addr(a.key()), self.network)
-                    && !self.own.addrs.contains(&a.key())
+                a.port != 0 && Some(a.addr) != self.onion && !self.own.addrs.contains(&a.key())
             })
             .collect();
         self.book.add_many(accepted, now());
@@ -1065,28 +1291,15 @@ impl Node {
         let Some(handle) = self.peers.get_mut(&id) else {
             return;
         };
-        let local = handle.local;
         let direction = handle.peer.direction();
         handle.addr_allowance = discovery::addr_allowance(direction);
-        let listen = (self.max_inbound > 0).then_some(self.listen_addr).flatten();
-        if let Some(addr) = discovery::announcement(
-            listen,
-            self.advertise,
-            local,
-            self.network,
-            self.private_transport(),
-            self.listen_accepts_ipv4,
-        ) {
-            let (ip, port) = addr_key(addr);
-            self.own.addrs.insert((ip, port));
-            self.send(
-                id,
-                Message::Addr(vec![PeerAddr {
-                    ip,
-                    port,
-                    last_seen: now(),
-                }]),
-            );
+        if self.max_inbound > 0 && self.p2p {
+            if let Some(addr) = self.onion {
+                self.send(
+                    id,
+                    Message::Addr(vec![PeerAddr::new(addr, self.p2p_port, now())]),
+                );
+            }
         }
         if direction == Direction::Outbound {
             self.send(id, Message::GetAddr);
@@ -1112,6 +1325,14 @@ impl Node {
     }
 
     fn misbehave(&mut self, id: PeerId, points: u32, reason: &'static str) {
+        if let Some((addr, _)) = self.peers.get(&id).and_then(|h| h.addr) {
+            self.book.penalize(addr, points, now());
+            self.save_peers();
+            if self.book.is_banned(&addr, now()) {
+                self.remove_peer(id);
+                return;
+            }
+        }
         let event = self
             .peers
             .get_mut(&id)
@@ -1131,6 +1352,7 @@ impl Node {
         let store = self.chain.store();
         let locator = locator(tip.height, |h| store.hash_at(h).ok().flatten());
         self.sync = BlockSync::new();
+        self.sync_deferred.clear();
         self.sync_peer = Some(id);
         self.sync_progress_at = now();
         log(&format!("syncing from peer {id} at height {}", tip.height));
@@ -1182,12 +1404,19 @@ impl Node {
         }
         let store = self.chain.store();
         let known = |hash: &BlockHash| store.block(hash).ok().flatten().is_some();
-        match self.sync.on_headers(headers, known) {
-            Ok(_) => {
+        if let Ok(progress) = self.sync.on_headers(headers, known) {
+            if progress.queued > 0 {
                 self.sync_progress_at = now();
-                self.continue_sync(id);
             }
-            Err(_) => self.misbehave(id, 20, "bad headers"),
+            self.continue_sync(id);
+        } else {
+            // A rejected response must not keep this peer's height claim
+            // holding miners and alternative sync peers indefinitely.
+            self.settle_claim(id);
+            self.sync_peer = None;
+            self.sync = BlockSync::new();
+            self.sync_deferred.clear();
+            self.misbehave(id, 20, "bad headers");
         }
     }
 
@@ -1224,6 +1453,7 @@ impl Node {
 
     fn on_inv(&mut self, id: PeerId, items: &[Inventory]) -> Result<()> {
         let mut wanted = Vec::new();
+        let mut requested = HashSet::new();
         for item in items {
             if let Some(handle) = self.peers.get_mut(&id) {
                 handle.peer.mark_known(*item);
@@ -1232,7 +1462,7 @@ impl Node {
                 Inventory::Block(hash) => self.chain.store().block(hash)?.is_some(),
                 Inventory::Tx(txid) => self.mempool.contains(txid),
             };
-            if !have {
+            if !have && requested.insert(*item) {
                 wanted.push(*item);
             }
         }
@@ -1243,19 +1473,85 @@ impl Node {
     }
 
     fn on_get_data(&mut self, id: PeerId, items: &[Inventory]) -> Result<()> {
-        let mut missing = Vec::new();
+        let Some(handle) = self.peers.get(&id) else {
+            return Ok(());
+        };
+        let mut seen: HashSet<Inventory> = handle.data_requests.iter().copied().collect();
+        let mut added = Vec::new();
         for item in items {
-            match item {
-                Inventory::Block(hash) => match self.chain.store().block(hash)? {
-                    Some(block) => self.send(id, Message::Block(Box::new(block))),
-                    None => missing.push(*item),
-                },
-                Inventory::Tx(txid) => match self.mempool.get(txid).cloned() {
-                    Some(tx) => {
-                        self.send(id, Message::Tx(Box::new(tx)));
-                    }
-                    None => missing.push(*item),
-                },
+            if seen.insert(*item) {
+                if seen.len() > MAX_DATA_REQUEST_ITEMS {
+                    // Reject the whole request before any storage reads.
+                    self.remove_peer(id);
+                    return Ok(());
+                }
+                added.push(*item);
+            }
+        }
+        if let Some(handle) = self.peers.get_mut(&id) {
+            handle.data_requests.extend(added);
+        }
+        self.serve_data(id)
+    }
+
+    /// Serves a bounded turn, reserving bytes before loading full bodies.
+    /// A full byte budget pauses serving until a write completes or the next tick.
+    fn serve_data(&mut self, id: PeerId) -> Result<()> {
+        let mut missing = Vec::new();
+        for _ in 0..DATA_ITEMS_PER_TURN {
+            let Some(handle) = self.peers.get(&id) else {
+                break;
+            };
+            let Some(item) = handle.data_requests.front().copied() else {
+                break;
+            };
+            let encoded_len = match &item {
+                Inventory::Block(hash) => self.chain.store().block_encoded_len(hash)?,
+                // This fixed-size calculation avoids cloning the proof just
+                // to discover the reservation size. Valid transactions have
+                // one of the consensus action classes.
+                Inventory::Tx(txid) => self
+                    .mempool
+                    .get(txid)
+                    .and_then(|tx| Transaction::encoded_len_for_actions(tx.actions().len()).ok()),
+            };
+            let Some(encoded_len) = encoded_len else {
+                if let Some(handle) = self.peers.get_mut(&id) {
+                    handle.data_requests.pop_front();
+                }
+                missing.push(item);
+                continue;
+            };
+            let Some(reservation) = handle.outbox.try_reserve_block(encoded_len) else {
+                break;
+            };
+            let message = match &item {
+                Inventory::Block(hash) => self
+                    .chain
+                    .store()
+                    .block(hash)?
+                    .map(|block| Message::Block(Box::new(block))),
+                Inventory::Tx(txid) => self
+                    .mempool
+                    .get(txid)
+                    .cloned()
+                    .map(|tx| Message::Tx(Box::new(tx))),
+            };
+            let Some(handle) = self.peers.get_mut(&id) else {
+                break;
+            };
+            handle.data_requests.pop_front();
+            if let Some(message) = message {
+                if handle
+                    .outbox
+                    .try_send_reserved(message, reservation)
+                    .is_err()
+                {
+                    self.remove_peer(id);
+                    break;
+                }
+            } else {
+                missing.push(item);
             }
         }
         if !missing.is_empty() {
@@ -1270,9 +1566,6 @@ impl Node {
     /// its consequences, and says what became of it.
     fn on_block(&mut self, from: Option<PeerId>, block: &Block) -> Result<Submission> {
         let hash = block.hash();
-        if self.sync.on_block(&hash) {
-            self.sync_progress_at = now();
-        }
         self.pending_blocks.remove(&hash);
         if let Some(id) = from {
             if let Some(handle) = self.peers.get_mut(&id) {
@@ -1323,6 +1616,11 @@ impl Node {
             }
             Ok(Import::SideChain | Import::AlreadyKnown) => {}
             Err(chain::Error::Orphan) => {
+                if self.sync.expects(&hash) && self.sync_peer.is_some() {
+                    // Keep the request in flight. Retain hashes only, so a
+                    // reordered window cannot buffer sixteen large bodies.
+                    self.sync_deferred.insert(hash, block.header().prev_hash);
+                }
                 if let Some(id) = from {
                     self.start_sync(id);
                 }
@@ -1331,6 +1629,31 @@ impl Node {
                 logging::warn(&format!("invalid block {hash}: {error}"));
                 if let Some(id) = from {
                     self.misbehave(id, 100, "invalid block");
+                }
+            }
+        }
+        if !matches!(submission, Submission::Rejected(_)) {
+            if self.sync.on_block(&hash) {
+                self.sync_progress_at = now();
+            }
+            self.sync_deferred.remove(&hash);
+            if let Some(id) = self.sync_peer {
+                let mut retry: Vec<_> = self
+                    .sync_deferred
+                    .iter()
+                    .filter_map(|(child, parent)| (*parent == hash).then_some(*child))
+                    .collect();
+                // HashMap iteration must not determine network request order.
+                retry.sort_unstable();
+                retry.retain(|child| {
+                    self.sync_deferred.remove(child);
+                    self.sync.retry(child, now())
+                });
+                if !retry.is_empty() {
+                    self.send(
+                        id,
+                        Message::GetData(retry.into_iter().map(Inventory::Block).collect()),
+                    );
                 }
             }
         }
@@ -1486,6 +1809,11 @@ impl Node {
     }
 
     fn on_mined(&mut self, block: &Block) -> Result<()> {
+        // Readiness can change after the worker's last nonce or while its
+        // result is queued. Do not extend our local branch while blocked.
+        if self.mining_blocker()?.is_some() {
+            return Ok(());
+        }
         // A block only counts and is logged once it actually lands, in
         // `on_block`. On a trivial target several workers can mine the same
         // height at once; the losers import as side chains and stay silent.
@@ -1531,6 +1859,10 @@ impl Node {
 
     /// What keeps miners from working on the tip; see [`mining_blocker`].
     fn mining_readiness(&self) -> Result<Option<NotReady>> {
+        // An explicitly offline node has no Tor supervisor to wait for.
+        if self.tor_status.is_some() && !self.tor_ready() {
+            return Ok(Some(NotReady::TorUnavailable));
+        }
         let ready = self
             .ready_peers(Direction::Inbound)
             .saturating_add(self.ready_peers(Direction::Outbound));
@@ -1550,7 +1882,7 @@ impl Node {
         if blocker != self.mining_blocked {
             match blocker {
                 Some(reason) => log(&format!("mining waits: {reason}")),
-                None => log("mining resumes: caught up with the network"),
+                None => log("mining resumes: readiness checks passed"),
             }
             self.mining_blocked = blocker;
         }
@@ -1708,6 +2040,7 @@ impl Node {
     // ---- clock ------------------------------------------------------
 
     fn on_tick(&mut self) {
+        self.dial_tasks.retain(|_, task| !task.is_finished());
         self.ticks = self.ticks.saturating_add(1);
         let now = now();
         let ids: Vec<PeerId> = self.peers.keys().copied().collect();
@@ -1723,8 +2056,7 @@ impl Node {
             let events = self
                 .peers
                 .get_mut(&id)
-                .map(|h| h.peer.tick(now, nonce))
-                .unwrap_or_default();
+                .map_or_default(|h| h.peer.tick(now, nonce));
             self.apply_peer_events(id, events);
         }
         if !self.sync.timeouts(now).is_empty() {
@@ -1736,6 +2068,7 @@ impl Node {
                 self.settle_claim(id);
             }
             self.sync = BlockSync::new();
+            self.sync_deferred.clear();
         }
         self.pending_blocks
             .retain(|_, p| now.saturating_sub(p.received_at) < PENDING_BLOCK_SECONDS);
@@ -1756,6 +2089,7 @@ impl Node {
                 self.settle_claim(id);
                 self.sync_peer = None;
                 self.sync = BlockSync::new();
+                self.sync_deferred.clear();
             }
         }
         if self.sync_peer.is_none() {
@@ -1768,10 +2102,23 @@ impl Node {
                 self.start_sync(id);
             }
         }
-        if self.ticks % 5 == 0 {
+        // A global byte budget may have been freed by another connection;
+        // retry here even if this peer has not emitted a Writable event.
+        let serving: Vec<_> = self
+            .peers
+            .iter()
+            .filter_map(|(id, h)| (!h.data_requests.is_empty()).then_some(*id))
+            .collect();
+        for id in serving {
+            if let Err(error) = self.serve_data(id) {
+                logging::warn(&format!("peer {id}: data serving failed: {error}"));
+                self.remove_peer(id);
+            }
+        }
+        if self.ticks.is_multiple_of(5) {
             self.maintain_connections();
         }
-        if self.ticks % EXCHANGE_SECONDS == 0 {
+        if self.ticks.is_multiple_of(EXCHANGE_SECONDS) {
             self.refresh_addresses();
             self.book.prune(now);
             self.save_peers();
@@ -1787,8 +2134,8 @@ impl Node {
             .collect();
         for id in ids {
             if let Some(h) = self.peers.get(&id) {
-                if h.peer.direction() == Direction::Outbound && !self.private_transport() {
-                    self.book.connected(addr_key(h.addr), now());
+                if let Some(key) = h.addr {
+                    self.book.connected(key, now());
                 }
             }
             self.exchange_addresses(id);
@@ -1803,7 +2150,17 @@ impl Node {
             .collect()
     }
 
+    fn tor_ready(&self) -> bool {
+        self.tor_status
+            .as_ref()
+            .is_some_and(crate::tor::service_ready)
+    }
+
     fn dial(&mut self, target: String) {
+        if !self.tor_ready() || dialed_key(&target).is_none_or(|(addr, _)| Some(addr) == self.onion)
+        {
+            return;
+        }
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
         self.dialing.insert(id, target.clone());
@@ -1812,24 +2169,47 @@ impl Node {
         }
         let route = crate::net::Route {
             target,
-            proxy: self.proxy,
-            own: self.listen_addr,
+            network: match &self.tor {
+                Some(tor) => Arc::clone(tor),
+                None => return,
+            },
+            own: self.onion,
+            readiness: match self.tor_status.clone() {
+                Some(status) => status,
+                None => return,
+            },
         };
-        crate::net::dial(route, id, self.events.clone());
+        self.dial_tasks
+            .insert(id, crate::net::dial(route, id, self.events.clone()));
     }
 
     /// Configured peers, without any that turned out to be this node.
     fn dialable_configured(&self) -> Vec<String> {
         self.configured
             .iter()
-            .filter(|t| !self.own.targets.contains(*t))
+            .filter(|t| {
+                !self.own.targets.contains(*t)
+                    && dialed_key(t).is_some_and(|key| self.book.dialable(key, now()))
+            })
             .cloned()
             .collect()
     }
 
     fn dial_configured(&mut self) {
-        for target in self.dialable_configured() {
-            self.dial(target);
+        let available = self.max_outbound.saturating_sub(
+            self.dialing.len().saturating_add(
+                self.peers
+                    .values()
+                    .filter(|h| h.peer.direction() == Direction::Outbound)
+                    .count(),
+            ),
+        );
+        for target in self.dialable_configured().into_iter().take(available) {
+            if !self.dialing.values().any(|t| *t == target)
+                && !self.peers.values().any(|h| h.target == target)
+            {
+                self.dial(target);
+            }
         }
     }
 
@@ -1851,8 +2231,7 @@ impl Node {
         if let Some(handle) = self.peers.get(&id) {
             if handle.peer.direction() == Direction::Outbound {
                 let (target, addr) = (handle.target.clone(), handle.addr);
-                let reached_directly = !self.private_transport();
-                self.mark_own(target, reached_directly.then_some(addr));
+                self.mark_own(target, addr);
             }
         }
         self.remove_peer(id);
@@ -1860,9 +2239,9 @@ impl Node {
 
     /// Records a target, and the address it reached when known, as this
     /// node. Logs only the first time, so seeds listing themselves stay quiet.
-    fn mark_own(&mut self, target: String, addr: Option<SocketAddr>) {
+    fn mark_own(&mut self, target: String, addr: Option<PeerKey>) {
         if let Some(addr) = addr {
-            self.own.addrs.insert(addr_key(addr));
+            self.own.addrs.insert(addr);
         }
         if !self.own.targets.contains(&target) {
             log(&format!("not dialing {target} again: it is this node"));
@@ -1871,6 +2250,9 @@ impl Node {
     }
 
     fn maintain_connections(&mut self) {
+        if self.max_outbound == 0 || !self.tor_ready() {
+            return;
+        }
         let outbound = self
             .peers
             .values()
@@ -1879,7 +2261,7 @@ impl Node {
         let full = outbound
             .saturating_add(self.dialing.len())
             .saturating_sub(self.probes.len())
-            >= OUTBOUND_TARGET;
+            >= self.max_outbound;
         let busy: HashSet<String> = self
             .peers
             .values()
@@ -1894,16 +2276,15 @@ impl Node {
             self.dial(target);
             return;
         }
-        if full && (self.probes.len() >= MAX_PROBES || self.private_transport()) {
+        if full && self.probes.len() >= MAX_PROBES {
             return;
         }
-        let exclude: Vec<([u8; 16], u16)> = self
+        let exclude: Vec<PeerKey> = self
             .peers
             .values()
-            .map(|h| addr_key(h.addr))
+            .filter_map(|h| h.addr)
             .chain(self.own.addrs.iter().copied())
-            .chain(self.listen_addr.map(addr_key))
-            .chain(self.advertise.map(addr_key))
+            .chain(self.onion.map(|addr| (addr, self.p2p_port)))
             .chain(self.dialing.values().filter_map(|s| dialed_key(s)))
             .collect();
         let candidate = if full {
@@ -1913,7 +2294,7 @@ impl Node {
             self.book.candidate(&exclude, now(), &mut self.rng)
         };
         if let Some(candidate) = candidate {
-            let target = key_addr(candidate.key()).to_string();
+            let target = candidate.addr.endpoint(candidate.port);
             if !busy.contains(&target) {
                 if full {
                     self.probes.insert(self.next_id);
@@ -2071,6 +2452,7 @@ mod tests {
     use std::time::Duration;
 
     use chain::params::Upgrade;
+    use p2p::transport::test_support;
     use protocol::consensus::BranchId;
 
     use super::*;
@@ -2115,37 +2497,24 @@ mod tests {
 
     #[test]
     fn dialed_targets_are_keyed_by_what_was_dialed_not_the_proxy() {
-        let peer: SocketAddr = "8.8.8.8:19000".parse().unwrap();
-        assert_eq!(dialed_key(&peer.to_string()), Some(addr_key(peer)));
-        assert_ne!(
-            dialed_key(&peer.to_string()),
-            Some(addr_key("127.0.0.1:9050".parse().unwrap()))
-        );
-        assert_eq!(
-            dialed_key("[2606:4700::1111]:19000").map(key_addr),
-            Some("[2606:4700::1111]:19000".parse().unwrap())
-        );
+        let peer = NetAddr::TorV3([9; 32]);
+        assert_eq!(dialed_key(&peer.endpoint(19000)), Some((peer, 19000)));
+        assert_eq!(dialed_key("127.0.0.1:9050"), None);
+        assert_eq!(dialed_key("8.8.8.8:19000"), None);
+        assert_eq!(dialed_key("[2606:4700::1111]:19000"), None);
         assert_eq!(dialed_key("abcdef.onion:19000"), None);
     }
 
     #[tokio::test]
     async fn shutdown_releases_owned_listener_ports() {
         let local = Some("127.0.0.1:0".parse().unwrap());
-        let node = spawn(Config {
-            listen: local,
+        let config = Config {
             rpc: local,
             rpc_http: local,
-            metrics: local,
             ..Config::test()
-        })
-        .await
-        .unwrap();
-        let ports = [
-            node.listen_addr,
-            node.rpc_addr,
-            node.rpc_http_addr,
-            node.metrics_addr,
-        ];
+        };
+        let node = spawn(config).await.unwrap();
+        let ports = [node.rpc_addr, node.rpc_http_addr];
         node.shutdown().await;
         for addr in ports.into_iter().flatten() {
             assert!(
@@ -2184,53 +2553,115 @@ mod tests {
         assert!(shell("exit 0").status().unwrap().success());
     }
 
-    /// A TCP relay that forwards to `target` once it is set and counts the
-    /// connections it accepts: a NAT or public address leading back to us.
-    async fn counting_relay(
-        target: Arc<std::sync::Mutex<Option<SocketAddr>>>,
-        accepted: Arc<std::sync::atomic::AtomicUsize>,
-    ) -> SocketAddr {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            while let Ok((mut inbound, _)) = listener.accept().await {
-                accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let target = target.clone();
-                tokio::spawn(async move {
-                    let to = loop {
-                        if let Some(to) = *target.lock().unwrap() {
-                            break to;
-                        }
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    };
-                    if let Ok(mut outbound) = tokio::net::TcpStream::connect(to).await {
-                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
-                    }
-                });
-            }
-        });
-        addr
-    }
-
-    // Three maintenance rounds (every 5 ticks) would each redial a
-    // configured peer; a target found to be ourselves is dialed once.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_target_that_reaches_ourselves_is_dialed_only_once() {
-        let target = Arc::new(std::sync::Mutex::new(None));
+        let own = NetAddr::TorV3([18; 32]);
+        let alias = NetAddr::TorV3([19; 32]);
+        let (network, _incoming) = test_support::network(own, &[19000]);
+        let (_alias_network, mut relayed) = test_support::network(alias, &[19000]);
         let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let relay = counting_relay(target.clone(), accepted.clone()).await;
-        let node = spawn(Config {
-            listen: Some("127.0.0.1:0".parse().unwrap()),
-            connect: vec![relay.to_string()],
+        let count = Arc::clone(&accepted);
+        let (forward, incoming) = mpsc::channel(8);
+        let relay = tokio::spawn(async move {
+            while let Some(stream) = relayed.recv().await {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if forward.send(stream).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let config = Config {
+            p2p: true,
+            connect: vec![alias.endpoint(19000)],
             ..Config::test()
-        })
-        .await
-        .unwrap();
-        *target.lock().unwrap() = node.listen_addr;
+        };
+        let node = spawn_with_network(config, network, incoming).await.unwrap();
         tokio::time::sleep(Duration::from_secs(16)).await;
         let dials = accepted.load(std::sync::atomic::Ordering::SeqCst);
         node.shutdown().await;
+        relay.abort();
         assert_eq!(dials, 1, "the relay back to ourselves was redialed");
+    }
+
+    #[tokio::test]
+    async fn disabled_inbound_limit_does_not_claim_an_accepting_onion_endpoint() {
+        let own = NetAddr::TorV3([195; 32]);
+        let other = NetAddr::TorV3([196; 32]);
+        let (network, incoming) = test_support::network(own, &[19000]);
+        let (_remote, mut requests) = test_support::network(other, &[19000]);
+        let config = Config {
+            p2p: true,
+            max_inbound: 0,
+            connect: vec![other.endpoint(19000)],
+            ..Config::test()
+        };
+        let node = spawn_with_network(config, network, incoming).await.unwrap();
+        let request = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let (_writer, mut reader) = p2p::transport::split(request.stream);
+        let message = tokio::time::timeout(Duration::from_secs(5), reader.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let Message::Version(version) = message else {
+            panic!("expected application version");
+        };
+        assert!(version.onion.is_none());
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn zero_outbound_limit_also_disables_verification_probes() {
+        let own = NetAddr::TorV3([193; 32]);
+        let other = NetAddr::TorV3([194; 32]);
+        let (network, incoming) = test_support::network(own, &[19000]);
+        let (_remote, mut requests) = test_support::network(other, &[19000]);
+        let config = Config {
+            p2p: true,
+            max_outbound: 0,
+            connect: vec![other.endpoint(19000)],
+            ..Config::test()
+        };
+        let node = spawn_with_network(config, network, incoming).await.unwrap();
+        // The configured target is an unverified address-book candidate. Force
+        // maintenance even though all regular outbound slots are disabled.
+        for _ in 0..5 {
+            node.events.send(Event::Tick).await.unwrap();
+        }
+        node.request(Request::Status).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), requests.recv())
+                .await
+                .is_err(),
+            "zero outbound slots still opened a verification stream"
+        );
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_releases_tor_while_an_outbound_handshake_is_unanswered() {
+        let own = NetAddr::TorV3([83; 32]);
+        let other = NetAddr::TorV3([84; 32]);
+        let (network, incoming) = test_support::network(own, &[19000]);
+        let weak = Arc::downgrade(&network);
+        let (_remote, mut requests) = test_support::network(other, &[19000]);
+        let config = Config {
+            p2p: true,
+            connect: vec![other.endpoint(19000)],
+            ..Config::test()
+        };
+        let node = spawn_with_network(config, network, incoming).await.unwrap();
+        let _unanswered = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        node.shutdown().await;
+        assert!(
+            weak.upgrade().is_none(),
+            "outbound task retained the Tor client after shutdown"
+        );
     }
 
     #[tokio::test]
@@ -2262,23 +2693,20 @@ mod tests {
     }
 
     #[test]
-    fn shared_addresses_are_never_banned() {
-        let public: SocketAddr = "46.19.141.66:51234".parse().unwrap();
-        assert!(bannable(public, false));
-        assert!(
-            !bannable(public, true),
-            "the proxy's or SAM bridge's address"
-        );
-        for tor in ["127.0.0.1:40000", "[::1]:40000"] {
-            assert!(!bannable(tor.parse().unwrap(), false), "{tor}");
-        }
+    fn bans_are_keyed_by_onion_identity_across_virtual_ports() {
+        let mut book = AddressBook::new();
+        let first = NetAddr::TorV3([12; 32]);
+        let second = NetAddr::TorV3([13; 32]);
+        book.ban(first, now());
+        assert!(book.is_banned(&first, now()));
+        assert!(!book.is_banned(&second, now()));
     }
 
     #[test]
     fn a_peer_closing_the_connection_is_named_with_how_long_it_lasted() {
         assert_eq!(
-            closed_by_peer(6, "Outbound node.example.org:19000", 0),
-            "peer 6 (Outbound node.example.org:19000) closed the connection after 0 s"
+            closed_by_peer(6, "Outbound onion-service:19000", 0),
+            "peer 6 (Outbound onion-service:19000) closed the connection after 0 s"
         );
     }
 }

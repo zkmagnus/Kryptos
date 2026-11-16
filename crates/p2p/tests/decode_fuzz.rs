@@ -7,6 +7,7 @@
     clippy::indexing_slicing
 )]
 
+use p2p::address::NetAddr;
 use p2p::codec::{frame, Framer};
 use p2p::message::{Inventory, Message, PeerAddr, VersionInfo};
 use proptest::prelude::*;
@@ -16,14 +17,16 @@ use protocol::transaction::TxId;
 fn samples() -> Vec<Message> {
     vec![
         Message::Version(VersionInfo {
-            version: 1,
+            version: p2p::message::PROTOCOL_VERSION,
             nonce: 2,
             best_height: 3,
             genesis: BlockHash::ZERO,
             timestamp: 4,
+            services: 1,
+            onion: None,
         }),
         Message::Ping(9),
-        Message::Addr(vec![PeerAddr::v4([1, 2, 3, 4], 5, 6)]),
+        Message::Addr(vec![PeerAddr::new(NetAddr::TorV3([4; 32]), 5, 6)]),
         Message::GetHeaders {
             locator: vec![BlockHash::from_bytes([7; 32])],
             stop: BlockHash::ZERO,

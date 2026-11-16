@@ -3,6 +3,9 @@ use thiserror::Error;
 /// Errors produced by the wallet.
 #[derive(Debug, Error)]
 pub enum Error {
+    /// The wallet file could not be opened or its permissions restricted.
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
     /// A protocol or building error.
     #[error(transparent)]
     Protocol(#[from] protocol::Error),

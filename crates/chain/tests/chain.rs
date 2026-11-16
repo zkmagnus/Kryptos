@@ -749,3 +749,106 @@ fn transactions_are_indexed_by_id_while_in_the_main_chain() {
     assert_eq!(store.transaction_location(&txid).unwrap(), None);
     assert_eq!(store.transaction(&coinbase).unwrap(), None);
 }
+
+#[test]
+fn interrupted_reorg_restores_real_transaction_indexes_and_tree() {
+    let mut h = Harness::new(8801);
+    let fork = h.chain.tip().unwrap().hash;
+    let first = h.extend(Vec::new());
+    let second = h.extend(Vec::new());
+    let expected_root = h.chain.store().tree().unwrap().root();
+    h.chain.store().begin_reorg(second.hash(), fork).unwrap();
+    h.chain.store().revert().unwrap();
+    h.chain.store().revert().unwrap();
+    // Recovery must run even when the arriving block is already stored.
+    assert_eq!(h.import(&second).unwrap(), Import::AlreadyKnown);
+    assert_eq!(h.chain.tip().unwrap().hash, second.hash());
+    assert_eq!(h.chain.store().tree().unwrap().root(), expected_root);
+    for block in [&first, &second] {
+        for (index, tx) in block.transactions().iter().enumerate() {
+            assert_eq!(
+                h.chain.store().transaction_location(&tx.txid()).unwrap(),
+                Some((block.header().height, index as u32))
+            );
+            for nf in tx.nullifiers() {
+                assert!(h.chain.store().contains_nullifier(nf).unwrap());
+            }
+        }
+    }
+    assert!(h.chain.store().pending_reorg().unwrap().is_none());
+}
+
+#[test]
+fn failed_reorg_restores_original_chain_and_clears_journal() {
+    let mut h = Harness::with_params(
+        8802,
+        ChainParams {
+            max_reorg_depth: 1,
+            ..ChainParams::test()
+        },
+    );
+    let fork = h.tip_header();
+    let fork_tree = h.chain.store().tree().unwrap();
+    let main = h.extend(Vec::new());
+    let (side, side_tree) = h.make_block_on(&fork, &fork_tree, Vec::new());
+    assert_eq!(h.import(&side).unwrap(), Import::SideChain);
+    let (bad, _) = h.make_block_on(side.header(), &side_tree, Vec::new());
+    let mut header = bad.header().clone();
+    header.commitment_root = side_tree.root();
+    assert!(h.chain.pow().mine(&mut header, 256, &mut h.rng).unwrap());
+    let bad = Block::new(header, bad.transactions().to_vec());
+    assert!(matches!(
+        h.import(&bad),
+        Err(Error::InvalidHeader("commitment root mismatch"))
+    ));
+    assert_eq!(h.chain.tip().unwrap().hash, main.hash());
+    assert_eq!(
+        h.chain.store().tree().unwrap().root(),
+        main.header().commitment_root
+    );
+    assert!(h.chain.store().pending_reorg().unwrap().is_none());
+    for tx in main.transactions() {
+        assert!(h
+            .chain
+            .store()
+            .transaction_location(&tx.txid())
+            .unwrap()
+            .is_some());
+        for nf in tx.nullifiers() {
+            assert!(h.chain.store().contains_nullifier(nf).unwrap());
+        }
+    }
+    for tx in side.transactions() {
+        assert!(h
+            .chain
+            .store()
+            .transaction_location(&tx.txid())
+            .unwrap()
+            .is_none());
+        for nf in tx.nullifiers() {
+            assert!(!h.chain.store().contains_nullifier(nf).unwrap());
+        }
+    }
+}
+
+/// Tiny-block baseline only: excludes coinbase proving, mining, and wallet scans.
+#[test]
+#[ignore = "measurement, not a check"]
+fn coinbase_only_block_import_timing() {
+    let mut h = Harness::new(9841);
+    let mut samples = Vec::with_capacity(7);
+    for _ in 0..7 {
+        let parent = h.tip_header();
+        let block = h.make_block(&parent, Vec::new());
+        let started = std::time::Instant::now();
+        let imported = h.import(&block);
+        samples.push(started.elapsed());
+        assert_eq!(imported.unwrap(), Import::Extended);
+    }
+    let mut ordered = samples.clone();
+    ordered.sort_unstable();
+    eprintln!(
+        "tiny coinbase-only block import: median {:?}, samples {samples:?}",
+        ordered[3]
+    );
+}
