@@ -23,16 +23,47 @@ mod u256 {
 }
 pub use u256::U256;
 
-mod u512 {
-    // Generated arithmetic; newer compilers deprecate the `max_value` the
-    // macro expands to.
-    #![allow(missing_docs, deprecated, clippy::all, clippy::pedantic)]
-    uint::construct_uint! {
-        /// A 512-bit unsigned integer for accumulated chain work.
-        pub struct U512(8);
+/// Cumulative, validated proof of work. Arithmetic never wraps or saturates.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ChainWork(U256);
+
+impl ChainWork {
+    /// Genesis contributes no work: it is a fixed, unmined network anchor.
+    pub const ZERO: Self = Self(U256::zero());
+    /// Largest representable cumulative work.
+    pub const MAX: Self = Self(U256::MAX);
+
+    /// Wraps an integer, for persisted work and node policy thresholds.
+    pub const fn from_u256(value: U256) -> Self {
+        Self(value)
+    }
+
+    /// The underlying integer, for non-consensus reporting.
+    pub fn as_u256(self) -> U256 {
+        self.0
+    }
+
+    /// Decodes the fixed-width big-endian database representation.
+    pub fn from_be_bytes(bytes: [u8; 32]) -> Self {
+        Self(U256::from_big_endian(&bytes))
+    }
+
+    /// Encodes the fixed-width big-endian database representation.
+    pub fn to_be_bytes(self) -> [u8; 32] {
+        self.0.to_big_endian()
+    }
+
+    /// Adds validated work without wrapping.
+    ///
+    /// # Errors
+    /// Returns [`Error::ChainWorkOverflow`] if the sum exceeds 256 bits.
+    pub fn checked_add(self, work: Self) -> Result<Self, Error> {
+        self.0
+            .checked_add(work.0)
+            .map(Self)
+            .ok_or(Error::ChainWorkOverflow)
     }
 }
-pub use u512::U512;
 
 /// A difficulty target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -111,16 +142,58 @@ impl Target {
         U256::from_big_endian(hash) <= self.0
     }
 
-    /// The work this target represents, `2^256 / (target + 1)`.
-    pub fn work(&self) -> U256 {
-        // (~t / (t + 1)) + 1 == 2^256 / (t + 1) without overflowing.
-        (!self.0 / (self.0.saturating_add(U256::one()))).saturating_add(U256::one())
+    /// The work this validated target represents, `floor(2^256 / (target + 1))`.
+    ///
+    /// # Errors
+    /// A zero target is invalid: its work would be 2^256, which cannot fit.
+    pub fn work(&self) -> Result<ChainWork, Error> {
+        if self.0.is_zero() {
+            return Err(Error::InvalidTarget);
+        }
+        // MAX + 1 cannot fit, but its work is exactly one.
+        let Some(denominator) = self.0.checked_add(U256::one()) else {
+            return Ok(ChainWork::from_u256(U256::one()));
+        };
+        let work = (!self.0 / denominator)
+            .checked_add(U256::one())
+            .ok_or(Error::ChainWorkOverflow)?;
+        Ok(ChainWork::from_u256(work))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn work_boundaries_and_checked_accumulation() {
+        assert!(matches!(
+            Target::from_u256(U256::zero()).work(),
+            Err(Error::InvalidTarget)
+        ));
+        let one = Target::MAX.work().unwrap();
+        assert_eq!(one.as_u256(), U256::one());
+        assert_eq!(
+            Target::from_u256(U256::one()).work().unwrap().as_u256(),
+            U256::one() << 255
+        );
+        let mut total = ChainWork::ZERO;
+        for _ in 0..100 {
+            let next = total.checked_add(one).unwrap();
+            assert!(next > total);
+            assert_eq!(ChainWork::from_be_bytes(next.to_be_bytes()), next);
+            total = next;
+        }
+        assert!(matches!(
+            ChainWork::MAX.checked_add(one),
+            Err(Error::ChainWorkOverflow)
+        ));
+        let half = Target::from_u256(U256::one()).work().unwrap();
+        assert!(matches!(
+            half.checked_add(half),
+            Err(Error::ChainWorkOverflow)
+        ));
+    }
 
     #[test]
     fn compact_roundtrips_known_values() {
@@ -172,7 +245,10 @@ mod tests {
         let easy = Target::from_u256(U256::one() << 200);
         let hard = Target::from_u256(U256::one() << 199);
         // 2^256 / (2^199 + 1) floors to 2^57 - 1, twice 2^56 - 1 plus one.
-        assert_eq!(hard.work(), easy.work() * 2 + 1);
-        assert_eq!(Target::MAX.work(), U256::one());
+        assert_eq!(
+            hard.work().unwrap().as_u256(),
+            easy.work().unwrap().as_u256() * 2 + 1
+        );
+        assert_eq!(Target::MAX.work().unwrap().as_u256(), U256::one());
     }
 }

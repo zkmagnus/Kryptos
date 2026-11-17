@@ -105,6 +105,8 @@ async fn mining_waits_for_tor_and_rejects_late_work_until_recovery() {
         Config {
             offline: false,
             p2p: true,
+            bootstrap_mining: true,
+            mining_ready_secs: 0,
             ..Config::test()
         },
         Arc::clone(&network),

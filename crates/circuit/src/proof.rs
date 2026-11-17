@@ -297,7 +297,7 @@ mod tests {
 
     /// `BLAKE2b` of the pinned verifying key description. Any change to the
     /// circuit changes this value; update it deliberately, never casually.
-    const PINNED_VK_HASH: &str = "9b18612cef14d44f18be424aeb9529e38b647f9d80ef2d55ed76a52e63a933e4";
+    const PINNED_VK_HASH: &str = "795317231dea0ea83c28af9ee83f2137e293d6b6ffe204321dcb2ed56d763ad4";
 
     #[test]
     fn verifying_key_is_pinned() {

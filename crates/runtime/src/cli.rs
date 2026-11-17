@@ -146,12 +146,54 @@ pub enum Command {
         /// Disable built-in seed peers.
         #[arg(long)]
         no_seeds: bool,
-        /// Maximum regular outbound peers.
+        /// Maximum maintained authenticated peers.
         #[arg(long, default_value_t = crate::config::OUTBOUND_TARGET)]
         max_outbound: usize,
         /// Public port of the Tor hidden service.
         #[arg(long, default_value_t = crate::config::DEFAULT_P2P_PORT)]
         p2p_port: u16,
+        /// Seconds allowed to establish an onion connection.
+        #[arg(long, default_value_t = 60)]
+        connect_timeout: u64,
+        /// Seconds allowed for the application version exchange.
+        #[arg(long, default_value_t = 60)]
+        handshake_timeout: u64,
+        /// Seconds without incoming peer traffic before disconnecting.
+        #[arg(long, default_value_t = 900)]
+        idle_timeout: u64,
+        /// Seconds allowed to read or write one peer message.
+        #[arg(long, default_value_t = 120)]
+        message_timeout: u64,
+        /// Seconds allowed for a headers or body response after its request is flushed.
+        #[arg(long, default_value_t = 300)]
+        sync_response_timeout: u64,
+        /// Seconds allowed per Tor directory bootstrap attempt.
+        #[arg(long, default_value_t = 180)]
+        tor_bootstrap_timeout: u64,
+        /// Seconds allowed for anonymous onion-service publication.
+        #[arg(long, default_value_t = 1200)]
+        tor_service_startup_timeout: u64,
+        /// Seconds Arti may spend building a requested circuit.
+        #[arg(long, default_value_t = 60)]
+        tor_circuit_request_timeout: u64,
+        /// Maximum Arti circuit construction attempts per request.
+        #[arg(long, default_value_t = 8)]
+        tor_circuit_request_attempts: u32,
+        /// Maximum onion introduction/rendezvous attempts per connection.
+        #[arg(long, default_value_t = 3)]
+        tor_intro_rendezvous_attempts: u32,
+        /// Seconds a used circuit remains eligible for new streams.
+        #[arg(long, default_value_t = 600)]
+        tor_max_circuit_dirtiness: u64,
+        /// Seconds to retain disused circuits with strong stream isolation.
+        #[arg(long, default_value_t = 3600)]
+        tor_disused_circuit_timeout: u64,
+        /// Initial seconds between failed peer or Tor bootstrap attempts.
+        #[arg(long, default_value_t = 60)]
+        retry_initial: u64,
+        /// Maximum retry seconds including jitter.
+        #[arg(long, default_value_t = 3600)]
+        retry_max: u64,
         /// Maximum inbound peers; Tor identities do not identify inbound dialers.
         #[arg(long, default_value_t = crate::config::DEFAULT_MAX_INBOUND)]
         max_inbound: usize,
@@ -161,6 +203,15 @@ pub enum Command {
         /// Miner worker threads; defaults to one. Ignored without --mine.
         #[arg(long, default_value_t = 1)]
         mining_threads: usize,
+        /// Allow mining without peers when creating the first node of a chain.
+        #[arg(long)]
+        bootstrap_mining: bool,
+        /// Distinct authenticated maintained peers required before online mining.
+        #[arg(long, default_value_t = 1)]
+        mining_min_peers: usize,
+        /// Seconds readiness must remain stable before mining starts or resumes.
+        #[arg(long, default_value_t = 5)]
+        mining_ready_secs: u64,
         /// Control socket address.
         #[arg(long, default_value = DEFAULT_RPC)]
         rpc: SocketAddr,
@@ -292,9 +343,26 @@ pub async fn run(cli: Cli) -> Result<()> {
             no_seeds,
             max_outbound,
             p2p_port,
+            connect_timeout,
+            handshake_timeout,
+            idle_timeout,
+            message_timeout,
+            sync_response_timeout,
+            tor_bootstrap_timeout,
+            tor_service_startup_timeout,
+            tor_circuit_request_timeout,
+            tor_circuit_request_attempts,
+            tor_intro_rendezvous_attempts,
+            tor_max_circuit_dirtiness,
+            tor_disused_circuit_timeout,
+            retry_initial,
+            retry_max,
             max_inbound,
             mine,
             mining_threads,
+            bootstrap_mining,
+            mining_min_peers,
+            mining_ready_secs,
             rpc,
             rpc_http,
             rpc_token,
@@ -313,10 +381,41 @@ pub async fn run(cli: Cli) -> Result<()> {
                 addnode,
                 no_seeds,
                 max_outbound,
-                tor: TorConfig { p2p_port },
+                tor: TorConfig {
+                    p2p_port,
+                    settings: p2p::transport::TorSettings {
+                        connect_timeout: std::time::Duration::from_secs(connect_timeout),
+                        handshake_timeout: std::time::Duration::from_secs(handshake_timeout),
+                        idle_timeout: std::time::Duration::from_secs(idle_timeout),
+                        message_timeout: std::time::Duration::from_secs(message_timeout),
+                        sync_response_timeout: std::time::Duration::from_secs(
+                            sync_response_timeout,
+                        ),
+                        bootstrap_timeout: std::time::Duration::from_secs(tor_bootstrap_timeout),
+                        service_startup_timeout: std::time::Duration::from_secs(
+                            tor_service_startup_timeout,
+                        ),
+                        circuit_request_timeout: std::time::Duration::from_secs(
+                            tor_circuit_request_timeout,
+                        ),
+                        circuit_request_attempts: tor_circuit_request_attempts,
+                        intro_rendezvous_attempts: tor_intro_rendezvous_attempts,
+                        max_circuit_dirtiness: std::time::Duration::from_secs(
+                            tor_max_circuit_dirtiness,
+                        ),
+                        disused_circuit_timeout: std::time::Duration::from_secs(
+                            tor_disused_circuit_timeout,
+                        ),
+                        retry_initial: std::time::Duration::from_secs(retry_initial),
+                        retry_max: std::time::Duration::from_secs(retry_max),
+                    },
+                },
                 max_inbound,
                 mine,
                 mining_threads,
+                bootstrap_mining,
+                mining_min_peers,
+                mining_ready_secs,
                 rpc,
                 rpc_http,
                 rpc_token: token,
@@ -389,13 +488,15 @@ async fn send(
     light: bool,
 ) -> Result<()> {
     let amount = RawCoin::from_raw(amount)?;
-    let mut client = rpc.connect().await?;
+    let endpoint = rpc.endpoint().await?;
+    let mut client = endpoint.connect().await?;
     let genesis = fetch_genesis(&mut client).await?;
     let network = network_of(&genesis)?;
     let recipient = RhombusAddress::decode(to, network.address_prefix())?;
     let wallet = open_wallet(wallet, genesis)?;
     let params = network.params();
     let scanned = sync_wallet(&mut client, &wallet, light).await?;
+    drop(client);
     let branch = params.branch_at(next_height(scanned)?);
     let pk = tokio::task::spawn_blocking(ProvingKey::build)
         .await
@@ -405,7 +506,7 @@ async fn send(
     let actual_fee = transaction.fee().raw();
     // Download closes its session before private scanning; proof generation
     // can also exceed the server's idle deadline. Submit on a fresh connection.
-    let mut client = rpc.connect().await?;
+    let mut client = endpoint.connect().await?;
     let txid = client
         .call(&format!("submit {}", to_hex(&transaction.to_vec())))
         .await?;
@@ -440,6 +541,9 @@ struct RunOptions {
     max_inbound: usize,
     mine: Option<String>,
     mining_threads: usize,
+    bootstrap_mining: bool,
+    mining_min_peers: usize,
+    mining_ready_secs: u64,
     rpc: SocketAddr,
     rpc_http: SocketAddr,
     rpc_token: Option<Token>,
@@ -460,6 +564,9 @@ async fn run_node(opts: RunOptions) -> Result<()> {
         max_inbound,
         mine,
         mining_threads,
+        bootstrap_mining,
+        mining_min_peers,
+        mining_ready_secs,
         rpc,
         rpc_http,
         rpc_token,
@@ -485,6 +592,9 @@ async fn run_node(opts: RunOptions) -> Result<()> {
         tor,
         mine_to,
         mining_threads,
+        bootstrap_mining,
+        mining_min_peers,
+        mining_ready_secs,
         rpc: Some(rpc),
         rpc_http: Some(rpc_http),
         rpc_token,
@@ -495,6 +605,13 @@ async fn run_node(opts: RunOptions) -> Result<()> {
     let handle = crate::node::spawn(config).await?;
     let log = crate::node::log;
     log(&format!("Rhombus up on the {network} network"));
+    if bootstrap_mining {
+        crate::logging::warn("bootstrap mining enabled: may create a separate chain without peers");
+    } else {
+        log(&format!(
+            "mining requires {mining_min_peers} distinct authenticated peers and completed sync"
+        ));
+    }
     log(if p2p {
         "peers      embedded onion service enabled"
     } else {
@@ -1015,6 +1132,66 @@ mod tests {
         assert_eq!(max_outbound, 8);
         assert_eq!(p2p_port, crate::config::DEFAULT_P2P_PORT);
         assert!(Cli::try_parse_from(["Rhombus", "status"]).is_err());
+    }
+
+    #[test]
+    fn tor_deadlines_and_circuit_settings_are_configurable() {
+        let cli = Cli::try_parse_from([
+            "Rhombus",
+            "run",
+            "--connect-timeout",
+            "45",
+            "--handshake-timeout",
+            "75",
+            "--idle-timeout",
+            "1200",
+            "--message-timeout",
+            "180",
+            "--tor-bootstrap-timeout",
+            "240",
+            "--tor-circuit-request-timeout",
+            "50",
+            "--tor-intro-rendezvous-attempts",
+            "2",
+            "--retry-initial",
+            "90",
+            "--retry-max",
+            "1800",
+        ])
+        .unwrap();
+        let Command::Run {
+            connect_timeout,
+            handshake_timeout,
+            idle_timeout,
+            message_timeout,
+            tor_bootstrap_timeout,
+            tor_circuit_request_timeout,
+            tor_intro_rendezvous_attempts,
+            retry_initial,
+            retry_max,
+            ..
+        } = cli.command
+        else {
+            panic!("run command")
+        };
+        assert_eq!(
+            (
+                connect_timeout,
+                handshake_timeout,
+                idle_timeout,
+                message_timeout
+            ),
+            (45, 75, 1200, 180)
+        );
+        assert_eq!(
+            (
+                tor_bootstrap_timeout,
+                tor_circuit_request_timeout,
+                tor_intro_rendezvous_attempts
+            ),
+            (240, 50, 2)
+        );
+        assert_eq!((retry_initial, retry_max), (90, 1800));
     }
 
     /// The network a parsed command is for, if it takes one.

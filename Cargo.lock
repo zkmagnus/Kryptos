@@ -2969,6 +2969,7 @@ name = "p2p"
 version = "0.1.0"
 dependencies = [
  "arti-client",
+ "chain",
  "crypto",
  "data-encoding",
  "fs-mistrust",

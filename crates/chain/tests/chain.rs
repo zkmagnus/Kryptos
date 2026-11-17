@@ -13,7 +13,7 @@ mod common;
 use chain::chain::{Chain, Import};
 use chain::genesis::genesis;
 use chain::params::{ChainParams, Upgrade};
-use chain::target::Target;
+use chain::target::{ChainWork, Target};
 use chain::Error;
 use common::{proving_key, spend_first_coin_for, spend_first_coin_with_fee, Harness, Wallet};
 use protocol::amount::RawCoin;
@@ -31,10 +31,29 @@ use storage::tree::CommitmentTree;
 fn mining_extends_the_chain_and_pays_the_miner() {
     let mut h = Harness::new(1);
     assert_eq!(h.miner.tree.len(), 0, "genesis has no allocated coins");
+    let mut work = h.chain.tip_chainwork().unwrap();
+    assert_eq!(work, ChainWork::ZERO, "genesis is an unmined anchor");
     for height in 1..=3u32 {
         let block = h.extend(Vec::new());
         assert_eq!(block.header().height, height);
         assert_eq!(h.chain.tip().unwrap().height, height);
+        let next = h.chain.tip_chainwork().unwrap();
+        assert!(next > work);
+        assert_eq!(
+            next,
+            work.checked_add(
+                Target::from_compact(block.header().target)
+                    .unwrap()
+                    .work()
+                    .unwrap()
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            h.chain.store().chainwork(&block.hash()).unwrap(),
+            Some(next.to_be_bytes())
+        );
+        work = next;
     }
     assert_eq!(h.miner.balance(), 3 * subsidy(1).raw());
     let again = h
@@ -296,6 +315,70 @@ fn a_longer_side_chain_triggers_a_reorganization() {
     );
 }
 
+#[test]
+fn equal_work_keeps_the_first_seen_block_even_when_its_hash_is_larger() {
+    let mut h = Harness::new(41);
+    let parent = h.tip_header();
+    let a = h.make_block(&parent, Vec::new());
+    let b = h.make_block(&parent, Vec::new());
+    let (first, second) = if a.hash() > b.hash() { (a, b) } else { (b, a) };
+    assert!(first.hash() > second.hash());
+    assert_eq!(h.import(&first).unwrap(), Import::Extended);
+    assert_eq!(h.import(&second).unwrap(), Import::SideChain);
+    assert_eq!(
+        h.chain.chainwork(&first.hash()).unwrap(),
+        h.chain.chainwork(&second.hash()).unwrap()
+    );
+    assert_eq!(h.chain.tip().unwrap().hash, first.hash());
+}
+
+#[test]
+fn overflowing_work_does_not_store_the_child_or_move_the_tip() {
+    let mut h = Harness::new(42);
+    let parent = h.tip_header();
+    let child = h.make_block(&parent, Vec::new());
+    let genesis = h.chain.store().block(&parent.hash()).unwrap().unwrap();
+    // Model a valid indexed ancestry already at the representational limit.
+    h.chain
+        .store()
+        .put_block(&genesis, &ChainWork::MAX.to_be_bytes())
+        .unwrap();
+    assert!(matches!(h.import(&child), Err(Error::ChainWorkOverflow)));
+    assert_eq!(h.chain.tip().unwrap().hash, genesis.hash());
+    assert!(h.chain.store().block(&child.hash()).unwrap().is_none());
+    assert!(h.chain.store().chainwork(&child.hash()).unwrap().is_none());
+}
+
+#[test]
+fn equivalent_noncanonical_nbits_are_rejected() {
+    let params = ChainParams {
+        pow_limit: Target::from_compact(0x207f_ff00).unwrap(),
+        ..ChainParams::test()
+    };
+    let h = Harness::with_params(43, params);
+    let parent = h.tip_header();
+    let mut header = empty_header(1, parent.hash(), parent.commitment_root);
+    header.timestamp = parent.timestamp + params.block_interval;
+    // Both decode to the same integer; only the DAA's encoding is allowed.
+    header.target = 0x2100_7fff;
+    assert_eq!(
+        Target::from_compact(header.target).unwrap(),
+        params.pow_limit
+    );
+    let validator = chain::validate::Validator {
+        params: h.chain.params(),
+        pow: h.chain.pow(),
+        vk: h.chain.verifying_key(),
+        now: header.timestamp,
+    };
+    assert!(matches!(
+        validator.check_header_rules(&header, &[parent]),
+        Err(Error::InvalidHeader(
+            "target does not match the difficulty rule"
+        ))
+    ));
+}
+
 /// One upgrade at height 3 on the test network.
 static UPGRADE_AT_3: [Upgrade; 1] = [Upgrade {
     height: 3,
@@ -512,9 +595,10 @@ fn a_failed_apply_leaves_no_partial_state() {
     let block = block_over(&mut h, &parent, vec![a.clone(), b]);
     let tree = h.chain.store().tree().unwrap();
     let tip_before = h.chain.tip().unwrap();
-    assert!(h.chain.store().apply(&block, &tree).is_err());
+    assert!(h.chain.store().apply(&block, &tree, &[0; 32]).is_err());
     assert_eq!(h.chain.tip().unwrap(), tip_before);
     assert!(h.chain.store().block(&block.hash()).unwrap().is_none());
+    assert!(h.chain.store().chainwork(&block.hash()).unwrap().is_none());
     assert!(!h
         .chain
         .store()
@@ -549,6 +633,7 @@ fn a_side_chain_block_with_the_wrong_target_is_not_stored() {
         ))
     ));
     assert!(h.chain.store().block(&cheap.hash()).unwrap().is_none());
+    assert!(h.chain.store().chainwork(&cheap.hash()).unwrap().is_none());
 }
 
 #[test]
@@ -696,7 +781,7 @@ fn a_store_with_history_but_no_rules_digest_is_refused() {
     let only_genesis = dir.path().join("genesis.redb");
     Store::open(&only_genesis)
         .unwrap()
-        .apply(&first, &CommitmentTree::empty())
+        .apply(&first, &CommitmentTree::empty(), &[0; 32])
         .unwrap();
     assert!(Chain::new(Store::open(&only_genesis).unwrap(), params, vk()).is_ok());
     assert!(Store::open(&only_genesis)
@@ -709,10 +794,16 @@ fn a_store_with_history_but_no_rules_digest_is_refused() {
     let with_history = dir.path().join("history.redb");
     {
         let store = Store::open(&with_history).unwrap();
-        store.apply(&first, &CommitmentTree::empty()).unwrap();
+        store
+            .apply(&first, &CommitmentTree::empty(), &[0; 32])
+            .unwrap();
         let header = empty_header(1, first.hash(), CommitmentTree::empty().root());
         store
-            .apply(&Block::new(header, Vec::new()), &CommitmentTree::empty())
+            .apply(
+                &Block::new(header, Vec::new()),
+                &CommitmentTree::empty(),
+                &[0; 32],
+            )
             .unwrap();
     }
     assert!(matches!(

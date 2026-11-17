@@ -1,7 +1,7 @@
 //! The event loop. One task owns every piece of state and reacts to
 //! events from connections, the clock, the miner and the RPC.
 
-use p2p::transport::{Incoming, TorNetwork, TorStatus};
+use p2p::transport::{Incoming, TorNetwork, TorSettings, TorStatus};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -13,13 +13,13 @@ use chain::params::ChainParams;
 use chain::target::{Target, U256};
 use chain::validate::{header_lookback, recent_headers};
 use p2p::addrbook::AddressBook;
-use p2p::address::{NetAddr, PeerKey};
+use p2p::address::{canonical_dialer, NetAddr, PeerKey};
 use p2p::dandelion::{Dandelion, Route};
 use p2p::message::{
     CompactBlock, Inventory, Message, PeerAddr, VersionInfo, MAX_HEADERS, MAX_INVENTORY,
 };
 use p2p::peer::{version_info, Direction, Event as PeerEvent, Peer, SELF_CONNECTION};
-use p2p::sync::{locator, BlockSync};
+use p2p::sync::{locator, BlockSync, MIN_CHAIN_WORK};
 use protocol::address::RhombusAddress;
 use protocol::block::{Block, BlockHash, BlockHeader};
 use protocol::compact::CompactBlock as LightBlock;
@@ -36,7 +36,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use transaction_proof::VerifyingKey;
 
 use crate::config::{Config, Network, MEMPOOL_CAPACITY};
-use crate::discovery::{self, EXCHANGE_SECONDS, MAX_PROBES, REPLY_SECONDS, SAMPLE_SIZE};
+use crate::discovery::{self, EXCHANGE_SECONDS, REPLY_SECONDS, SAMPLE_SIZE};
 use crate::logging;
 use crate::metrics::Metrics;
 use crate::miner::Template;
@@ -65,12 +65,16 @@ const MAX_MINED_RECORDS: usize = 100_000;
 /// gives up on its peer, so a peer that claims a long chain and never
 /// sends it cannot hold the node in sync, and its miners idle, forever.
 const SYNC_STALL_SECONDS: u64 = 600;
+/// Bound retries of an incomplete initial check on an otherwise live peer.
+const INITIAL_SYNC_RETRY_SECONDS: u64 = 60;
 
 /// Why the node hands out no mining work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NotReady {
     /// The embedded Tor client or onion service is not ready.
     TorUnavailable,
+    /// Transport, peer and sync checks must remain ready before resuming.
+    Stabilizing,
     /// No peer has finished its handshake, on a network that needs one.
     NoPeers,
     /// Blocks are downloading, or a peer reported a longer chain.
@@ -81,7 +85,8 @@ impl std::fmt::Display for NotReady {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::TorUnavailable => "embedded Tor is not ready",
-            Self::NoPeers => "no peers yet",
+            Self::NoPeers => "not enough authenticated peers",
+            Self::Stabilizing => "waiting for stable network readiness",
             Self::Syncing => "catching up with the network",
         })
     }
@@ -115,12 +120,14 @@ pub enum Event {
         id: PeerId,
         /// Who dialed.
         direction: Direction,
-        /// Authenticated outbound onion endpoint; inbound callers are anonymous.
+        /// Authenticated onion endpoint; unbound inbound callers are anonymous.
         addr: Option<PeerKey>,
         /// What was dialed, or the remote address for inbound peers.
         target: String,
         /// Where to queue messages for it.
         outbox: crate::net::Outbox,
+        /// Time spent establishing the outbound onion stream.
+        connect_time: Option<std::time::Duration>,
     },
     /// A message arrived.
     Message {
@@ -138,6 +145,28 @@ pub enum Event {
     Writable {
         /// Connection id.
         id: PeerId,
+    },
+    /// A complete outbound frame was flushed; starts request deadlines.
+    Sent {
+        /// Connection id.
+        id: PeerId,
+        /// Request metadata.
+        sent: crate::net::Sent,
+        /// Actual flush time.
+        at: std::time::Instant,
+        /// Actual flush wall-clock seconds used by the sync state machine.
+        timestamp: u64,
+        /// Total flushed bytes on this stream.
+        bytes: u64,
+    },
+    /// A complete valid frame was read from a peer.
+    Received {
+        /// Connection id.
+        id: PeerId,
+        /// Total received bytes on this stream.
+        bytes: u64,
+        /// Receipt time, before actor queueing.
+        at: std::time::Instant,
     },
     /// A dial was skipped because its name resolves only to this node.
     DialedSelf {
@@ -276,7 +305,7 @@ pub struct Located {
 pub struct PeerSummary {
     /// Connection id.
     pub id: PeerId,
-    /// Authenticated outbound onion endpoint; inbound callers are anonymous.
+    /// Authenticated onion endpoint; unbound inbound callers are anonymous.
     pub addr: Option<PeerKey>,
     /// What was dialed, or the remote address for inbound peers.
     pub target: String,
@@ -290,6 +319,16 @@ pub struct PeerSummary {
     pub best_height: Option<u32>,
     /// Misbehavior score.
     pub score: u32,
+    /// Outbound onion connection duration in milliseconds.
+    pub connect_millis: Option<u64>,
+    /// Last measured keepalive round trip in microseconds.
+    pub rtt_micros: Option<u64>,
+    /// Complete frame bytes read on this connection.
+    pub received_bytes: u64,
+    /// Complete frame bytes flushed on this connection.
+    pub sent_bytes: u64,
+    /// Average received bytes per second since connection establishment.
+    pub bytes_per_second: u64,
 }
 
 /// Local control responses.
@@ -363,11 +402,46 @@ struct PeerHandle {
     /// Whether its handshake height no longer counts as a longer chain:
     /// we synced from it until it had nothing more, or it stalled a sync.
     claim_settled: bool,
+    /// Initial headers/body exchange was attempted on this connection.
+    sync_attempted: bool,
+    /// Completed exchange with validated bodies, not merely a settled height claim.
+    sync_checked: bool,
+    /// Monotonic time of the last initial sync attempt.
+    sync_attempted_at: Option<std::time::Instant>,
+    connect_time: Option<std::time::Duration>,
+    ping_sent: Option<(u64, std::time::Instant)>,
+    rtt: Option<std::time::Duration>,
+    received_bytes: u64,
+    sent_bytes: u64,
+    last_received: std::time::Instant,
+    outbound_nonce: Option<u64>,
+    link_sent: Option<PeerId>,
+    pending_link: Option<u64>,
 }
 
 impl PeerHandle {
     /// How a log line names the peer: direction and what was dialed, or
     /// the remote address for inbound peers.
+    fn bytes_per_second(&self) -> u64 {
+        self.received_bytes
+            .checked_div(
+                self.last_received
+                    .duration_since(self.connected_at)
+                    .as_secs()
+                    .max(1),
+            )
+            .unwrap_or_default()
+    }
+
+    fn relay_priority(&self) -> (std::time::Duration, std::cmp::Reverse<u64>) {
+        (
+            self.rtt
+                .or(self.connect_time)
+                .unwrap_or(std::time::Duration::MAX),
+            std::cmp::Reverse(self.bytes_per_second()),
+        )
+    }
+
     fn describe(&self) -> String {
         format!("{:?} {}", self.peer.direction(), self.target)
     }
@@ -392,7 +466,7 @@ struct OwnEndpoints {
 
 /// The node state, owned by the loop task.
 pub struct Node {
-    network: Network,
+    datadir: PathBuf,
     params: ChainParams,
     chain: Chain,
     mempool: Mempool,
@@ -401,7 +475,10 @@ pub struct Node {
     peers_path: Option<PathBuf>,
     dandelion: Dandelion<PeerId>,
     sync: BlockSync,
+    sync_headers: crate::headers::SyncHeaders,
     sync_peer: Option<PeerId>,
+    sync_epoch: u64,
+    sync_unavailable: HashSet<PeerId>,
     /// Expected orphan hashes waiting for their parent to be imported.
     /// Bodies are discarded and requested again, bounding this by the window.
     sync_deferred: HashMap<BlockHash, BlockHash>,
@@ -409,11 +486,15 @@ pub struct Node {
     sync_progress_at: u64,
     /// The last reason miners were refused work, logged when it changes.
     mining_blocked: Option<NotReady>,
+    mining_requires_tor: bool,
+    mining_needs_peers: bool,
+    mining_min_peers: usize,
+    mining_ready_delay: std::time::Duration,
+    mining_ready_since: Option<std::time::Instant>,
+    mining_allowed: watch::Sender<bool>,
     peers: HashMap<PeerId, PeerHandle>,
     dialing: HashMap<PeerId, String>,
     dial_tasks: HashMap<PeerId, JoinHandle<()>>,
-    /// Short reachability checks when all regular outbound slots are occupied.
-    probes: HashSet<PeerId>,
     configured: Vec<String>,
     /// Whether incoming P2P streams are accepted.
     p2p: bool,
@@ -421,6 +502,7 @@ pub struct Node {
     onion: Option<NetAddr>,
     tor_status: Option<watch::Receiver<TorStatus>>,
     tor: Option<Arc<TorNetwork>>,
+    tor_settings: TorSettings,
     p2p_port: u16,
     /// Targets and addresses that turned out to be this node; never redialed.
     own: OwnEndpoints,
@@ -440,6 +522,9 @@ pub struct Node {
     ticks: u64,
     /// Height and hash of every block this node mined, oldest first.
     mined: VecDeque<(u32, BlockHash)>,
+    mined_rejected: u64,
+    mined_blocked: u64,
+    block_telemetry: crate::metrics::BlockTelemetry,
     started_at: u64,
     /// Shell command run with the hash of every new main-chain tip.
     block_notify: Option<String>,
@@ -550,6 +635,7 @@ async fn spawn_inner(
     let genesis = chain.store().hash_at(0)?.ok_or(Error::Stopped)?;
     let (events, receiver) = mpsc::channel(4_096);
     let tip = watch::Sender::new(chain.tip()?.hash);
+    let mining_allowed = watch::Sender::new(false);
     let (peers_path, mut book) = saved_book(&config);
     let configured = starting_peers(&config, &mut book);
 
@@ -564,7 +650,15 @@ async fn spawn_inner(
         &mut tasks,
     )?;
     if let Some(payout) = config.mine_to.clone() {
-        spawn_miner(&mut tasks, payout, &config, &events, &tip, tor.as_ref());
+        spawn_miner(
+            &mut tasks,
+            payout,
+            &config,
+            &events,
+            &tip,
+            tor.as_ref(),
+            mining_allowed.subscribe(),
+        );
     }
     let clock = events.clone();
     tasks.spawn(async move {
@@ -579,27 +673,40 @@ async fn spawn_inner(
 
     book.set_own(onion);
     let node = Node {
-        network: config.network,
+        datadir: config.datadir.clone(),
         params,
         chain,
         mempool: Mempool::new(MEMPOOL_CAPACITY),
         book,
         peers_path,
         dandelion: Dandelion::new(now()),
-        sync: BlockSync::new(),
+        sync: BlockSync::with_timeout(config.tor.settings.sync_response_timeout.as_secs()),
+        sync_headers: crate::headers::SyncHeaders::default(),
         sync_peer: None,
+        sync_epoch: 0,
+        sync_unavailable: HashSet::new(),
         sync_deferred: HashMap::new(),
         sync_progress_at: 0,
         mining_blocked: None,
+        mining_requires_tor: !config.offline || tor.is_some(),
+        mining_needs_peers: !config.offline && !config.bootstrap_mining,
+        mining_min_peers: config.mining_min_peers,
+        mining_ready_delay: std::time::Duration::from_secs(if config.offline {
+            0
+        } else {
+            config.mining_ready_secs
+        }),
+        mining_ready_since: None,
+        mining_allowed,
         peers: HashMap::new(),
         dialing: HashMap::new(),
         dial_tasks: HashMap::new(),
-        probes: HashSet::new(),
         configured,
         p2p: config.p2p,
         onion,
         tor_status: tor.as_ref().map(|tor| tor.status()),
         tor: tor.clone(),
+        tor_settings: config.tor.settings.clone(),
         p2p_port: config.tor.p2p_port,
         own: OwnEndpoints::default(),
         max_outbound: config.max_outbound,
@@ -613,6 +720,9 @@ async fn spawn_inner(
         genesis,
         ticks: 0,
         mined: VecDeque::new(),
+        mined_rejected: 0,
+        mined_blocked: 0,
+        block_telemetry: crate::metrics::BlockTelemetry::default(),
         started_at: now(),
         block_notify: config.block_notify.clone(),
     };
@@ -657,7 +767,12 @@ fn start_network(
     }
     let network = match supplied {
         Some(network) => Some(network),
-        None if needs_tor => Some(TorNetwork::start(&config.datadir, true, &ports)?),
+        None if needs_tor => Some(TorNetwork::start_with_settings(
+            &config.datadir,
+            true,
+            &ports,
+            &config.tor.settings,
+        )?),
         None => None,
     };
     let tor = network.as_ref().map(|(network, _)| Arc::clone(network));
@@ -693,6 +808,7 @@ fn start_network(
                 rpc: rpc_addr.map(|addr| addr.port()),
                 http: rpc_http_addr.map(|addr| addr.port()),
                 max_inbound: config.max_inbound,
+                settings: config.tor.settings.clone(),
             },
             rpc_token,
             config.network,
@@ -724,6 +840,7 @@ fn starting_peers(config: &Config, book: &mut AddressBook) -> Vec<String> {
 
 /// Virtual service ports and the inbound P2P connection limit.
 struct OnionPorts {
+    settings: TorSettings,
     p2p: Option<u16>,
     rpc: Option<u16>,
     http: Option<u16>,
@@ -757,9 +874,10 @@ async fn serve_onion(
                     let Some(id) = next_id.checked_add(1) else { break; };
                     next_id = id;
                     let events = events.clone();
+                    let settings = ports.settings.clone();
                     connections.spawn(async move {
                         let _permit = permit;
-                        crate::net::accept(stream, events, id).await;
+                        crate::net::accept(stream, events, id, settings).await;
                     });
                 } else if Some(port) == ports.rpc || Some(port) == ports.http {
                     let Some(token) = token.clone() else { continue; };
@@ -874,14 +992,16 @@ fn spawn_miner(
     events: &mpsc::Sender<Event>,
     tip: &watch::Sender<BlockHash>,
     tor: Option<&Arc<TorNetwork>>,
+    mining_allowed: watch::Receiver<bool>,
 ) {
-    let miner = crate::miner::start_with_tor(
+    let miner = crate::miner::start_for_node(
         payout,
         config.network.params(),
         config.mining_threads,
         events.clone(),
         tip.subscribe(),
         tor.map(|network| network.status()),
+        Some(mining_allowed),
     );
     tasks.spawn(async move {
         if let Err(error) = miner.wait().await {
@@ -905,8 +1025,16 @@ impl Node {
             if matches!(event, Event::Shutdown) {
                 break;
             }
+            if let Err(error) = self.refresh_mining_readiness() {
+                self.mining_allowed.send_replace(false);
+                logging::error(&format!("mining readiness error: {error}"));
+            }
             if let Err(error) = self.handle(event) {
                 logging::error(&format!("loop error: {error}"));
+            }
+            if let Err(error) = self.refresh_mining_readiness() {
+                self.mining_allowed.send_replace(false);
+                logging::error(&format!("mining readiness error: {error}"));
             }
         }
         self.save_peers();
@@ -934,7 +1062,8 @@ impl Node {
                 addr,
                 target,
                 outbox,
-            } => self.on_connected(id, direction, addr, target, outbox),
+                connect_time,
+            } => self.on_connected(id, direction, addr, target, outbox, connect_time),
             Event::Message { id, message } => self.on_message(id, *message),
             Event::Disconnected { id } => {
                 // A peer still here was not dropped by us: the other side
@@ -944,20 +1073,54 @@ impl Node {
                     let lasted = handle.connected_at.elapsed().as_secs();
                     log(&closed_by_peer(id, &handle.describe(), lasted));
                 }
-                self.fail_unready(id);
+                self.fail_connection(id);
                 self.remove_peer(id);
                 Ok(())
             }
             Event::Writable { id } => self.serve_data(id),
+            Event::Sent {
+                id,
+                sent,
+                at,
+                timestamp,
+                bytes,
+            } => {
+                if let Some(peer) = self.peers.get_mut(&id) {
+                    peer.sent_bytes = bytes;
+                    match sent {
+                        crate::net::Sent::Headers { epoch, request }
+                            if epoch == self.sync_epoch && self.sync_peer == Some(id) =>
+                        {
+                            self.sync.headers_sent_for_request(request, timestamp);
+                        }
+                        crate::net::Sent::Blocks { epoch, requests }
+                            if epoch == self.sync_epoch =>
+                        {
+                            self.sync
+                                .requests_sent_for_requests(id, &requests, timestamp);
+                        }
+                        crate::net::Sent::Ping(nonce) => {
+                            peer.ping_sent = Some((nonce, at));
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(())
+            }
+            Event::Received { id, bytes, at } => {
+                if let Some(peer) = self.peers.get_mut(&id) {
+                    peer.received_bytes = bytes;
+                    peer.last_received = at;
+                }
+                Ok(())
+            }
             Event::DialedSelf { id, target } => {
                 self.dialing.remove(&id);
-                self.probes.remove(&id);
                 self.mark_own(target, None);
                 Ok(())
             }
             Event::DialFailed { id, target } => {
                 self.dialing.remove(&id);
-                self.probes.remove(&id);
                 self.fail_target(&target);
                 Ok(())
             }
@@ -1032,6 +1195,7 @@ impl Node {
         addr: Option<PeerKey>,
         target: String,
         outbox: crate::net::Outbox,
+        connect_time: Option<std::time::Duration>,
     ) -> Result<()> {
         self.dialing.remove(&id);
         if !self.tor_ready() {
@@ -1077,7 +1241,11 @@ impl Node {
         if direction == Direction::Outbound {
             self.handshakes.insert(nonce, id);
         }
-        let (peer, events) = Peer::new(direction, self.our_version(nonce)?, now());
+        let (mut peer, events) = Peer::new(direction, self.our_version(nonce)?, now());
+        peer.set_timeouts(
+            self.tor_settings.idle_timeout,
+            self.tor_settings.message_timeout,
+        );
         self.peers.insert(
             id,
             PeerHandle {
@@ -1090,6 +1258,18 @@ impl Node {
                 addr_allowance: 0,
                 connected_at: std::time::Instant::now(),
                 claim_settled: false,
+                sync_attempted: false,
+                sync_checked: false,
+                sync_attempted_at: None,
+                connect_time,
+                ping_sent: None,
+                rtt: None,
+                received_bytes: 0,
+                sent_bytes: 0,
+                last_received: std::time::Instant::now(),
+                outbound_nonce: (direction == Direction::Outbound).then_some(nonce),
+                link_sent: None,
+                pending_link: None,
             },
         );
         self.apply_peer_events(id, events);
@@ -1117,20 +1297,43 @@ impl Node {
     fn fail_target(&mut self, target: &str) {
         if let Some(key) = dialed_key(target) {
             self.book.failed(key);
+            let delay = self
+                .tor_settings
+                .retry_delay(self.book.failures(key), self.rng.next_u64());
+            self.book.defer_retry(key, now(), delay.as_secs());
         }
+    }
+
+    /// Applies retry policy to a failed authenticated stream, regardless of
+    /// whether duplicate collapse retained its outbound or reverse direction.
+    fn fail_connection(&mut self, id: PeerId) {
+        let Some((addr, port)) = self.peers.get(&id).and_then(|peer| peer.addr) else {
+            return;
+        };
+        // Closing the redundant direction is not a reachability failure while
+        // the canonical authenticated stream to this onion is still healthy.
+        if self.peers.iter().any(|(other, peer)| {
+            *other != id
+                && peer.peer.is_ready()
+                && peer.addr.is_some_and(|(connected, _)| connected == addr)
+        }) {
+            return;
+        }
+        self.fail_target(&addr.endpoint(port));
     }
 
     fn remove_peer(&mut self, id: PeerId) {
         self.peers.remove(&id);
+        self.sync.peer_disconnected(id);
         if let Some(task) = self.dial_tasks.get(&id) {
             task.abort();
         }
-        self.probes.remove(&id);
         self.handshakes.retain(|_, peer| *peer != id);
         self.dandelion.remove_peer(&id);
         if self.sync_peer == Some(id) {
             self.sync_peer = None;
-            self.sync = BlockSync::new();
+            self.sync = BlockSync::with_timeout(self.tor_settings.sync_response_timeout.as_secs());
+            self.sync_headers = crate::headers::SyncHeaders::default();
             self.sync_deferred.clear();
         }
     }
@@ -1139,8 +1342,39 @@ impl Node {
         let Some(handle) = self.peers.get(&id) else {
             return;
         };
-        if handle.outbox.try_send(message).is_err() {
+        let tracking = match &message {
+            Message::GetHeaders { .. } if self.sync_peer == Some(id) => self
+                .sync
+                .header_request_id()
+                .map(|request| crate::net::Sent::Headers {
+                    epoch: self.sync_epoch,
+                    request,
+                }),
+            Message::GetData(items) => {
+                let requests: Vec<_> = items
+                    .iter()
+                    .filter_map(|item| match item {
+                        Inventory::Block(hash) if self.sync.owner(hash) == Some(id) => self
+                            .sync
+                            .body_request_id(hash)
+                            .map(|ticket| (*hash, ticket)),
+                        _ => None,
+                    })
+                    .collect();
+                (!requests.is_empty()).then_some(crate::net::Sent::Blocks {
+                    epoch: self.sync_epoch,
+                    requests,
+                })
+            }
+            _ => None,
+        };
+        let result = match tracking {
+            Some(ticket) => handle.outbox.try_send_tracked(message, ticket),
+            None => handle.outbox.try_send(message),
+        };
+        if result.is_err() {
             logging::warn(&format!("peer {id}: outbox stalled, dropping"));
+            self.fail_connection(id);
             self.remove_peer(id);
         }
     }
@@ -1162,6 +1396,8 @@ impl Node {
                     ));
                     if ban {
                         self.ban(id);
+                    } else if matches!(reason, "ping timeout" | "idle timeout") {
+                        self.fail_connection(id);
                     }
                     self.remove_peer(id);
                 }
@@ -1169,8 +1405,8 @@ impl Node {
         }
     }
 
-    /// Only an outbound onion destination has an authenticated identity.
-    /// Inbound callers are anonymous; never ban their shared loopback socket.
+    /// Only authenticated destinations and their nonce-bound reverse streams
+    /// carry an identity. Anonymous inbound claims cannot create identity bans.
     fn ban(&mut self, id: PeerId) {
         if let Some((addr, _)) = self.peers.get(&id).and_then(|h| h.addr) {
             self.book.ban(addr, now());
@@ -1194,20 +1430,116 @@ impl Node {
             self.book.connected((addr, port), now());
             self.save_peers();
         }
-        if self.probes.contains(&id) {
-            self.remove_peer(id);
-            return;
-        }
         if direction == Direction::Inbound {
             if let Some((claim, port)) = info.onion.filter(|(claim, _)| Some(*claim) != self.onion)
             {
                 self.book.add(PeerAddr::new(claim, port, now()), now());
             }
         }
+        self.link_duplicate_connections();
+        let pending: Vec<_> = self
+            .peers
+            .iter()
+            .filter_map(|(peer, handle)| handle.pending_link.map(|nonce| (*peer, nonce)))
+            .collect();
+        for (peer, nonce) in pending {
+            self.on_connection_link(peer, nonce);
+        }
+        if !self.peers.contains_key(&id) {
+            return;
+        }
         self.exchange_addresses(id);
         let ours = self.chain.tip().map_or(0, |t| t.height);
-        if info.best_height > ours {
+        if info.best_height > ours || (self.mining_needs_peers && direction == Direction::Outbound)
+        {
             self.start_sync(id);
+        }
+    }
+
+    /// Relay an inbound caller's nonce only through our authenticated outbound
+    /// stream to its claimed onion. This optional one-way collision message
+    /// does not gate the handshake or add an authentication round trip.
+    fn link_duplicate_connections(&mut self) {
+        let links: Vec<_> = self
+            .peers
+            .iter()
+            .filter_map(|(id, inbound)| {
+                if inbound.peer.direction() != Direction::Inbound
+                    || !inbound.peer.is_ready()
+                    || inbound.addr.is_some()
+                {
+                    return None;
+                }
+                let version = inbound.peer.version()?;
+                let claimed = version.onion?;
+                let outbound = self
+                    .peers
+                    .iter()
+                    .find(|(_, peer)| {
+                        peer.peer.is_ready()
+                            && peer.peer.direction() == Direction::Outbound
+                            && peer.addr == Some(claimed)
+                    })?
+                    .0;
+                (inbound.link_sent != Some(*outbound)).then_some((*id, *outbound, version.nonce))
+            })
+            .collect();
+        for (inbound, outbound, nonce) in links {
+            if let Some(peer) = self.peers.get_mut(&inbound) {
+                peer.link_sent = Some(outbound);
+            }
+            self.send(outbound, Message::ConnectionLink(nonce));
+        }
+    }
+
+    fn on_connection_link(&mut self, inbound: PeerId, nonce: u64) {
+        let Some(claimed) = self
+            .peers
+            .get(&inbound)
+            .filter(|peer| peer.peer.direction() == Direction::Inbound && peer.addr.is_none())
+            .and_then(|peer| peer.peer.version())
+            .and_then(|info| info.onion)
+        else {
+            return;
+        };
+        let Some(outbound) = self
+            .peers
+            .iter()
+            .find(|(_, peer)| {
+                peer.peer.direction() == Direction::Outbound
+                    && peer.outbound_nonce == Some(nonce)
+                    && peer.addr == Some(claimed)
+            })
+            .map(|(id, _)| *id)
+        else {
+            return;
+        };
+        // Different onion streams can deliver the link before the outbound
+        // Version reply. Preserve it until that network handshake completes.
+        if self
+            .peers
+            .get(&outbound)
+            .is_some_and(|peer| !peer.peer.is_ready())
+        {
+            if let Some(peer) = self.peers.get_mut(&inbound) {
+                peer.pending_link = Some(nonce);
+            }
+            return;
+        }
+        let Some(own) = self.onion else {
+            return;
+        };
+        // The nonce reached this inbound stream via the authenticated onion
+        // destination. An arbitrary Version.onion claim alone cannot evict it.
+        let authenticated = self.peers.get(&outbound).and_then(|peer| peer.addr);
+        if let Some(peer) = self.peers.get_mut(&inbound) {
+            peer.addr = authenticated;
+            peer.pending_link = None;
+        }
+        // Only the larger endpoint closes the reverse stream after binding.
+        if !canonical_dialer(own, claimed.0) {
+            self.remove_peer(outbound);
+            self.start_sync(inbound);
         }
     }
 
@@ -1223,6 +1555,12 @@ impl Node {
         let Some(handle) = self.peers.get_mut(&id) else {
             return Ok(());
         };
+        if let Message::Pong(nonce) = &message {
+            if let Some((_, sent)) = handle.ping_sent.filter(|(expected, _)| expected == nonce) {
+                handle.rtt = Some(handle.last_received.saturating_duration_since(sent));
+                handle.ping_sent = None;
+            }
+        }
         let was_ready = handle.peer.is_ready();
         let before_score = handle.peer.score();
         let events = handle.peer.handle(&message, now());
@@ -1240,6 +1578,31 @@ impl Node {
             return Ok(());
         }
         match message {
+            Message::ConnectionLink(nonce) => self.on_connection_link(id, nonce),
+            Message::NotFound(items) => {
+                let mut missing = false;
+                for item in items {
+                    if let Inventory::Block(hash) = item {
+                        missing |= self.sync.request_failed(id, &hash);
+                    }
+                }
+                if missing {
+                    if self.sync_peer == Some(id) {
+                        self.settle_claim(id);
+                        self.sync_peer = None;
+                        self.sync = BlockSync::with_timeout(
+                            self.tor_settings.sync_response_timeout.as_secs(),
+                        );
+                        self.sync_headers = crate::headers::SyncHeaders::default();
+                        self.sync_deferred.clear();
+                    } else {
+                        self.sync_unavailable.insert(id);
+                        if let Some(source) = self.sync_peer {
+                            self.continue_sync(source);
+                        }
+                    }
+                }
+            }
             Message::GetAddr => {
                 self.share_addresses(id);
             }
@@ -1258,11 +1621,7 @@ impl Node {
             Message::BlockTxn { hash, transactions } => {
                 self.on_block_txn(id, hash, transactions)?;
             }
-            Message::Version(_)
-            | Message::Verack
-            | Message::Ping(_)
-            | Message::Pong(_)
-            | Message::NotFound(_) => {}
+            Message::Version(_) | Message::Verack | Message::Ping(_) | Message::Pong(_) => {}
         }
         Ok(())
     }
@@ -1344,6 +1703,14 @@ impl Node {
 
     // ---- sync -------------------------------------------------------
 
+    fn is_syncing(&self) -> bool {
+        self.sync_peer.is_some()
+            || self
+                .chain
+                .tip_chainwork()
+                .map_or(true, |work| work < MIN_CHAIN_WORK)
+    }
+
     fn start_sync(&mut self, id: PeerId) {
         if self.sync_peer.is_some() {
             return;
@@ -1351,9 +1718,21 @@ impl Node {
         let Ok(tip) = self.chain.tip() else { return };
         let store = self.chain.store();
         let locator = locator(tip.height, |h| store.hash_at(h).ok().flatten());
-        self.sync = BlockSync::new();
+        self.sync_epoch = self.sync_epoch.saturating_add(1);
+        self.sync_unavailable.clear();
+        self.sync = BlockSync::with_timeout(self.tor_settings.sync_response_timeout.as_secs());
+        let Ok(headers) = crate::headers::SyncHeaders::new(&self.datadir) else {
+            logging::warn("cannot create verified header spool");
+            return;
+        };
+        self.sync_headers = headers;
         self.sync_deferred.clear();
         self.sync_peer = Some(id);
+        if let Some(peer) = self.peers.get_mut(&id) {
+            peer.sync_attempted = true;
+            peer.sync_attempted_at = Some(std::time::Instant::now());
+            peer.sync_checked = false;
+        }
         self.sync_progress_at = now();
         log(&format!("syncing from peer {id} at height {}", tip.height));
         self.send(
@@ -1404,7 +1783,30 @@ impl Node {
         }
         let store = self.chain.store();
         let known = |hash: &BlockHash| store.block(hash).ok().flatten().is_some();
-        if let Ok(progress) = self.sync.on_headers(headers, known) {
+        let verified = if self.sync.expects_headers() {
+            self.sync_headers.verify(&self.chain, headers, now())
+        } else {
+            Err(p2p::Error::BadHeaders("unsolicited headers").into())
+        };
+        let accepted = verified.and_then(|work| {
+            let required = self.chain.tip_chainwork()?.max(MIN_CHAIN_WORK);
+            Ok(self.sync.on_headers(headers, known, work, required)?)
+        });
+        if let Ok(progress) = accepted {
+            if let Err(error) = self
+                .sync_headers
+                .defer(&self.sync.take_received_headers(progress.queued))
+            {
+                logging::warn(&format!("cannot spool verified headers: {error}"));
+                self.remove_peer(id);
+                return;
+            }
+            for header in headers {
+                if !known(&header.hash()) {
+                    self.block_telemetry
+                        .observe(header.hash(), std::time::Instant::now());
+                }
+            }
             if progress.queued > 0 {
                 self.sync_progress_at = now();
             }
@@ -1414,7 +1816,8 @@ impl Node {
             // holding miners and alternative sync peers indefinitely.
             self.settle_claim(id);
             self.sync_peer = None;
-            self.sync = BlockSync::new();
+            self.sync = BlockSync::with_timeout(self.tor_settings.sync_response_timeout.as_secs());
+            self.sync_headers = crate::headers::SyncHeaders::default();
             self.sync_deferred.clear();
             self.misbehave(id, 20, "bad headers");
         }
@@ -1423,7 +1826,16 @@ impl Node {
     /// Requests more headers if the queue has room for them, fills the
     /// block request window, and ends the sync once nothing is left.
     fn continue_sync(&mut self, id: PeerId) {
-        if let Some(from) = self.sync.next_headers_request() {
+        let Ok(work) = self.chain.tip_chainwork() else {
+            return;
+        };
+        self.sync.set_required_work(work.max(MIN_CHAIN_WORK));
+        if let Some(from) = ((!self.sync_headers.has_deferred() && self.sync.queued() == 0)
+            || !self.sync.meets_required_work()
+            || !self.sync_headers.authenticated())
+        .then(|| self.sync.next_headers_request())
+        .flatten()
+        {
             self.send(
                 id,
                 Message::GetHeaders {
@@ -1432,20 +1844,98 @@ impl Node {
                 },
             );
         }
-        let hashes = self.sync.next_requests(now());
-        if !hashes.is_empty() {
-            self.send(
-                id,
-                Message::GetData(hashes.into_iter().map(Inventory::Block).collect()),
-            );
+        if self.sync_headers.authenticated()
+            && self.sync.meets_required_work()
+            && self.sync.queued() == 0
+        {
+            match self.sync_headers.take_deferred(MAX_HEADERS) {
+                Ok(headers) => {
+                    if self.sync.queue_headers(&headers).is_err() {
+                        self.remove_peer(id);
+                        return;
+                    }
+                }
+                Err(error) => {
+                    logging::warn(&format!("cannot read verified header spool: {error}"));
+                    self.remove_peer(id);
+                    return;
+                }
+            }
+        }
+        // Independent onion streams avoid a slow body blocking every peer.
+        let mut peers: Vec<_> = self
+            .peers
+            .iter()
+            .filter(|(peer_id, peer)| {
+                self.sync_headers.authenticated()
+                    && peer.peer.is_ready()
+                    && !self.sync_unavailable.contains(peer_id)
+                    && (**peer_id == id
+                        || peer.peer.version().is_some_and(|version| {
+                            self.sync
+                                .last_header()
+                                .is_none_or(|header| version.best_height >= header.height)
+                        }))
+            })
+            .map(|(peer, handle)| (*peer, handle.relay_priority()))
+            .collect();
+        peers.sort_by_key(|(peer, priority)| (*priority, *peer));
+        for (peer, _) in peers {
+            let hashes = self.sync.next_requests_for(peer);
+            if !hashes.is_empty() {
+                self.send(
+                    peer,
+                    Message::GetData(hashes.into_iter().map(Inventory::Block).collect()),
+                );
+            }
+        }
+        if self.sync.work_blocked() || (self.sync.exhausted() && !self.sync_headers.authenticated())
+        {
+            logging::warn(&format!(
+                "peer {id}: header chain below required work; no bodies requested"
+            ));
+            self.settle_claim(id);
+            self.sync_peer = None;
+            self.sync = BlockSync::with_timeout(self.tor_settings.sync_response_timeout.as_secs());
+            self.sync_headers = crate::headers::SyncHeaders::default();
+            self.sync_deferred.clear();
+            return;
         }
         self.finish_sync_if_done();
     }
 
     fn finish_sync_if_done(&mut self) {
-        if self.sync.is_idle() && self.sync.exhausted() {
+        if self.sync_headers.authenticated()
+            && !self.sync_headers.has_deferred()
+            && self.sync.is_idle()
+            && self.sync.exhausted()
+            && self.sync.meets_required_work()
+        {
             if let Some(id) = self.sync_peer.take() {
-                log(&format!("synced with peer {id}"));
+                let ours = self.chain.tip().map_or(0, |tip| tip.height);
+                if let Some(peer) = self.peers.get_mut(&id) {
+                    // An empty reply to an unfulfilled higher-height claim is
+                    // not evidence of synchronization. A validated side branch
+                    // can be lower-work than ours; chain.import decides that.
+                    peer.sync_checked = self
+                        .chain
+                        .tip_chainwork()
+                        .is_ok_and(|work| work >= MIN_CHAIN_WORK)
+                        && peer.peer.version().is_some_and(|version| {
+                            version.best_height <= ours
+                                || self
+                                    .sync
+                                    .last_header()
+                                    .is_some_and(|header| header.height >= version.best_height)
+                        });
+                }
+                if self.peers.get(&id).is_some_and(|peer| peer.sync_checked) {
+                    log(&format!("synced with peer {id}"));
+                } else {
+                    logging::warn(&format!(
+                        "peer {id} ended sync without supplying its claimed height"
+                    ));
+                }
                 self.settle_claim(id);
             }
         }
@@ -1454,6 +1944,7 @@ impl Node {
     fn on_inv(&mut self, id: PeerId, items: &[Inventory]) -> Result<()> {
         let mut wanted = Vec::new();
         let mut requested = HashSet::new();
+        let mut unknown_block = false;
         for item in items {
             if let Some(handle) = self.peers.get_mut(&id) {
                 handle.peer.mark_known(*item);
@@ -1463,8 +1954,17 @@ impl Node {
                 Inventory::Tx(txid) => self.mempool.contains(txid),
             };
             if !have && requested.insert(*item) {
-                wanted.push(*item);
+                if let Inventory::Block(hash) = item {
+                    self.block_telemetry
+                        .observe(*hash, std::time::Instant::now());
+                    unknown_block = true;
+                } else {
+                    wanted.push(*item);
+                }
             }
+        }
+        if unknown_block {
+            self.start_sync(id);
         }
         if !wanted.is_empty() {
             self.send(id, Message::GetData(wanted));
@@ -1572,7 +2072,33 @@ impl Node {
                 handle.peer.mark_known(Inventory::Block(hash));
             }
         }
+        let already_known = self.chain.store().block(&hash)?.is_some();
+        let started = std::time::Instant::now();
+        if from.is_some() {
+            self.block_telemetry.observe(hash, started);
+        }
         let outcome = self.chain.import(block, now(), &mut self.rng);
+        let valid_new = !already_known
+            && matches!(
+                &outcome,
+                Ok(Import::Extended | Import::Reorganized { .. } | Import::SideChain)
+            );
+        if !matches!(&outcome, Err(chain::Error::Orphan)) {
+            self.block_telemetry.imported(
+                hash,
+                from.is_some(),
+                valid_new,
+                started.elapsed(),
+                std::time::Instant::now(),
+            );
+        }
+        if from.is_none() {
+            if valid_new {
+                self.record_mined(block);
+            } else if outcome.is_err() {
+                self.mined_rejected = self.mined_rejected.saturating_add(1);
+            }
+        }
         let submission = match &outcome {
             Ok(Import::Extended | Import::Reorganized { .. }) => Submission::Accepted,
             Ok(Import::AlreadyKnown) => Submission::Duplicate,
@@ -1583,9 +2109,6 @@ impl Node {
             Ok(Import::Extended) => {
                 self.mempool
                     .on_block_applied(block, self.chain.store(), &self.params)?;
-                if from.is_none() {
-                    self.record_mined(block);
-                }
                 log(&format!(
                     "{} {} {} ({} txs)",
                     if from.is_none() {
@@ -1601,9 +2124,6 @@ impl Node {
                 self.tip_moved(hash);
             }
             Ok(Import::Reorganized { reverted, applied }) => {
-                if from.is_none() {
-                    self.record_mined(block);
-                }
                 logging::warn(&format!(
                     "reorganized: reverted {}, applied {applied}",
                     reverted.len()
@@ -1617,6 +2137,9 @@ impl Node {
             Ok(Import::SideChain | Import::AlreadyKnown) => {}
             Err(chain::Error::Orphan) => {
                 if self.sync.expects(&hash) && self.sync_peer.is_some() {
+                    // Receipt resolved the old response deadline. The parent has
+                    // its own deadline; a later retry gets a fresh write ticket.
+                    self.sync.retry(&hash);
                     // Keep the request in flight. Retain hashes only, so a
                     // reordered window cannot buffer sixteen large bodies.
                     self.sync_deferred.insert(hash, block.header().prev_hash);
@@ -1637,23 +2160,22 @@ impl Node {
                 self.sync_progress_at = now();
             }
             self.sync_deferred.remove(&hash);
-            if let Some(id) = self.sync_peer {
-                let mut retry: Vec<_> = self
-                    .sync_deferred
-                    .iter()
-                    .filter_map(|(child, parent)| (*parent == hash).then_some(*child))
-                    .collect();
-                // HashMap iteration must not determine network request order.
-                retry.sort_unstable();
-                retry.retain(|child| {
-                    self.sync_deferred.remove(child);
-                    self.sync.retry(child, now())
-                });
-                if !retry.is_empty() {
-                    self.send(
-                        id,
-                        Message::GetData(retry.into_iter().map(Inventory::Block).collect()),
-                    );
+            self.sync
+                .set_required_work(self.chain.tip_chainwork()?.max(MIN_CHAIN_WORK));
+            let mut retry: Vec<_> = self
+                .sync_deferred
+                .iter()
+                .filter_map(|(child, parent)| {
+                    (*parent == hash && self.sync.meets_required_work()).then_some(*child)
+                })
+                .collect();
+            retry.sort_unstable();
+            for child in retry {
+                self.sync_deferred.remove(&child);
+                if let Some(owner) = self.sync.owner(&child) {
+                    if self.sync.retry(&child) {
+                        self.send(owner, Message::GetData(vec![Inventory::Block(child)]));
+                    }
                 }
             }
         }
@@ -1705,7 +2227,25 @@ impl Node {
         if store.block(&hash)?.is_some() || self.pending_blocks.contains_key(&hash) {
             return Ok(());
         }
+        self.block_telemetry
+            .observe(hash, std::time::Instant::now());
         if store.block(&compact.header.prev_hash)?.is_none() {
+            self.start_sync(id);
+            return Ok(());
+        }
+        // A compact relay already carries a header. Validate it before asking
+        // for missing transactions, using the same work policy as header sync.
+        let mut candidate = crate::headers::SyncHeaders::default();
+        let work = match candidate.verify(&self.chain, std::slice::from_ref(&compact.header), now())
+        {
+            Ok(work) => work,
+            Err(error) => {
+                logging::warn(&format!("peer {id}: invalid compact header: {error}"));
+                self.misbehave(id, 100, "invalid compact header");
+                return Ok(());
+            }
+        };
+        if !candidate.authenticated() || work < self.chain.tip_chainwork()?.max(MIN_CHAIN_WORK) {
             self.start_sync(id);
             return Ok(());
         }
@@ -1812,16 +2352,16 @@ impl Node {
         // Readiness can change after the worker's last nonce or while its
         // result is queued. Do not extend our local branch while blocked.
         if self.mining_blocker()?.is_some() {
+            self.mined_blocked = self.mined_blocked.saturating_add(1);
             return Ok(());
         }
-        // A block only counts and is logged once it actually lands, in
-        // `on_block`. On a trivial target several workers can mine the same
-        // height at once; the losers import as side chains and stay silent.
+        // Count every valid distinct solution, including direct side branches.
+        // Only a main-chain result gets the normal mined-block log.
         self.on_block(None, block)?;
         Ok(())
     }
 
-    /// Remembers a block this node mined into the main chain, for the
+    /// Remembers every valid new local block, including side branches, for the
     /// stale-block counters, dropping the oldest past the cap.
     fn record_mined(&mut self, block: &Block) {
         if self.mined.len() >= MAX_MINED_RECORDS {
@@ -1857,22 +2397,72 @@ impl Node {
         }
     }
 
-    /// What keeps miners from working on the tip; see [`mining_blocker`].
-    fn mining_readiness(&self) -> Result<Option<NotReady>> {
-        // An explicitly offline node has no Tor supervisor to wait for.
-        if self.tor_status.is_some() && !self.tor_ready() {
+    /// Readiness before the stable-resume delay. Handshake height alone
+    /// does not prove synchronization; only authenticated maintained peers count.
+    fn mining_prerequisites(&self) -> Result<Option<NotReady>> {
+        if self.mining_requires_tor && !self.tor_ready() {
             return Ok(Some(NotReady::TorUnavailable));
         }
-        let ready = self
-            .ready_peers(Direction::Inbound)
-            .saturating_add(self.ready_peers(Direction::Outbound));
+        if self.mining_needs_peers {
+            if self.authenticated_identities(false) < self.mining_min_peers {
+                return Ok(Some(NotReady::NoPeers));
+            }
+            if self.authenticated_identities(true) < self.mining_min_peers {
+                return Ok(Some(NotReady::Syncing));
+            }
+        }
+        if self.chain.tip_chainwork()? < MIN_CHAIN_WORK {
+            return Ok(Some(NotReady::Syncing));
+        }
         Ok(mining_blocker(
-            self.network.mines_only_with_peers(),
-            ready,
+            false,
+            0,
             self.sync_peer.is_some(),
             self.chain.tip()?.height,
             self.claims().map(|(_, height)| height),
         ))
+    }
+
+    fn authenticated_identities(&self, checked: bool) -> usize {
+        self.peers
+            .iter()
+            .filter(|(_, h)| h.peer.is_ready() && h.addr.is_some() && (!checked || h.sync_checked))
+            .filter_map(|(_, h)| h.addr.map(|(addr, _)| addr))
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
+    fn mining_readiness(&self) -> Result<Option<NotReady>> {
+        if let Some(reason) = self.mining_prerequisites()? {
+            return Ok(Some(reason));
+        }
+        if !self.mining_ready_delay.is_zero()
+            && self
+                .mining_ready_since
+                .is_none_or(|since| since.elapsed() < self.mining_ready_delay)
+        {
+            return Ok(Some(NotReady::Stabilizing));
+        }
+        Ok(None)
+    }
+
+    fn refresh_mining_readiness(&mut self) -> Result<()> {
+        if self.mining_prerequisites()?.is_some() {
+            self.mining_ready_since = None;
+        } else {
+            self.mining_ready_since
+                .get_or_insert_with(std::time::Instant::now);
+        }
+        let ready = self.mining_readiness()?.is_none();
+        self.mining_allowed.send_if_modified(|current| {
+            if *current == ready {
+                false
+            } else {
+                *current = ready;
+                true
+            }
+        });
+        Ok(())
     }
 
     /// [`Self::mining_readiness`] for a template request, logged when it
@@ -1897,13 +2487,18 @@ impl Node {
     }
 
     fn metrics(&self) -> Result<Metrics> {
+        let mined_in_chain = self.mined_in_chain()?;
         Ok(Metrics {
             height: self.chain.tip()?.height,
             peers_inbound: self.ready_peers(Direction::Inbound),
             peers_outbound: self.ready_peers(Direction::Outbound),
             mempool: self.mempool.len(),
             blocks_mined: self.mined.len(),
-            blocks_mined_in_chain: self.mined_in_chain()?,
+            blocks_mined_in_chain: mined_in_chain,
+            blocks_mined_stale: self.mined.len().saturating_sub(mined_in_chain),
+            blocks_mined_rejected: self.mined_rejected,
+            blocks_mined_blocked: self.mined_blocked,
+            block_timing: self.block_telemetry.snapshot(),
             pending_compact_blocks: self.pending_blocks.len(),
             uptime_seconds: now().saturating_sub(self.started_at),
             mining_waits: self.mining_readiness()?,
@@ -1917,7 +2512,7 @@ impl Node {
         Ok(MiningInfo {
             height: tip.height,
             hash: tip.hash,
-            syncing: self.sync_peer.is_some(),
+            syncing: self.is_syncing(),
             next_target: template.next_target()?.to_compact(),
             subsidy: protocol::consensus::subsidy(next).raw(),
             mempool: self.mempool.len(),
@@ -2023,7 +2618,7 @@ impl Node {
     /// Sends to every ready peer except `except` and those already
     /// knowing `item`, marking `item` known.
     fn broadcast(&mut self, message: &Message, except: Option<PeerId>, item: Option<Inventory>) {
-        let targets: Vec<PeerId> = self
+        let mut targets: Vec<PeerId> = self
             .peers
             .iter_mut()
             .filter(|(id, h)| Some(**id) != except && h.peer.is_ready())
@@ -2032,6 +2627,7 @@ impl Node {
                 None => Some(*id),
             })
             .collect();
+        targets.sort_by_key(|id| (self.peers.get(id).map(PeerHandle::relay_priority), *id));
         for id in targets {
             self.send(id, message.clone());
         }
@@ -2046,7 +2642,8 @@ impl Node {
         let ids: Vec<PeerId> = self.peers.keys().copied().collect();
         for id in ids {
             if self.peers.get(&id).is_some_and(|h| {
-                !h.peer.is_ready() && h.connected_at.elapsed() >= p2p::transport::HANDSHAKE_TIMEOUT
+                !h.peer.is_ready()
+                    && h.connected_at.elapsed() >= self.tor_settings.handshake_timeout
             }) {
                 self.fail_unready(id);
                 self.remove_peer(id);
@@ -2059,16 +2656,25 @@ impl Node {
                 .map_or_default(|h| h.peer.tick(now, nonce));
             self.apply_peer_events(id, events);
         }
-        if !self.sync.timeouts(now).is_empty() {
-            // Settled like a stall: a peer that sends headers but withholds
-            // blocks must not be picked again at once and hold the sync,
-            // and miners, forever.
-            logging::warn("sync timed out, trying another peer");
+        let expired = self.sync.timeouts(now);
+        let mut stalled: Vec<_> = expired.iter().map(|(_, peer)| *peer).collect();
+        stalled.sort_unstable();
+        stalled.dedup();
+        let source_stalled = self.sync.headers_timed_out(now)
+            || self.sync_peer.is_some_and(|peer| stalled.contains(&peer));
+        if source_stalled {
+            logging::warn("sync source timed out, trying another peer");
             if let Some(id) = self.sync_peer.take() {
                 self.settle_claim(id);
             }
-            self.sync = BlockSync::new();
+            self.sync = BlockSync::with_timeout(self.tor_settings.sync_response_timeout.as_secs());
+            self.sync_headers = crate::headers::SyncHeaders::default();
             self.sync_deferred.clear();
+        } else {
+            for peer in stalled {
+                self.sync_unavailable.insert(peer);
+                self.sync.peer_disconnected(peer);
+            }
         }
         self.pending_blocks
             .retain(|_, p| now.saturating_sub(p.received_at) < PENDING_BLOCK_SECONDS);
@@ -2088,7 +2694,9 @@ impl Node {
                 logging::warn(&format!("sync with peer {id} stalled, trying another peer"));
                 self.settle_claim(id);
                 self.sync_peer = None;
-                self.sync = BlockSync::new();
+                self.sync =
+                    BlockSync::with_timeout(self.tor_settings.sync_response_timeout.as_secs());
+                self.sync_headers = crate::headers::SyncHeaders::default();
                 self.sync_deferred.clear();
             }
         }
@@ -2098,7 +2706,15 @@ impl Node {
                 .claims()
                 .find(|(_, height)| *height > ours)
                 .map(|(id, _)| id);
-            if let Some(id) = behind {
+            let needs_witnesses = self.authenticated_identities(true) < self.mining_min_peers;
+            let initial = self.mining_needs_peers.then(|| self.peers.iter()
+                .filter(|(_, h)| h.peer.is_ready() && h.addr.is_some()
+                    && (!h.sync_attempted || (needs_witnesses && !h.sync_checked
+                        && h.sync_attempted_at.is_some_and(|at| at.elapsed().as_secs() >= INITIAL_SYNC_RETRY_SECONDS))))
+                // Check new peers before retrying a previously failed one.
+                .min_by_key(|(id, h)| (h.sync_attempted, **id))
+                .map(|(id, _)| *id)).flatten();
+            if let Some(id) = behind.or(initial) {
                 self.start_sync(id);
             }
         }
@@ -2114,6 +2730,9 @@ impl Node {
                 logging::warn(&format!("peer {id}: data serving failed: {error}"));
                 self.remove_peer(id);
             }
+        }
+        if let Some(source) = self.sync_peer {
+            self.continue_sync(source);
         }
         if self.ticks.is_multiple_of(5) {
             self.maintain_connections();
@@ -2156,9 +2775,22 @@ impl Node {
             .is_some_and(crate::tor::service_ready)
     }
 
+    fn connected_or_dialing(&self, addr: NetAddr) -> bool {
+        self.peers
+            .values()
+            .any(|peer| peer.addr.is_some_and(|(connected, _)| connected == addr))
+            || self
+                .dialing
+                .values()
+                .any(|target| dialed_key(target).is_some_and(|(dialing, _)| dialing == addr))
+    }
+
     fn dial(&mut self, target: String) {
         if !self.tor_ready() || dialed_key(&target).is_none_or(|(addr, _)| Some(addr) == self.onion)
         {
+            return;
+        }
+        if dialed_key(&target).is_some_and(|(addr, _)| self.connected_or_dialing(addr)) {
             return;
         }
         let id = self.next_id;
@@ -2168,6 +2800,7 @@ impl Node {
             self.book.attempted(key, now());
         }
         let route = crate::net::Route {
+            settings: self.tor_settings.clone(),
             target,
             network: match &self.tor {
                 Some(tor) => Arc::clone(tor),
@@ -2189,7 +2822,9 @@ impl Node {
             .iter()
             .filter(|t| {
                 !self.own.targets.contains(*t)
-                    && dialed_key(t).is_some_and(|key| self.book.dialable(key, now()))
+                    && dialed_key(t).is_some_and(|key| {
+                        self.book.dialable(key, now()) && !self.connected_or_dialing(key.0)
+                    })
             })
             .cloned()
             .collect()
@@ -2200,15 +2835,18 @@ impl Node {
             self.dialing.len().saturating_add(
                 self.peers
                     .values()
-                    .filter(|h| h.peer.direction() == Direction::Outbound)
+                    .filter(|h| h.peer.direction() == Direction::Outbound || h.addr.is_some())
                     .count(),
             ),
         );
-        for target in self.dialable_configured().into_iter().take(available) {
-            if !self.dialing.values().any(|t| *t == target)
-                && !self.peers.values().any(|h| h.target == target)
-            {
+        let mut remaining = available;
+        for target in self.dialable_configured() {
+            if remaining == 0 {
+                break;
+            }
+            if dialed_key(&target).is_some_and(|(addr, _)| !self.connected_or_dialing(addr)) {
                 self.dial(target);
+                remaining = remaining.saturating_sub(1);
             }
         }
     }
@@ -2256,12 +2894,9 @@ impl Node {
         let outbound = self
             .peers
             .values()
-            .filter(|h| h.peer.direction() == Direction::Outbound)
+            .filter(|h| h.peer.direction() == Direction::Outbound || h.addr.is_some())
             .count();
-        let full = outbound
-            .saturating_add(self.dialing.len())
-            .saturating_sub(self.probes.len())
-            >= self.max_outbound;
+        let full = outbound.saturating_add(self.dialing.len()) >= self.max_outbound;
         let busy: HashSet<String> = self
             .peers
             .values()
@@ -2276,7 +2911,9 @@ impl Node {
             self.dial(target);
             return;
         }
-        if full && self.probes.len() >= MAX_PROBES {
+        // Established connections are long-lived. A full pool does not open
+        // temporary verification rendezvous that change its connection count.
+        if full {
             return;
         }
         let exclude: Vec<PeerKey> = self
@@ -2287,18 +2924,10 @@ impl Node {
             .chain(self.onion.map(|addr| (addr, self.p2p_port)))
             .chain(self.dialing.values().filter_map(|s| dialed_key(s)))
             .collect();
-        let candidate = if full {
-            self.book
-                .unverified_candidate(&exclude, now(), &mut self.rng)
-        } else {
-            self.book.candidate(&exclude, now(), &mut self.rng)
-        };
+        let candidate = self.book.candidate(&exclude, now(), &mut self.rng);
         if let Some(candidate) = candidate {
             let target = candidate.addr.endpoint(candidate.port);
             if !busy.contains(&target) {
-                if full {
-                    self.probes.insert(self.next_id);
-                }
                 self.dial(target);
             }
         }
@@ -2317,7 +2946,7 @@ impl Node {
                     mempool: self.mempool.len(),
                     mined: self.mined.len(),
                     mined_in_chain: self.mined_in_chain()?,
-                    syncing: self.sync_peer.is_some(),
+                    syncing: self.is_syncing(),
                 })
             }
             Request::Metrics => Ok(Response::Metrics(Box::new(self.metrics()?))),
@@ -2364,11 +2993,26 @@ impl Node {
                         version: h.peer.version().map(|v| v.version),
                         best_height: h.peer.version().map(|v| v.best_height),
                         score: h.peer.score(),
+                        connect_millis: h
+                            .connect_time
+                            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+                        rtt_micros: h
+                            .rtt
+                            .map(|d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX)),
+                        received_bytes: h.received_bytes,
+                        sent_bytes: h.sent_bytes,
+                        bytes_per_second: h.bytes_per_second(),
                     })
                     .collect(),
             )),
             Request::Stop => Ok(Response::Stopping),
             Request::SubmitBlock(block) => {
+                if let Some(reason) = self.mining_blocker()? {
+                    self.mined_blocked = self.mined_blocked.saturating_add(1);
+                    return Ok(Response::BlockSubmitted(Submission::Rejected(format!(
+                        "mining not ready: {reason}"
+                    ))));
+                }
                 Ok(Response::BlockSubmitted(self.on_block(None, &block)?))
             }
             Request::MiningInfo => Ok(Response::MiningInfo(Box::new(self.mining_info()?))),
@@ -2413,7 +3057,9 @@ fn work_per_second(recent: &[BlockHeader]) -> Result<U256> {
         .iter()
         .skip(1)
         .try_fold(U256::zero(), |acc, header| {
-            Ok::<_, Error>(acc.saturating_add(Target::from_compact(header.target)?.work()))
+            Ok::<_, Error>(
+                acc.saturating_add(Target::from_compact(header.target)?.work()?.as_u256()),
+            )
         })?;
     Ok(work.checked_div(U256::from(seconds)).unwrap_or_default())
 }

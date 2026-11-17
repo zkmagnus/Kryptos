@@ -139,9 +139,9 @@ impl ChainParams {
             randomx_key: b"Rhombus Mainnet RandomX v1",
             pow_limit: Target::from_compact(0x207f_ffff).expect("valid compact target"),
             pow_limit_change: None,
-            block_interval: 10,
-            // A 100-block LWMA window (about 16 minutes 40 seconds at
-            // the 10-second target block interval).
+            block_interval: 300,
+            // A 100-block LWMA window (about 8 hours 20 minutes at
+            // the 300-second target block interval).
             difficulty_window: 100,
             // Native transaction v3 genesis; distinct from earlier networks.
             genesis_timestamp: 1_793_700_000,

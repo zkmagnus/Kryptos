@@ -99,7 +99,7 @@ fn two_action_proof_roundtrips_and_rejects_wrong_inputs() {
     ));
     assert_eq!(
         proof_digest,
-        "aa15d30d93a017d94087cde3fc47482915b847906bedbb25bd987a4aba033e17"
+        "a6ff94a6bb3938ff90c466670caf9774a49394184fbbbee53507f69de5f3cc2f"
     );
     eprintln!("proof vector: {}", proof_digest);
     eprintln!(

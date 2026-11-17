@@ -161,7 +161,6 @@ async fn inbound_connections_are_capped() {
         let got = tokio::time::timeout(Duration::from_secs(2), reader.recv()).await;
         if matches!(got, Ok(Ok(p2p::message::Message::Version(_)))) {
             versions += 1;
-            writer.send(&p2p::message::Message::Verack).await.unwrap();
             writer
                 .send(&p2p::message::Message::Ping(attempt))
                 .await
@@ -210,7 +209,6 @@ async fn an_incomplete_inbound_handshake_is_evicted_before_a_healthy_peer() {
         .await
         .unwrap();
     assert!(matches!(reader.recv().await.unwrap(), Message::Version(_)));
-    writer.send(&Message::Verack).await.unwrap();
     writer.send(&Message::Ping(88)).await.unwrap();
     tokio::time::timeout(Duration::from_secs(2), async {
         while reader.recv().await.unwrap() != Message::Pong(88) {}

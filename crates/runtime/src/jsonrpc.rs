@@ -919,6 +919,11 @@ async fn other_methods(
                 "mempool": metrics.mempool,
                 "blocks_mined": metrics.blocks_mined,
                 "blocks_mined_in_chain": metrics.blocks_mined_in_chain,
+                "blocks_mined_stale": metrics.blocks_mined_stale,
+                "blocks_mined_rejected": metrics.blocks_mined_rejected,
+                "blocks_mined_blocked": metrics.blocks_mined_blocked,
+                "block_timing": metrics.block_timing,
+                "block_timing_bucket_bounds_ms": crate::metrics::BLOCK_TIMING_BUCKETS_MS,
                 "pending_compact_blocks": metrics.pending_compact_blocks,
                 "uptime_seconds": metrics.uptime_seconds,
                 "mining_ready": metrics.mining_waits.is_none(),
@@ -1229,11 +1234,84 @@ fn peer_json(peer: &PeerSummary) -> Value {
         "version": peer.version,
         "best_height": peer.best_height,
         "score": peer.score,
+        "connect_millis": peer.connect_millis,
+        "rtt_micros": peer.rtt_micros,
+        "received_bytes": peer.received_bytes,
+        "sent_bytes": peer.sent_bytes,
+        "bytes_per_second": peer.bytes_per_second,
     })
 }
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn getmetrics_exposes_block_timing_and_separate_local_outcomes() {
+        use super::*;
+        use crate::metrics::Metrics;
+
+        let (events, mut received) = mpsc::channel(1);
+        let context = Context::new(events, Network::Test);
+        let responder = tokio::spawn(async move {
+            let Some(Event::Rpc {
+                request: Request::Metrics,
+                reply,
+            }) = received.recv().await
+            else {
+                panic!("getmetrics must request a node metrics snapshot");
+            };
+            let mut metrics = Metrics {
+                blocks_mined: 7,
+                blocks_mined_in_chain: 5,
+                blocks_mined_stale: 2,
+                blocks_mined_rejected: 3,
+                blocks_mined_blocked: 4,
+                ..Metrics::default()
+            };
+            metrics
+                .block_timing
+                .first_seen_to_import
+                .observe(Duration::from_millis(125));
+            metrics
+                .block_timing
+                .validation
+                .observe(Duration::from_micros(500));
+            reply.send(Response::Metrics(Box::new(metrics))).unwrap();
+        });
+        let response = process(
+            &context,
+            json!({"jsonrpc":"2.0", "method":"getmetrics", "params":[], "id":9}),
+        )
+        .await;
+        assert_eq!(response["id"], 9);
+        assert!(response["error"].is_null());
+        let metrics = &response["result"];
+        assert_eq!(metrics["blocks_mined"], 7);
+        assert_eq!(metrics["blocks_mined_stale"], 2);
+        assert_eq!(metrics["blocks_mined_rejected"], 3);
+        assert_eq!(metrics["blocks_mined_blocked"], 4);
+        assert_eq!(
+            metrics["block_timing_bucket_bounds_ms"]
+                .as_array()
+                .unwrap()
+                .len(),
+            17
+        );
+        assert_eq!(
+            metrics["block_timing"]["first_seen_to_import"]["buckets"]
+                .as_array()
+                .unwrap()
+                .len(),
+            18
+        );
+        assert_eq!(metrics["block_timing"]["first_seen_to_import"]["count"], 1);
+        assert_eq!(
+            metrics["block_timing"]["first_seen_to_import"]["sum_nanos"],
+            125_000_000
+        );
+        assert_eq!(metrics["block_timing"]["validation"]["sum_nanos"], 500_000);
+        responder.await.unwrap();
+    }
+
     #[tokio::test]
     async fn server_rejects_unauthenticated_large_body_before_reading_it() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

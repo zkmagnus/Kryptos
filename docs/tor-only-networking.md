@@ -34,9 +34,12 @@ invalid onion checksum/version and port zero are rejected. Names use the standar
 v3 encoding supplied by `tor_hscrypto::pk::HsId`. Peer tables and gossip exclude
 the local onion identity across all ports.
 
-The application protocol is now version 3, incompatible with the previous
-daemon-era version 2 handshake. The handshake verifies version, genesis/network identity
-and anti-self nonce, and carries service flags plus a claimed onion endpoint.
+The application protocol is version 4. The one-round-trip handshake verifies
+version, genesis/network identity and anti-self nonce, and carries service flags
+plus a claimed onion endpoint. An inbound connection replies with its Version
+and immediately queues its first application messages; Version receipt completes
+the handshake without a Verack round trip. There is no user-agent field or
+per-node version string.
 Onion transport authenticates the listener. An incoming caller's claimed endpoint
 does not authenticate the dialer and must not earn a verified peer record until a
 successful outgoing connection to that endpoint. No static dialer authentication
@@ -66,15 +69,20 @@ backoff; it does not select another backend.
 An online node using embedded Tor also withholds mining templates until both its
 Tor client and onion service are ready. Losing readiness cancels active local
 mining work and prevents local miner results from being accepted while mining is
-blocked. After readiness returns, mining resumes when the existing sync checks
-also permit it. An explicitly offline embedded node can still mine without Tor.
+blocked. Normal online mining also requires authenticated outbound peers,
+completion of the initial header/body synchronization check, and a stable ready
+period before resuming. The defaults are one outbound peer and five seconds of
+stable readiness; `--mining-min-peers` and `--mining-ready-secs` configure them.
+An explicitly offline embedded node can still mine without Tor.
 
-This gate does not require a connected peer: both networks still allow mining
-with zero peers. A ready onion service therefore does not establish that the node
-has synchronized with another chain. Configure peers with `--seed`, `--addnode`
-or `--connect` and check their reported tips when joining an existing network;
-there are no built-in seed peers. Standalone commands such as `balance` use their
-own Tor client, whose readiness is independent of the mining node's service.
+For the first node of an intentionally bootstrapped chain, `--bootstrap-mining`
+bypasses the outbound-peer requirement while retaining Tor readiness and sync
+checks for connected peers. A ready onion service alone does not establish that
+the node has synchronized with another chain. Configure peers with `--seed`,
+`--addnode` or `--connect` when joining an existing network; there are no built-in
+seed peers. See [mining readiness](mining-readiness.md). Standalone commands such
+as `balance` use their own Tor client, whose readiness is independent of the
+mining node's service.
 
 Arti can initially report service state `Shutdown` before its service tasks start.
 The supervisor treats that initial state as startup rather than immediately
@@ -285,10 +293,14 @@ Independent single-service and production-wrapper probes also succeeded, but the
 repository tests above provide the direct evidence for Rhombus transport and node
 handshake behavior.
 
-Actual seed identities remain operator-provided. The next operational checks are
-block synchronization/mining, throughput with large blocks and persistent restart
-behavior. Docker image execution and bridge integration are separate from these
-public-Tor test results.
+Actual seed identities remain operator-provided. Later RPC and block-relay
+experiments passed over public Tor: the expanded empty-wallet snapshot/reconnect
+test in 112.40 seconds, and four sequential coinbase-only blocks in 186.70 seconds.
+See [RPC evidence](rpc-and-reorg-recovery.md) and
+[block propagation measurements](block-propagation.md). These one-host smoke tests
+do not establish a sustainable stale rate with competing miners. Multi-location
+mining, throughput with large blocks and persistent restart behavior remain
+separate operational checks, as do Docker image execution and bridge integration.
 
 The Docker build command selects the production `runtime` binary with default
 features and excludes dev dependencies. Its normal/build feature graph was checked:

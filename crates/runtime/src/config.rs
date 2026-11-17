@@ -42,13 +42,10 @@ impl Network {
         }
     }
 
-    /// Whether mining waits for a connected peer.
-    ///
-    /// Mining is permitted without peers on both networks. A node still
-    /// pauses while it is synchronizing or while a connected peer advertises
-    /// a higher, unsettled tip.
+    /// Online mining normally requires an authenticated outbound peer.
+    /// Explicit bootstrap and offline modes are configured per node.
     pub fn mines_only_with_peers(self) -> bool {
-        false
+        true
     }
 
     /// How this network's addresses are written.
@@ -112,7 +109,7 @@ pub struct Config {
     pub addnode: Vec<String>,
     /// Disable built-in bootstrap peers.
     pub no_seeds: bool,
-    /// Maximum regular outbound peers; zero also disables verification probes.
+    /// Maximum maintained authenticated peers, including bound reverse streams.
     pub max_outbound: usize,
     /// Embedded Tor onion-service configuration.
     pub tor: TorConfig,
@@ -120,6 +117,12 @@ pub struct Config {
     pub mine_to: Option<RhombusAddress>,
     /// Miner worker threads when mining. At least one.
     pub mining_threads: usize,
+    /// Allow the first node to mine without peers; still requires Tor and known sync.
+    pub bootstrap_mining: bool,
+    /// Distinct authenticated maintained peers required for ordinary online mining.
+    pub mining_min_peers: usize,
+    /// Seconds of continuous readiness before online mining starts or resumes.
+    pub mining_ready_secs: u64,
     /// Local control socket, or `None` for none.
     pub rpc: Option<SocketAddr>,
     /// JSON-RPC 2.0 over HTTP, or `None` for none. Shares the control
@@ -149,6 +152,20 @@ impl Config {
             }
         }
         self.tor.validate()?;
+        if self.mining_min_peers == 0 {
+            return Err(crate::Error::Argument(
+                "mining-min-peers must be positive; use bootstrap-mining for a first node".into(),
+            ));
+        }
+        if !self.offline
+            && !self.bootstrap_mining
+            && self.mine_to.is_some()
+            && self.mining_min_peers > self.max_outbound
+        {
+            return Err(crate::Error::Argument(
+                "mining-min-peers exceeds max-outbound".into(),
+            ));
+        }
         let inbound_capacity = self
             .max_inbound
             .checked_add(crate::net::MAX_PENDING_INBOUND);
@@ -185,6 +202,9 @@ impl Config {
             tor: TorConfig::default(),
             mine_to: None,
             mining_threads: 1,
+            bootstrap_mining: false,
+            mining_min_peers: 1,
+            mining_ready_secs: 5,
             rpc: None,
             rpc_http: None,
             rpc_token: None,
@@ -276,5 +296,16 @@ mod tests {
         assert!(config.validate().is_ok());
         config.tor.p2p_port = 0;
         assert!(config.validate().is_err());
+    }
+    #[test]
+    fn zero_peer_threshold_requires_explicit_bootstrap_instead() {
+        let mut config = Config::test();
+        config.mining_min_peers = 0;
+        assert!(config.validate().is_err());
+        config.mining_min_peers = 1;
+        config.bootstrap_mining = true;
+        config.offline = false;
+        config.max_outbound = 0;
+        assert!(config.validate().is_ok());
     }
 }

@@ -1,0 +1,28 @@
+{
+  "architecture": "x86_64",
+  "competing_miners": false,
+  "first_hop": {
+    "count": 4,
+    "max_us": 1777683,
+    "p50_us": 1483024,
+    "p90_us": 1777683,
+    "p95_us": 1777683,
+    "samples_us": [
+      1483024,
+      1777683,
+      1477431,
+      1524674
+    ]
+  },
+  "limitations": "Both nodes run on one machine; sequential blocks without competing miners. Includes source validation. Results do not establish network-wide or majority-hashrate latency, or stale rate under contention.",
+  "mainnet_target_seconds": 10,
+  "measurement": "source_submission_to_follower_tip",
+  "os": "linux",
+  "public_tor": true,
+  "sample_block_contents": "one coinbase transaction; no user transactions",
+  "stale_local_blocks": 0,
+  "test_network_target_seconds": 5,
+  "topology": "A -> B",
+  "transport": "public_tor_same_host",
+  "valid_local_blocks": 4
+}

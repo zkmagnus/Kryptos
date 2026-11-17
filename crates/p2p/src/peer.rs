@@ -1,6 +1,7 @@
 //! One peer's connection state: handshake, keepalive, misbehavior.
 
 use std::collections::HashSet;
+use std::time::Duration;
 
 use protocol::block::BlockHash;
 
@@ -58,7 +59,8 @@ pub struct Peer {
     stage: Stage,
     ours: VersionInfo,
     theirs: Option<VersionInfo>,
-    verack_received: bool,
+    idle_timeout: u64,
+    ping_timeout: u64,
     score: u32,
     last_ping_sent: Option<(u64, u64)>,
     last_activity: u64,
@@ -73,7 +75,8 @@ impl Peer {
             stage: Stage::Start,
             ours,
             theirs: None,
-            verack_received: false,
+            idle_timeout: 900,
+            ping_timeout: PING_TIMEOUT,
             score: 0,
             last_ping_sent: None,
             last_activity: now,
@@ -125,10 +128,6 @@ impl Peer {
             (Stage::Start | Stage::VersionSent, Message::Version(theirs)) => {
                 self.on_version(theirs.clone())
             }
-            (Stage::VersionSent, Message::Verack) => {
-                self.verack_received = true;
-                self.maybe_ready()
-            }
             (Stage::Ready, Message::Ping(n)) => vec![Event::Send(Message::Pong(*n))],
             (Stage::Ready, Message::Pong(n)) => {
                 if self.last_ping_sent.is_some_and(|(nonce, _)| nonce == *n) {
@@ -174,19 +173,21 @@ impl Peer {
         if self.stage == Stage::Start {
             events.push(self.send_version());
         }
-        events.push(Event::Send(Message::Verack));
-        events.extend(self.maybe_ready());
+        // The onion connection already authenticates the destination. A
+        // uniform version exchange is sufficient: the caller queues its first
+        // application request immediately after Version, in this same flight.
+        // No extra Verack or application authentication round trip is needed.
+        self.stage = Stage::Ready;
+        if let Some(theirs) = &self.theirs {
+            events.push(Event::Ready(theirs.clone()));
+        }
         events
     }
 
-    fn maybe_ready(&mut self) -> Vec<Event> {
-        match (&self.theirs, self.verack_received, self.stage) {
-            (Some(theirs), true, Stage::VersionSent) => {
-                self.stage = Stage::Ready;
-                vec![Event::Ready(theirs.clone())]
-            }
-            _ => Vec::new(),
-        }
+    /// Sets fixed node timeouts; neither is randomized per peer.
+    pub fn set_timeouts(&mut self, idle: Duration, ping_response: Duration) {
+        self.idle_timeout = idle.as_secs().max(1);
+        self.ping_timeout = ping_response.as_secs().max(1);
     }
 
     /// Drives keepalives: pings when idle, disconnects when unanswered.
@@ -194,8 +195,14 @@ impl Peer {
         if !self.is_ready() {
             return Vec::new();
         }
+        if now.saturating_sub(self.last_activity) >= self.idle_timeout {
+            return vec![Event::Disconnect {
+                reason: "idle timeout",
+                ban: false,
+            }];
+        }
         match self.last_ping_sent {
-            Some((_, sent)) if now.saturating_sub(sent) >= PING_TIMEOUT => {
+            Some((_, sent)) if now.saturating_sub(sent) >= self.ping_timeout => {
                 vec![Event::Disconnect {
                     reason: "ping timeout",
                     ban: false,
@@ -253,9 +260,10 @@ mod tests {
             panic!("outbound sends version")
         };
         let replies = inb.handle(version, 1);
-        // Inbound answers with its own version and a verack.
+        // The response combines Version and readiness for the first request.
         assert!(matches!(replies[0], Event::Send(Message::Version(_))));
-        assert_eq!(replies[1], Event::Send(Message::Verack));
+        assert!(matches!(replies[1], Event::Ready(_)));
+        assert!(inb.is_ready());
         for reply in &replies {
             if let Event::Send(m) = reply {
                 let back = out.handle(m, 2);
@@ -275,6 +283,40 @@ mod tests {
         assert!(out.is_ready() && inb.is_ready());
         assert_eq!(out.version().unwrap().nonce, 2);
         assert_eq!(inb.version().unwrap().nonce, 1);
+    }
+
+    #[test]
+    fn one_round_trip_allows_application_messages_without_an_ack() {
+        let (mut outbound, first) = Peer::new(Direction::Outbound, info(1), 0);
+        let (mut inbound, _) = Peer::new(Direction::Inbound, info(2), 0);
+        let Event::Send(version) = &first[0] else {
+            panic!("version")
+        };
+        let response = inbound.handle(version, 1);
+        let Event::Send(version) = &response[0] else {
+            panic!("version")
+        };
+        assert_eq!(outbound.handle(version, 2), vec![Event::Ready(info(2))]);
+        assert_eq!(
+            outbound.handle(&Message::Ping(9), 2),
+            vec![Event::Send(Message::Pong(9))]
+        );
+        assert!(response
+            .iter()
+            .all(|event| !matches!(event, Event::Send(Message::Verack))));
+    }
+
+    #[test]
+    fn configured_idle_timeout_is_enforced() {
+        let (mut outbound, _) = handshake();
+        outbound.set_timeouts(Duration::from_secs(10), Duration::from_secs(5));
+        assert!(matches!(
+            outbound.tick(12, 1).as_slice(),
+            [Event::Disconnect {
+                reason: "idle timeout",
+                ban: false
+            }]
+        ));
     }
 
     #[test]

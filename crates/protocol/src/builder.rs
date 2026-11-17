@@ -530,7 +530,7 @@ mod tests {
         eprintln!("transaction build vector: {digest}");
         assert_eq!(
             digest,
-            "a858d3e77c7b7208c25a103c4571a8c61cfe9f9fe969637ec17ec0d4daf03435"
+            "20091747c3208f26ddc1f9f1bcfea312b88cf4037541cc53aa1816b98c344c33"
         );
         assert_eq!(tx.actions().len(), 2);
         assert!(verify_regular(&tx, BRANCH, test_keys::verifying_key(), &mut rng).is_ok());

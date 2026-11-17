@@ -36,6 +36,9 @@ pub enum Error {
     /// A compact target encoding is malformed.
     #[error("invalid compact target")]
     InvalidTarget,
+    /// Validated work cannot fit in the cumulative 256-bit counter.
+    #[error("chain work overflow")]
+    ChainWorkOverflow,
     /// The mempool refused a transaction.
     #[error("mempool rejected the transaction: {0}")]
     Rejected(crate::mempool::Rejection),

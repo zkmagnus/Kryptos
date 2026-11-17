@@ -88,20 +88,23 @@ payment address:
 RHOMBUS_TEST_ADDRESS="$(target/release/rhombus address --network test --wallet local-test/wallet.redb)"
 target/release/rhombus run --network test --datadir local-test/node-a \
   --p2p-port 19000 --rpc 127.0.0.1:18444 --rpc-http 127.0.0.1:18443 \
-  --mine "$RHOMBUS_TEST_ADDRESS" --mining-threads 1
+  --mine "$RHOMBUS_TEST_ADDRESS" --mining-threads 1 --bootstrap-mining
 ```
 
 With `--mine`, the online node waits for both its embedded Tor client and onion
 service to become ready before issuing mining work. If Tor loses readiness, the
 node pauses active local mining and rejects local miner results while blocked.
-Mining resumes after Tor recovers and the existing sync checks permit work.
-Explicitly offline embedded nodes can still mine without Tor.
+Normal online mining also requires at least one authenticated outbound peer,
+initial header/body synchronization, and a stable ready period before work
+resumes. Configure these with `--mining-min-peers` (default 1) and
+`--mining-ready-secs` (default 5). Explicitly offline embedded nodes can still
+mine without Tor.
 
-Mining with zero peers remains allowed on both networks, so node A can create
-this test chain on its own. For an existing chain, configure `--seed`, `--addnode`
-or `--connect` and check peer connectivity and tip agreement; there are no
-built-in seed peers, and `embedded Tor ready` alone does not establish chain
-synchronization.
+The example uses `--bootstrap-mining` because node A intentionally starts this
+test chain without peers. When joining an existing chain, omit that flag and
+configure `--seed`, `--addnode` or `--connect`. There are no built-in seed peers,
+and `embedded Tor ready` alone does not establish chain synchronization. See
+[mining readiness](mining-readiness.md) for the bootstrap and recovery policy.
 
 After service readiness, copy node A's reported onion hostname into
 `RHOMBUS_ONION_A`. The placeholder below is deliberately not a working peer:
@@ -162,8 +165,9 @@ Agree on source revision, genesis and consensus parameters before joining. Suppl
 repeatable `--seed`, `--addnode` or `--connect` onion endpoints. `--no-seeds` disables
 built-in seeds; their lists are currently empty. `--max-outbound` defaults to eight,
 `--max-inbound` to 32, and `--no-p2p` disables inbound P2P. No public bootstrap service
-is provided. An isolated node can mine its own chain, so height growth alone does
-not prove network membership.
+is provided. Online mining requires synced outbound peers unless the operator
+explicitly selects `--bootstrap-mining`; height growth under bootstrap mode alone
+does not prove membership in another network.
 
 The old P2P `--listen`, `--socks-port`, `--tor-binary`, `--tor-external`, `--proxy`
 and `--advertise` flags are removed. There is no external Tor configuration to
@@ -361,6 +365,20 @@ errors, so persistence/restart behavior still needs its own verification. See
 [the full results and limits](tor-only-networking.md#dependencies-and-verification).
 Use the earlier two-node mining procedure to evaluate synchronization and real
 throughput separately; actual public seed identities remain operator-provided.
+
+The additional RPC and block-relay experiments now cover wallet snapshot
+reads/reconnects and a small sequence of validated blocks over public Tor:
+
+```sh
+cargo test -p runtime --test rpc_real_tor --locked --offline -- --ignored --nocapture
+cargo test -p runtime --test propagation public_tor_two_node_relay_reports_timings --locked --offline -- --ignored --nocapture
+```
+
+The expanded RPC wallet test passed in 112.40 seconds; the four-block public-Tor
+relay test passed in 186.70 seconds. These are fresh temporary fixtures on one
+host, not a production wallet recovery or a multi-location competing-miner
+benchmark. See [RPC recovery](rpc-and-reorg-recovery.md) and
+[measured relay results](block-propagation.md) for the tested paths and limits.
 
 ## Checks and public-release requirements
 

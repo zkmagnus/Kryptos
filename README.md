@@ -1,5 +1,7 @@
 # Rhombus
 
+# $BUS
+
 **RHOMBUS — Randomized Hidden-Output Monetary Blockchain Using Shielded-transfers.**
 
 ***EXPERIMENTAL***
@@ -16,6 +18,13 @@ RPC uses the explicitly restricted `127.0.0.1` binder; P2P streams are accepted
 directly by the onion service. Preserve `<datadir>/tor/state` when backing up the
 node because it contains the service identity. See the
 [networking design](docs/tor-only-networking.md) for isolation and service limits.
+
+Online mining waits for Tor, at least one authenticated outbound peer, completed
+initial synchronization, and five seconds of stable readiness. The first node
+of a new chain must explicitly use `--bootstrap-mining` to mine without peers.
+See [mining readiness](docs/mining-readiness.md) for configuration and
+[block propagation measurements](docs/block-propagation.md) for measured results
+and the limits of the 300-second mainnet target.
 
 ## Build from source
 

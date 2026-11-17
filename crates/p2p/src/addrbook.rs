@@ -204,6 +204,18 @@ impl AddressBook {
         }
     }
 
+    /// Consecutive failed attempts at an endpoint.
+    pub fn failures(&self, key: PeerKey) -> u32 {
+        self.entries.get(&key).map_or(0, |entry| entry.failures)
+    }
+
+    /// Applies the node's configured backoff, measured from failure/disconnection.
+    pub fn defer_retry(&mut self, key: PeerKey, now: u64, seconds: u64) {
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.retry_at = now.saturating_add(seconds);
+        }
+    }
+
     /// Records a successful connection at `now`.
     pub fn connected(&mut self, key: PeerKey, now: u64) {
         if let Some(e) = self.entries.get_mut(&key) {
@@ -250,7 +262,7 @@ impl AddressBook {
                     && (!unverified_only || !e.is_verified(now))
                     && now.saturating_sub(e.addr.last_seen) <= MAX_AGE
                     && !self.is_banned(&e.addr.addr, now)
-                    && !exclude.contains(&e.addr.key())
+                    && !exclude.iter().any(|(addr, _)| *addr == e.addr.addr)
             })
             .collect();
         if pool.is_empty() {

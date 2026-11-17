@@ -24,6 +24,15 @@ pub enum NetAddr {
 /// One service identity and its virtual P2P port.
 pub type PeerKey = (NetAddr, u16);
 
+/// Whether `own` is the canonical dialer for a verified pair of onion identities.
+/// Public-key byte order gives both nodes the same choice without timestamps or
+/// nonce grinding. Equal identities are self-connections, so neither should dial.
+/// Apply this only after the reverse connection has been securely linked; a
+/// claimed inbound address must never evict an authenticated outbound stream.
+pub fn canonical_dialer(own: NetAddr, remote: NetAddr) -> bool {
+    own < remote
+}
+
 impl NetAddr {
     /// Parses an onion hostname followed by its virtual port.
     ///
@@ -126,6 +135,15 @@ mod tests {
     use protocol::bytes::{Reader, Writer};
 
     #[test]
+    fn the_lower_onion_is_the_unique_dialer_in_both_directions() {
+        let lower = NetAddr::TorV3([1; 32]);
+        let higher = NetAddr::TorV3([2; 32]);
+        assert!(super::canonical_dialer(lower, higher));
+        assert!(!super::canonical_dialer(higher, lower));
+        assert!(!super::canonical_dialer(lower, lower));
+    }
+
+    #[test]
     fn known_onion_vector_and_endpoint_roundtrip() {
         let hostname = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaam2dqd.onion";
         let address = NetAddr::TorV3([0; 32]);
@@ -195,6 +213,17 @@ mod tests {
     }
 
     proptest! {
+        #[test]
+        fn canonical_dialer_is_antisymmetric(a in any::<[u8; 32]>(), b in any::<[u8; 32]>()) {
+            let a = NetAddr::TorV3(a);
+            let b = NetAddr::TorV3(b);
+            if a == b {
+                prop_assert!(!super::canonical_dialer(a, b));
+            } else {
+                prop_assert_ne!(super::canonical_dialer(a, b), super::canonical_dialer(b, a));
+            }
+        }
+
         #[test]
         fn arbitrary_tor_keys_roundtrip(key in any::<[u8; 32]>(), port in 1u16..=u16::MAX) {
             let address = NetAddr::TorV3(key);

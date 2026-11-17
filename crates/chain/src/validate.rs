@@ -32,7 +32,7 @@ use transaction_proof::{ProofBatch, VerifyingKey};
 use crate::difficulty::{next_target, Sample};
 use crate::params::ChainParams;
 use crate::pow::RandomXPow;
-use crate::target::Target;
+use crate::target::{ChainWork, Target};
 use crate::{Error, Result};
 
 /// Headers whose timestamps form the median a new block must exceed.
@@ -81,14 +81,15 @@ impl Validator<'_> {
         }
         self.check_checkpoint(block)?;
         let recent = recent_headers(store, tip.height, self.window())?;
-        self.check_header(header, &recent)?;
+        let target = self.check_header(header, &recent)?;
+        let work = child_chainwork(store, header, target)?;
         block.check_tx_root()?;
 
         let tree = self.check_transactions(store, block, rng)?;
         if tree.root() != header.commitment_root {
             return Err(Error::InvalidHeader("commitment root mismatch"));
         }
-        store.apply(block, &tree)?;
+        store.apply(block, &tree, &work.to_be_bytes())?;
         if let Some(prune_below) = header.height.checked_sub(self.params.max_reorg_depth) {
             store.prune_frontiers_below(prune_below)?;
         }
@@ -116,10 +117,11 @@ impl Validator<'_> {
         }
         self.check_checkpoint(block)?;
         let recent = branch_headers(store, parent.header(), self.window())?;
-        self.check_header(header, &recent)?;
+        let target = self.check_header(header, &recent)?;
+        let work = child_chainwork(store, header, target)?;
         block.check_tx_root()?;
         self.check_authorization(block, rng)?;
-        store.put_block(block)?;
+        store.put_block(block, &work.to_be_bytes())?;
         Ok(())
     }
 
@@ -141,13 +143,33 @@ impl Validator<'_> {
 
     /// The header rules that depend only on the headers before it:
     /// version, timestamp, target and proof of work, cheapest first.
-    fn check_header(&self, header: &BlockHeader, recent: &[BlockHeader]) -> Result<()> {
+    fn check_header(&self, header: &BlockHeader, recent: &[BlockHeader]) -> Result<Target> {
+        let target = self.check_header_rules(header, recent)?;
+        self.pow.check(header)?;
+        Ok(target)
+    }
+
+    /// Checks version, timestamp and exact compact difficulty against ancestry,
+    /// returning the validated target from which work may be calculated.
+    /// `recent` is the parent's ancestry, oldest first, with at least
+    /// [`header_lookback`] entries unless genesis is reached first.
+    ///
+    /// The caller checks linkage and checkpoints, and either checks `RandomX` or
+    /// proves this header is an ancestor of a trusted checkpoint before using
+    /// its work for synchronization.
+    ///
+    /// # Errors
+    /// Returns the first violated header rule or invalid historical target.
+    pub fn check_header_rules(
+        &self,
+        header: &BlockHeader,
+        recent: &[BlockHeader],
+    ) -> Result<Target> {
         if header.version != BLOCK_VERSION {
             return Err(Error::InvalidHeader("unknown version"));
         }
         self.check_timestamp(header, recent)?;
-        self.check_target(header, recent)?;
-        self.pow.check(header)
+        self.check_target(header, recent)
     }
 
     fn check_timestamp(&self, header: &BlockHeader, recent: &[BlockHeader]) -> Result<()> {
@@ -168,7 +190,7 @@ impl Validator<'_> {
         Ok(())
     }
 
-    fn check_target(&self, header: &BlockHeader, recent: &[BlockHeader]) -> Result<()> {
+    fn check_target(&self, header: &BlockHeader, recent: &[BlockHeader]) -> Result<Target> {
         let samples = recent
             .iter()
             .map(|h| {
@@ -179,8 +201,10 @@ impl Validator<'_> {
             })
             .collect::<Result<Vec<_>>>()?;
         let expected = next_target(self.params, header.height, &samples);
-        if Target::from_compact(header.target)? == expected {
-            Ok(())
+        // Comparing encoded nBits also rejects alternate encodings of an
+        // otherwise equal target: headers must carry the canonical DAA output.
+        if header.target == expected.to_compact() {
+            Ok(expected)
         } else {
             Err(Error::InvalidHeader(
                 "target does not match the difficulty rule",
@@ -250,6 +274,14 @@ impl Validator<'_> {
         }
         Ok(batch)
     }
+}
+
+/// Adds work only after header validation has produced `target`.
+fn child_chainwork(store: &Store, header: &BlockHeader, target: Target) -> Result<ChainWork> {
+    let parent = store
+        .chainwork(&header.prev_hash)?
+        .ok_or(Error::InvalidBlock("parent chain work missing"))?;
+    ChainWork::from_be_bytes(parent).checked_add(target.work()?)
 }
 
 /// Splits the block and computes the mint the coinbase must carry.

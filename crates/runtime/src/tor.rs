@@ -1,7 +1,7 @@
 //! Embedded onion-service configuration.
 
 use p2p::address::{NetAddr, PeerKey};
-use p2p::transport::TorStatus;
+use p2p::transport::{TorSettings, TorStatus};
 use tokio::sync::watch;
 
 /// Virtual onion-service ports. Tor runs inside the application process.
@@ -9,11 +9,16 @@ use tokio::sync::watch;
 pub struct TorConfig {
     /// Virtual P2P port advertised with the service identity.
     pub p2p_port: u16,
+    /// Configurable Tor circuit, bootstrap, retry, and application deadlines.
+    pub settings: TorSettings,
 }
 
 impl Default for TorConfig {
     fn default() -> Self {
-        Self { p2p_port: 19000 }
+        Self {
+            p2p_port: 19000,
+            settings: TorSettings::default(),
+        }
     }
 }
 
@@ -28,6 +33,7 @@ impl TorConfig {
                 "onion P2P port must be nonzero".into(),
             ));
         }
+        self.settings.validate()?;
         Ok(())
     }
 }

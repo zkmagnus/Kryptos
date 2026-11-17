@@ -13,8 +13,6 @@ pub(crate) const REPLY_SECONDS: u64 = 60;
 pub(crate) const OUTBOUND_ADDR_ALLOWANCE: usize = SAMPLE_SIZE + 1;
 /// Inbound peers may announce only one endpoint per exchange.
 pub(crate) const INBOUND_ADDR_ALLOWANCE: usize = 1;
-/// Extra bounded connection used to verify gossip when outbound slots are full.
-pub(crate) const MAX_PROBES: usize = 1;
 
 /// Gossiped addresses allowed per exchange period.
 pub(crate) fn addr_allowance(direction: Direction) -> usize {

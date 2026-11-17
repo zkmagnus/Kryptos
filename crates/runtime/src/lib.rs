@@ -24,6 +24,7 @@ pub mod cli;
 pub mod config;
 mod discovery;
 mod error;
+mod headers;
 pub mod http;
 pub mod jsonrpc;
 pub mod logging;

@@ -1,0 +1,42 @@
+{
+  "architecture": "x86_64",
+  "competing_miners": false,
+  "first_hop": {
+    "count": 4,
+    "max_us": 371640,
+    "p50_us": 366986,
+    "p90_us": 371640,
+    "p95_us": 371640,
+    "samples_us": [
+      290647,
+      366986,
+      371640,
+      367983
+    ]
+  },
+  "frame_delay_us": 75000,
+  "limitations": "Four sequential blocks and no competing miners. Includes source validation. Does not establish real Tor propagation or stale rate under contention.",
+  "mainnet_target_seconds": 10,
+  "measurement": "source_submission_to_follower_tip",
+  "os": "linux",
+  "public_tor": false,
+  "sample_block_contents": "one coinbase transaction; no user transactions",
+  "second_hop": {
+    "count": 4,
+    "max_us": 591099,
+    "p50_us": 584354,
+    "p90_us": 591099,
+    "p95_us": 591099,
+    "samples_us": [
+      468114,
+      584354,
+      591099,
+      586171
+    ]
+  },
+  "stale_local_blocks": 0,
+  "test_network_target_seconds": 5,
+  "topology": "A -> B -> C",
+  "transport": "memory_with_fixed_frame_delay",
+  "valid_local_blocks": 4
+}

@@ -11,7 +11,7 @@ use transaction_proof::VerifyingKey;
 use crate::genesis::genesis_with_tree;
 use crate::params::ChainParams;
 use crate::pow::RandomXPow;
-use crate::target::{Target, U512};
+use crate::target::ChainWork;
 use crate::validate::Validator;
 use crate::{Error, Result};
 
@@ -51,7 +51,7 @@ impl Chain {
     pub fn new(store: Store, params: ChainParams, vk: VerifyingKey) -> Result<Self> {
         let (expected, tree) = genesis_with_tree(&params);
         match store.hash_at(0)? {
-            None => store.apply(&expected, &tree)?,
+            None => store.apply(&expected, &tree, &ChainWork::ZERO.to_be_bytes())?,
             Some(hash) if hash == expected.hash() => {}
             Some(_) => return Err(Error::InvalidBlock("store belongs to another network")),
         }
@@ -74,7 +74,11 @@ impl Chain {
             pow: RandomXPow::new(params.randomx_key)?,
             vk,
         };
+        if chain.chainwork(&expected.hash())? != ChainWork::ZERO {
+            return Err(Error::InvalidBlock("genesis chain work must be zero"));
+        }
         chain.recover_reorg()?;
+        chain.tip_chainwork()?;
         Ok(chain)
     }
 
@@ -104,6 +108,26 @@ impl Chain {
     /// Fails on a storage error.
     pub fn tip(&self) -> Result<Tip> {
         self.store.tip()?.ok_or(Error::InvalidBlock("no genesis"))
+    }
+
+    /// Indexed cumulative work of a validated block. Genesis contributes zero:
+    /// its fixed header is a network anchor, not a mined proof of work.
+    ///
+    /// # Errors
+    /// Fails if the block has no work index entry or the database cannot be read.
+    pub fn chainwork(&self, hash: &BlockHash) -> Result<ChainWork> {
+        self.store
+            .chainwork(hash)?
+            .map(ChainWork::from_be_bytes)
+            .ok_or(Error::InvalidBlock("block chain work missing"))
+    }
+
+    /// The current tip's cumulative work.
+    ///
+    /// # Errors
+    /// Fails on a missing tip or work index entry, or a storage read error.
+    pub fn tip_chainwork(&self) -> Result<ChainWork> {
+        self.chainwork(&self.tip()?.hash)
     }
 
     /// Imports a block: extends the tip, stores a side-chain block, or
@@ -150,9 +174,9 @@ impl Chain {
         if tip.height.saturating_sub(fork_height) > self.params.max_reorg_depth {
             return Err(Error::InvalidBlock("reorganization too deep"));
         }
-        let branch_work = chain_work(&branch)?;
-        let main_work = chain_work(&self.main_blocks_above(fork_height, tip.height)?)?;
-        if branch_work <= main_work {
+        // Keep the first accepted tip on equal work; block hashes never
+        // influence the tie. Every indexed value came from a validated target.
+        if self.chainwork(&block.hash())? <= self.chainwork(&tip.hash)? {
             return Ok(Import::SideChain);
         }
         self.reorganize(fork_height, &branch, now, rng)
@@ -185,21 +209,6 @@ impl Chain {
         }
         branch.reverse();
         Ok(branch)
-    }
-
-    /// Main-chain blocks strictly above `fork_height` up to `tip_height`.
-    fn main_blocks_above(&self, fork_height: u32, tip_height: u32) -> Result<Vec<Block>> {
-        (fork_height.saturating_add(1)..=tip_height)
-            .map(|height| {
-                let hash = self
-                    .store
-                    .hash_at(height)?
-                    .ok_or(Error::InvalidBlock("height index gap"))?;
-                self.store
-                    .block(&hash)?
-                    .ok_or(Error::InvalidBlock("block missing"))
-            })
-            .collect()
     }
 
     /// Rolls an interrupted reorg back to its original, previously validated chain.
@@ -239,7 +248,8 @@ impl Chain {
             if tree.root() != block.header().commitment_root {
                 return Err(Error::InvalidBlock("recovery commitment root mismatch"));
             }
-            self.store.apply(block, &tree)?;
+            self.store
+                .apply(block, &tree, &self.chainwork(&block.hash())?.to_be_bytes())?;
         }
         self.store.finish_reorg()?;
         Ok(())
@@ -277,9 +287,9 @@ impl Chain {
     }
 }
 
-/// Revision marker for the current consensus rules. The chain is reset when
-/// consensus changes, so this remains at the initial revision.
-pub const CONSENSUS_REVISION: u32 = 1;
+/// Revision marker for the current consensus rules. Revision 2 requires exact
+/// compact difficulty and checked 256-bit cumulative work.
+pub const CONSENSUS_REVISION: u32 = 2;
 
 /// Digest of everything that decides whether an applied block was valid:
 /// [`CONSENSUS_REVISION`], every consensus parameter, the genesis branch,
@@ -336,19 +346,6 @@ pub fn rules_digest(params: &ChainParams, vk: &VerifyingKey) -> [u8; 32] {
     )
 }
 
-/// Summed work of `blocks`.
-fn chain_work(blocks: &[Block]) -> Result<U512> {
-    blocks.iter().try_fold(U512::zero(), |acc, block| {
-        let work = Target::from_compact(block.header().target)?.work();
-        // A valid target contributes at most 2^255 work, and a chain has
-        // at most u32::MAX heights, so the sum fits in 288 bits. Keep a
-        // checked operation here so a future wider height/work rule cannot
-        // silently turn distinct chains into equal saturated totals.
-        acc.checked_add(U512::from_big_endian(&work.to_big_endian()))
-            .ok_or(Error::InvalidBlock("chain work overflow"))
-    })
-}
-
 /// Hash of the block at `height` on the main chain, for tests and tools.
 ///
 /// # Errors
@@ -376,12 +373,12 @@ mod tests {
             let fork = chain.tip().unwrap().hash;
             let tree = chain.store.tree().unwrap();
             let first = Block::new(protocol::block::empty_header(1, fork, tree.root()), vec![]);
-            chain.store.apply(&first, &tree).unwrap();
+            chain.store.apply(&first, &tree, &[1; 32]).unwrap();
             let second = Block::new(
                 protocol::block::empty_header(2, first.hash(), tree.root()),
                 vec![],
             );
-            chain.store.apply(&second, &tree).unwrap();
+            chain.store.apply(&second, &tree, &[2; 32]).unwrap();
             chain.store.begin_reorg(second.hash(), fork).unwrap();
             if phase >= 1 {
                 chain.store.revert().unwrap();
@@ -394,7 +391,7 @@ mod tests {
                 header.timestamp += 1;
                 chain
                     .store
-                    .apply(&Block::new(header, vec![]), &tree)
+                    .apply(&Block::new(header, vec![]), &tree, &[3; 32])
                     .unwrap();
             }
             chain.store.prune_frontiers_below(100).unwrap();

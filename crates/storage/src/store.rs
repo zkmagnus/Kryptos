@@ -5,6 +5,7 @@
 //! | table | key | value |
 //! |---|---|---|
 //! | `blocks` | block hash | block bytes |
+//! | `chainwork` | block hash | cumulative work, 32-byte big-endian |
 //! | `heights` | height | block hash |
 //! | `nullifiers` | nullifier | height it was spent at |
 //! | `frontiers` | height | commitment tree after that block |
@@ -27,6 +28,7 @@ use crate::tree::CommitmentTree;
 use crate::{Error, Result};
 
 const BLOCKS: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("blocks");
+const CHAINWORK: TableDefinition<&[u8; 32], &[u8; 32]> = TableDefinition::new("chainwork");
 const HEIGHTS: TableDefinition<u32, &[u8; 32]> = TableDefinition::new("heights");
 const NULLIFIERS: TableDefinition<&[u8; 32], u32> = TableDefinition::new("nullifiers");
 const FRONTIERS: TableDefinition<u32, &[u8]> = TableDefinition::new("frontiers");
@@ -43,7 +45,7 @@ const SCHEMA: &str = "schema";
 /// The on-disk layout this code writes and reads. Bumped whenever a table
 /// is added or changed; an older store is refused rather than served with
 /// tables it never filled.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// The chain tip.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,6 +83,7 @@ impl Store {
     fn init(db: Database) -> Result<Self> {
         let tx = db.begin_write()?;
         tx.open_table(BLOCKS)?;
+        tx.open_table(CHAINWORK)?;
         tx.open_table(HEIGHTS)?;
         tx.open_table(NULLIFIERS)?;
         tx.open_table(FRONTIERS)?;
@@ -253,6 +256,17 @@ impl Store {
             .transpose()
     }
 
+    /// Cumulative validated work for a stored block, in fixed-width big-endian form.
+    /// Genesis is zero; reverted and side-chain blocks retain their index entries.
+    ///
+    /// # Errors
+    /// Fails on a read error.
+    pub fn chainwork(&self, hash: &BlockHash) -> Result<Option<[u8; 32]>> {
+        let tx = self.db.begin_read()?;
+        let work = tx.open_table(CHAINWORK)?;
+        Ok(work.get(hash.as_bytes())?.map(|v| *v.value()))
+    }
+
     /// The hash of the block at `height` on the current chain.
     ///
     /// # Errors
@@ -393,15 +407,17 @@ impl Store {
     }
 
     /// Stores a block's bytes without applying it, for side-chain blocks
-    /// that may become the best chain later.
+    /// that may become the best chain later, atomically with its validated work.
     ///
     /// # Errors
     /// Fails on a write error.
-    pub fn put_block(&self, block: &Block) -> Result<()> {
+    pub fn put_block(&self, block: &Block, chainwork: &[u8; 32]) -> Result<()> {
         let tx = self.db.begin_write()?;
         {
             let mut blocks = tx.open_table(BLOCKS)?;
             blocks.insert(block.hash().as_bytes(), block.to_vec().as_slice())?;
+            tx.open_table(CHAINWORK)?
+                .insert(block.hash().as_bytes(), chainwork)?;
         }
         tx.commit()?;
         Ok(())
@@ -410,13 +426,14 @@ impl Store {
     /// Appends `block` to the tip, spending its nullifiers and recording
     /// `tree`, the commitment tree after the block. All or nothing.
     ///
-    /// The caller has validated the block; this only checks that it
+    /// The caller has validated the block and computed cumulative work from
+    /// its validated target and indexed parent; this only checks that it
     /// extends the tip.
     ///
     /// # Errors
     /// Returns [`Error::NotOnTip`] if the block's previous hash or height
     /// does not match the tip, or a write error.
-    pub fn apply(&self, block: &Block, tree: &CommitmentTree) -> Result<()> {
+    pub fn apply(&self, block: &Block, tree: &CommitmentTree, chainwork: &[u8; 32]) -> Result<()> {
         let header = block.header();
         let expected_prev = match self.tip()? {
             Some(t) => (t.hash, next_height(t.height)?),
@@ -430,6 +447,8 @@ impl Store {
         {
             let mut blocks = tx.open_table(BLOCKS)?;
             blocks.insert(hash.as_bytes(), block.to_vec().as_slice())?;
+            tx.open_table(CHAINWORK)?
+                .insert(hash.as_bytes(), chainwork)?;
             let mut heights = tx.open_table(HEIGHTS)?;
             heights.insert(header.height, hash.as_bytes())?;
             let mut nullifiers = tx.open_table(NULLIFIERS)?;
@@ -564,6 +583,27 @@ mod tests {
         assert!(Store::open(&fresh).is_ok(), "reopening keeps the version");
     }
 
+    #[test]
+    fn the_layout_without_a_work_index_requires_resync() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1.redb");
+        {
+            let db = Database::create(&path).unwrap();
+            let tx = db.begin_write().unwrap();
+            tx.open_table(META)
+                .unwrap()
+                .insert(SCHEMA, &schema_bytes(1))
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        assert!(matches!(
+            Store::open(path),
+            Err(Error::Corrupt(
+                "store layout outdated; delete it and resync"
+            ))
+        ));
+    }
+
     fn temp_store() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("chain.redb")).unwrap();
@@ -600,7 +640,9 @@ mod tests {
     fn apply_advances_the_tip_and_indexes_by_height() {
         let (_dir, store) = temp_store();
         let genesis = block(0, BlockHash::ZERO);
-        store.apply(&genesis, &CommitmentTree::empty()).unwrap();
+        store
+            .apply(&genesis, &CommitmentTree::empty(), &[0; 32])
+            .unwrap();
         let tip = store.tip().unwrap().unwrap();
         assert_eq!(
             tip,
@@ -613,7 +655,9 @@ mod tests {
         assert_eq!(store.block(&genesis.hash()).unwrap(), Some(genesis.clone()));
 
         let next = block(1, genesis.hash());
-        store.apply(&next, &CommitmentTree::empty()).unwrap();
+        store
+            .apply(&next, &CommitmentTree::empty(), &[0; 32])
+            .unwrap();
         assert_eq!(store.tip().unwrap().unwrap().height, 1);
     }
 
@@ -621,17 +665,31 @@ mod tests {
     fn blocks_that_do_not_extend_the_tip_are_refused() {
         let (_dir, store) = temp_store();
         assert!(matches!(
-            store.apply(&block(1, BlockHash::ZERO), &CommitmentTree::empty()),
+            store.apply(
+                &block(1, BlockHash::ZERO),
+                &CommitmentTree::empty(),
+                &[0; 32]
+            ),
             Err(Error::NotOnTip)
         ));
         let genesis = block(0, BlockHash::ZERO);
-        store.apply(&genesis, &CommitmentTree::empty()).unwrap();
+        store
+            .apply(&genesis, &CommitmentTree::empty(), &[0; 32])
+            .unwrap();
         assert!(matches!(
-            store.apply(&block(1, BlockHash::ZERO), &CommitmentTree::empty()),
+            store.apply(
+                &block(1, BlockHash::ZERO),
+                &CommitmentTree::empty(),
+                &[0; 32]
+            ),
             Err(Error::NotOnTip)
         ));
         assert!(matches!(
-            store.apply(&block(2, genesis.hash()), &CommitmentTree::empty()),
+            store.apply(
+                &block(2, genesis.hash()),
+                &CommitmentTree::empty(),
+                &[0; 32]
+            ),
             Err(Error::NotOnTip)
         ));
     }
@@ -640,14 +698,18 @@ mod tests {
     fn revert_restores_the_previous_tip_and_tree() {
         let (_dir, store) = temp_store();
         let genesis = block(0, BlockHash::ZERO);
-        store.apply(&genesis, &CommitmentTree::empty()).unwrap();
+        store
+            .apply(&genesis, &CommitmentTree::empty(), &[0; 32])
+            .unwrap();
         let mut tree = CommitmentTree::empty();
         tree.append(&cmx(1)).unwrap();
         let next = block(1, genesis.hash());
-        store.apply(&next, &tree).unwrap();
+        store.apply(&next, &tree, &[2; 32]).unwrap();
+        assert_eq!(store.chainwork(&next.hash()).unwrap(), Some([2; 32]));
         assert_eq!(store.tree().unwrap(), tree);
 
         let reverted = store.revert().unwrap();
+        assert_eq!(store.chainwork(&next.hash()).unwrap(), Some([2; 32]));
         assert_eq!(reverted, next);
         assert_eq!(store.tip().unwrap().unwrap().height, 0);
         assert_eq!(store.tree().unwrap(), CommitmentTree::empty());
@@ -675,7 +737,7 @@ mod tests {
             roots.push(tree.root());
             let b = block(height, prev);
             prev = b.hash();
-            store.apply(&b, &tree).unwrap();
+            store.apply(&b, &tree, &[0; 32]).unwrap();
         }
         assert_eq!(store.anchor_height(&roots[4], 10).unwrap(), Some(4));
         assert_eq!(store.anchor_height(&roots[1], 10).unwrap(), Some(1));
@@ -690,10 +752,12 @@ mod tests {
         tree.append(&cmx(1)).unwrap();
         let first_root = tree.root();
         let genesis = block(0, BlockHash::ZERO);
-        store.apply(&genesis, &tree).unwrap();
+        store.apply(&genesis, &tree, &[0; 32]).unwrap();
         tree.append(&cmx(2)).unwrap();
         let latest_root = tree.root();
-        store.apply(&block(1, genesis.hash()), &tree).unwrap();
+        store
+            .apply(&block(1, genesis.hash()), &tree, &[0; 32])
+            .unwrap();
 
         assert_eq!(
             store.check_block_state(&[latest_root], &[], 0).unwrap(),
@@ -731,7 +795,7 @@ mod tests {
         for height in 0..4u32 {
             let b = block(height, prev);
             prev = b.hash();
-            store.apply(&b, &CommitmentTree::empty()).unwrap();
+            store.apply(&b, &CommitmentTree::empty(), &[0; 32]).unwrap();
         }
         store.prune_frontiers_below(2).unwrap();
         assert!(store.tree_at(1).unwrap().is_none());
@@ -779,11 +843,12 @@ mod tests {
         let (_dir, store) = temp_store();
         let side = block(5, BlockHash::from_bytes([9; 32]));
         assert_eq!(store.block_encoded_len(&side.hash()).unwrap(), None);
-        store.put_block(&side).unwrap();
+        store.put_block(&side, &[7; 32]).unwrap();
         assert_eq!(
             store.block_encoded_len(&side.hash()).unwrap(),
             Some(side.to_vec().len())
         );
+        assert_eq!(store.chainwork(&side.hash()).unwrap(), Some([7; 32]));
         assert_eq!(store.block(&side.hash()).unwrap(), Some(side));
         assert_eq!(store.tip().unwrap(), None);
     }
@@ -793,11 +858,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("chain.redb");
         let genesis = block(0, BlockHash::ZERO);
+        let next = block(1, genesis.hash());
+        let side = block(2, genesis.hash());
         {
             let store = Store::open(&path).unwrap();
-            store.apply(&genesis, &CommitmentTree::empty()).unwrap();
+            store
+                .apply(&genesis, &CommitmentTree::empty(), &[0; 32])
+                .unwrap();
+            store
+                .apply(&next, &CommitmentTree::empty(), &[2; 32])
+                .unwrap();
+            store.put_block(&side, &[3; 32]).unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.tip().unwrap().unwrap().hash, genesis.hash());
+        assert_eq!(store.tip().unwrap().unwrap().hash, next.hash());
+        assert_eq!(store.chainwork(&genesis.hash()).unwrap(), Some([0; 32]));
+        assert_eq!(store.chainwork(&next.hash()).unwrap(), Some([2; 32]));
+        assert_eq!(store.chainwork(&side.hash()).unwrap(), Some([3; 32]));
     }
 }

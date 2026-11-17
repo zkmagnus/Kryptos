@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use arti_client::config::{BoolOrAuto, TorClientConfigBuilder};
 use arti_client::{BootstrapBehavior, DataStream, StreamPrefs, TorClient};
 use futures_util::StreamExt;
+use rand_core::{OsRng, RngCore};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::{mpsc, watch, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
@@ -28,7 +29,7 @@ use crate::{Error, Result};
 /// Application handshake deadline, allowing for onion circuit latency.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Deadline to establish an isolated onion connection.
-pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(180);
 // Arti allows five minutes for descriptor upload retries and fifteen minutes
 // before declaring an introduction point persistently faulty. This startup
@@ -38,6 +39,119 @@ const INCOMING_CAPACITY: usize = 32;
 const MAX_RENDEZVOUS: usize = 32;
 const MAX_ACCEPTING: usize = 8;
 const SERVICE_NICKNAME: &str = "rhombus";
+
+/// Fixed node settings for Tor and the application stream. No setting changes
+/// path length or permits non-anonymous onion services.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TorSettings {
+    /// Total deadline for connecting to an onion destination.
+    pub connect_timeout: Duration,
+    /// Application version exchange and incoming rendezvous acceptance deadline.
+    pub handshake_timeout: Duration,
+    /// Maximum time without incoming application traffic.
+    pub idle_timeout: Duration,
+    /// Deadline for reading or writing a single application message.
+    pub message_timeout: Duration,
+    /// Deadline for requested headers or block bodies, beginning after flush.
+    pub sync_response_timeout: Duration,
+    /// Deadline for each directory bootstrap attempt.
+    pub bootstrap_timeout: Duration,
+    /// Time allowed for anonymous onion-service publication to become reachable.
+    pub service_startup_timeout: Duration,
+    /// Maximum duration Arti spends obtaining a requested circuit.
+    pub circuit_request_timeout: Duration,
+    /// Maximum circuit construction attempts for a request.
+    pub circuit_request_attempts: u32,
+    /// Maximum introduction/rendezvous attempts for one onion connection.
+    pub intro_rendezvous_attempts: u32,
+    /// Time a used circuit remains available for new streams.
+    pub max_circuit_dirtiness: Duration,
+    /// Time Arti retains an unused circuit with strong stream isolation.
+    pub disused_circuit_timeout: Duration,
+    /// Initial delay between failed bootstrap or peer connection attempts.
+    pub retry_initial: Duration,
+    /// Maximum retry delay, including jitter.
+    pub retry_max: Duration,
+}
+
+impl Default for TorSettings {
+    fn default() -> Self {
+        Self {
+            connect_timeout: CONNECT_TIMEOUT,
+            handshake_timeout: HANDSHAKE_TIMEOUT,
+            idle_timeout: Duration::from_mins(15),
+            message_timeout: Duration::from_secs(120),
+            sync_response_timeout: Duration::from_mins(5),
+            bootstrap_timeout: BOOTSTRAP_TIMEOUT,
+            service_startup_timeout: SERVICE_STARTUP_TIMEOUT,
+            circuit_request_timeout: Duration::from_secs(60),
+            circuit_request_attempts: 8,
+            intro_rendezvous_attempts: 3,
+            max_circuit_dirtiness: Duration::from_secs(600),
+            disused_circuit_timeout: Duration::from_hours(1),
+            retry_initial: Duration::from_secs(60),
+            retry_max: Duration::from_hours(1),
+        }
+    }
+}
+
+impl TorSettings {
+    /// Rejects zero deadlines and malformed retry settings.
+    ///
+    /// # Errors
+    /// Returns a configuration error before starting Arti or accepting streams.
+    pub fn validate(&self) -> Result<()> {
+        if [
+            self.connect_timeout,
+            self.handshake_timeout,
+            self.idle_timeout,
+            self.message_timeout,
+            self.sync_response_timeout,
+            self.bootstrap_timeout,
+            self.service_startup_timeout,
+            self.circuit_request_timeout,
+            self.max_circuit_dirtiness,
+            self.disused_circuit_timeout,
+            self.retry_initial,
+            self.retry_max,
+        ]
+        .into_iter()
+        .any(|duration| duration < Duration::from_secs(1))
+            || self.retry_initial > self.retry_max
+            || self.circuit_request_attempts == 0
+            || self.intro_rendezvous_attempts == 0
+        {
+            return Err(Error::Tor(
+                "Tor deadlines and attempts must be positive, with retry initial <= maximum".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Exponential backoff with bounded jitter. All nodes share the same range;
+    /// randomness applies only to retry timing, not peer or circuit counts.
+    pub fn retry_delay(&self, failures: u32, entropy: u64) -> Duration {
+        let shift = failures.saturating_sub(1).min(31);
+        let base = self
+            .retry_initial
+            .saturating_mul(1u32 << shift)
+            .min(self.retry_max);
+        // Keep jitter even after reaching the cap, so a long outage cannot
+        // synchronize every node's subsequent introduction attempts.
+        let lower = base
+            .saturating_sub(base.checked_div(4).unwrap_or_default())
+            .max(self.retry_initial);
+        let upper = base
+            .saturating_add(base.checked_div(4).unwrap_or_default())
+            .min(self.retry_max);
+        let room = upper.saturating_sub(lower);
+        let jitter_ms = u64::try_from(room.as_millis()).unwrap_or(u64::MAX);
+        let jitter = entropy
+            .checked_rem(jitter_ms.saturating_add(1))
+            .unwrap_or(0);
+        lower.saturating_add(Duration::from_millis(jitter))
+    }
+}
 
 type Client = TorClient<PreferredRuntime>;
 
@@ -64,6 +178,9 @@ pub struct Incoming {
 pub enum Stream {
     /// An authenticated, encrypted Tor onion-service stream.
     Tor(Box<DataStream>),
+    /// An accepted stream keeps its rendezvous request listener alive while
+    /// the application uses the circuit, including during long RPC downloads.
+    AcceptedTor(Box<DataStream>, Arc<()>),
     /// Explicit in-memory fixture, unavailable in production builds.
     #[cfg(any(test, feature = "test-support"))]
     Memory(tokio::io::DuplexStream),
@@ -79,7 +196,7 @@ impl AsyncRead for Stream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
-            Self::Tor(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Tor(stream) | Self::AcceptedTor(stream, _) => Pin::new(stream).poll_read(cx, buf),
             #[cfg(any(test, feature = "test-support"))]
             Self::Memory(stream) => Pin::new(stream).poll_read(cx, buf),
             #[cfg(any(test, feature = "test-support"))]
@@ -95,7 +212,9 @@ impl AsyncWrite for Stream {
         bytes: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         match self.get_mut() {
-            Self::Tor(stream) => Pin::new(stream).poll_write(cx, bytes),
+            Self::Tor(stream) | Self::AcceptedTor(stream, _) => {
+                Pin::new(stream).poll_write(cx, bytes)
+            }
             #[cfg(any(test, feature = "test-support"))]
             Self::Memory(stream) => Pin::new(stream).poll_write(cx, bytes),
             #[cfg(any(test, feature = "test-support"))]
@@ -104,7 +223,7 @@ impl AsyncWrite for Stream {
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
-            Self::Tor(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Tor(stream) | Self::AcceptedTor(stream, _) => Pin::new(stream).poll_flush(cx),
             #[cfg(any(test, feature = "test-support"))]
             Self::Memory(stream) => Pin::new(stream).poll_flush(cx),
             #[cfg(any(test, feature = "test-support"))]
@@ -113,7 +232,7 @@ impl AsyncWrite for Stream {
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
-            Self::Tor(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Tor(stream) | Self::AcceptedTor(stream, _) => Pin::new(stream).poll_shutdown(cx),
             #[cfg(any(test, feature = "test-support"))]
             Self::Memory(stream) => Pin::new(stream).poll_shutdown(cx),
             #[cfg(any(test, feature = "test-support"))]
@@ -148,6 +267,7 @@ pub struct TorNetwork {
     service: bool,
     status: watch::Sender<TorStatus>,
     supervisor: Option<JoinHandle<()>>,
+    settings: TorSettings,
 }
 
 impl std::fmt::Debug for TorNetwork {
@@ -178,6 +298,20 @@ impl TorNetwork {
         service: bool,
         ports: &[u16],
     ) -> Result<(Arc<Self>, mpsc::Receiver<Incoming>)> {
+        Self::start_with_settings(datadir, service, ports, &TorSettings::default())
+    }
+
+    /// Starts embedded Tor with explicit timeout, bootstrap, and circuit settings.
+    ///
+    /// # Errors
+    /// Rejects invalid settings, unsafe storage permissions, ports, or Arti setup.
+    pub fn start_with_settings(
+        datadir: &Path,
+        service: bool,
+        ports: &[u16],
+        settings: &TorSettings,
+    ) -> Result<(Arc<Self>, mpsc::Receiver<Incoming>)> {
+        settings.validate()?;
         if ports.contains(&0) {
             return Err(Error::Tor("virtual ports must be nonzero".into()));
         }
@@ -192,6 +326,27 @@ impl TorNetwork {
         mistrust.make_directory(&cache).map_err(tor_error)?;
         let mut config = TorClientConfigBuilder::from_directories(state, cache);
         config.storage().permissions().ignore_environment();
+        config
+            .download_schedule()
+            .retry_bootstrap()
+            .initial_delay(settings.retry_initial);
+        config
+            .stream_timeouts()
+            .connect_timeout(settings.connect_timeout);
+        config
+            .circuit_timing()
+            .request_timeout(settings.circuit_request_timeout)
+            .request_max_retries(settings.circuit_request_attempts)
+            .hs_intro_rend_attempts(settings.intro_rendezvous_attempts)
+            .max_dirtiness(settings.max_circuit_dirtiness)
+            .disused_circuit_timeout(settings.disused_circuit_timeout);
+        // These setters are verified against vendored Arti 0.48.0. Its public
+        // preemptive-circuit settings predict exit traffic, not onion peers;
+        // targeted onion circuit prewarming is not exposed here. Existing
+        // streams survive max_dirtiness: it limits reuse for *new* streams
+        // without strong isolation. Our isolated peer circuits use Arti's
+        // disused_circuit_timeout after their last stream is gone.
+        // Full vanguards is a security invariant, not a latency tuning knob.
         config
             .vanguards()
             .mode(tor_config::ExplicitOrAuto::Explicit(
@@ -210,6 +365,7 @@ impl TorNetwork {
             ports.to_vec(),
             incoming,
             status.clone(),
+            settings.clone(),
         ));
         Ok((
             Arc::new(Self {
@@ -217,9 +373,15 @@ impl TorNetwork {
                 service,
                 status,
                 supervisor: Some(supervisor),
+                settings: settings.clone(),
             }),
             receiver,
         ))
+    }
+
+    /// Settings shared by outbound dials and application connection tasks.
+    pub fn settings(&self) -> &TorSettings {
+        &self.settings
     }
 
     /// Follows bootstrap and service reachability without parsing log messages.
@@ -239,7 +401,7 @@ impl TorNetwork {
     /// Fails if the supervisor closes or startup exceeds its deadline.
     pub async fn wait_ready(&self) -> Result<()> {
         let mut status = self.status();
-        tokio::time::timeout(BOOTSTRAP_TIMEOUT, async {
+        tokio::time::timeout(self.settings.bootstrap_timeout, async {
             loop {
                 if self.ready() {
                     return Ok(());
@@ -273,7 +435,7 @@ impl TorNetwork {
                 let connect = client.connect_with_prefs((hostname.as_str(), port), &prefs);
                 tokio::pin!(connect);
                 let mut status = self.status();
-                tokio::time::timeout(CONNECT_TIMEOUT, async {
+                tokio::time::timeout(self.settings.connect_timeout, async {
                     loop {
                         tokio::select! {
                             result = &mut connect => return result.map(|stream| Stream::Tor(Box::new(stream))).map_err(tor_error),
@@ -301,11 +463,14 @@ async fn supervise(
     ports: Vec<u16>,
     incoming: mpsc::Sender<Incoming>,
     status: watch::Sender<TorStatus>,
+    settings: TorSettings,
 ) {
-    let mut delay = Duration::from_secs(2);
+    let mut failures = 0u32;
     loop {
         status.send_replace(TorStatus::default());
-        match tokio::time::timeout(BOOTSTRAP_TIMEOUT, client.bootstrap()).await {
+        failures = failures.saturating_add(1);
+        let delay = settings.retry_delay(failures, OsRng.next_u64());
+        match tokio::time::timeout(settings.bootstrap_timeout, client.bootstrap()).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 eprintln!(
@@ -313,7 +478,6 @@ async fn supervise(
                     client.bootstrap_status()
                 );
                 tokio::time::sleep(delay).await;
-                delay = delay.saturating_mul(2).min(Duration::from_secs(60));
                 continue;
             }
             Err(_) => {
@@ -322,22 +486,36 @@ async fn supervise(
                     client.bootstrap_status()
                 );
                 tokio::time::sleep(delay).await;
-                delay = delay.saturating_mul(2).min(Duration::from_secs(60));
                 continue;
             }
         }
         let result = if service {
-            serve(&client, &ports, &incoming, &status).await
+            serve(
+                &client,
+                &ports,
+                &incoming,
+                &status,
+                &settings,
+                &mut failures,
+            )
+            .await
         } else {
+            failures = 0;
             monitor_client(&client, &status).await;
             Ok(())
         };
         status.send_replace(TorStatus::default());
+        // A healthy session breaks the run of startup failures. Do not keep
+        // maximum backoff for unrelated outages later in this process's life.
+        let delay = if failures == 0 {
+            settings.retry_delay(1, OsRng.next_u64())
+        } else {
+            delay
+        };
         if let Err(error) = result {
             eprintln!("embedded onion service unavailable: {error}; retrying in {delay:?}");
         }
         tokio::time::sleep(delay).await;
-        delay = delay.saturating_mul(2).min(Duration::from_secs(60));
     }
 }
 
@@ -348,10 +526,13 @@ async fn monitor_client(client: &Client, status: &watch::Sender<TorStatus>) {
         client_ready: was_ready,
         onion: None,
     });
-    while let Some(event) = events.next().await {
-        let ready = event.ready_for_traffic();
+    while events.next().await.is_some() {
+        // Events are wakeups: their payload can predate the snapshot used to
+        // publish readiness above. Never regress to a queued startup event.
+        let current = client.bootstrap_status();
+        let ready = current.ready_for_traffic();
         if was_ready && !ready {
-            eprintln!("embedded Tor client lost readiness: {event}");
+            eprintln!("embedded Tor client lost readiness: {current}");
             break;
         }
         was_ready |= ready;
@@ -414,7 +595,11 @@ async fn serve(
     ports: &[u16],
     incoming: &mpsc::Sender<Incoming>,
     status: &watch::Sender<TorStatus>,
+    settings: &TorSettings,
+    failures: &mut u32,
 ) -> Result<()> {
+    // Arti 0.48.0 has no public single-onion/non-anonymous configuration.
+    // Keep the normal anonymous service and full vanguards; do not shorten paths.
     let config = OnionServiceConfig::builder()
         .nickname(SERVICE_NICKNAME.parse().map_err(tor_error)?)
         .max_concurrent_streams_per_circuit(8)
@@ -441,9 +626,12 @@ async fn serve(
         )));
     }
     publish_status(client, &service, status);
-    let startup_deadline = tokio::time::sleep(SERVICE_STARTUP_TIMEOUT);
+    let startup_deadline = tokio::time::sleep(settings.service_startup_timeout);
     tokio::pin!(startup_deadline);
     let mut became_ready = status.borrow().onion.is_some();
+    if became_ready {
+        *failures = 0;
+    }
     let failure = loop {
         tokio::select! {
             () = &mut startup_deadline, if !became_ready => {
@@ -451,20 +639,24 @@ async fn serve(
                 break Error::Tor(format!("onion service startup timed out: client {}; service {service_status:?}", client.bootstrap_status()));
             }
             change = bootstrap.next() => {
-                let Some(change) = change else { break Error::Tor("client bootstrap status stream ended".into()); };
-                let ready = change.ready_for_traffic();
-                if was_ready && !ready { break Error::Tor(format!("client lost bootstrap readiness: {change}")); }
+                let Some(_) = change else { break Error::Tor("client bootstrap status stream ended".into()); };
+                let current = client.bootstrap_status();
+                let ready = current.ready_for_traffic();
+                if was_ready && !ready { break Error::Tor(format!("client lost bootstrap readiness: {current}")); }
                 was_ready |= ready;
                 publish_status(client, &service, status);
                 became_ready |= status.borrow().onion.is_some();
+                if became_ready { *failures = 0; }
             }
             change = changes.next() => {
-                let Some(change) = change else { break Error::Tor("onion service status stream ended".into()); };
-                if lifecycle.stopped(change.state()) {
-                    break Error::Tor(format!("onion service stopped: {:?}; problem: {:?}", change.state(), change.current_problem()));
+                let Some(_) = change else { break Error::Tor("onion service status stream ended".into()); };
+                let current = service.status();
+                if lifecycle.stopped(current.state()) {
+                    break Error::Tor(format!("onion service stopped: {:?}; problem: {:?}", current.state(), current.current_problem()));
                 }
                 publish_status(client, &service, status);
                 became_ready |= status.borrow().onion.is_some();
+                if became_ready { *failures = 0; }
             }
             Some(_) = circuits.join_next(), if !circuits.is_empty() => {}
             request = requests.next() => {
@@ -475,11 +667,14 @@ async fn serve(
                 let incoming = incoming.clone();
                 let stream_limit = Arc::clone(&stream_limit);
                 let accepting = Arc::clone(&accepting);
+                let handshake_timeout = settings.handshake_timeout;
+                let idle_timeout = settings.idle_timeout;
                 circuits.spawn(async move {
-                    let accepted = tokio::time::timeout(HANDSHAKE_TIMEOUT, request.accept()).await;
+                    let accepted = tokio::time::timeout(handshake_timeout, request.accept()).await;
                     drop(permit);
                     let Ok(Ok(mut streams)) = accepted else { return; };
-                    while let Ok(Some(request)) = tokio::time::timeout(HANDSHAKE_TIMEOUT, streams.next()).await {
+                    let active = Arc::new(());
+                    while let Some(request) = next_rendezvous_request(&mut streams, &active, idle_timeout).await {
                         let IncomingStreamRequest::Begin(begin) = request.request() else { continue; };
                         let port = begin.port();
                         if !ports.contains(&port) { continue; }
@@ -487,8 +682,8 @@ async fn serve(
                         if !allowed { continue; }
                         let Ok(slot) = incoming.try_reserve() else { continue; };
                         let Ok(_accept_permit) = Arc::clone(&accepting).try_acquire_owned() else { continue; };
-                        if let Ok(Ok(stream)) = tokio::time::timeout(HANDSHAKE_TIMEOUT, request.accept(Connected::new_empty())).await {
-                            slot.send(Incoming { port, stream: Stream::Tor(Box::new(stream)) });
+                        if let Ok(Ok(stream)) = tokio::time::timeout(handshake_timeout, request.accept(Connected::new_empty())).await {
+                            slot.send(Incoming { port, stream: Stream::AcceptedTor(Box::new(stream), Arc::clone(&active)) });
                         }
                     }
                 });
@@ -496,6 +691,24 @@ async fn serve(
         }
     };
     Err(failure)
+}
+
+/// Idle rendezvous circuits can be reaped, but a request listener must outlive
+/// accepted application streams. Dropping it while a stream is active makes a
+/// later BEGIN on that same circuit close the whole circuit in Arti. The outer
+/// admission limit still caps these tasks, and idle circuits expire normally.
+async fn next_rendezvous_request<S: futures_util::Stream + Unpin>(
+    requests: &mut S,
+    active: &Arc<()>,
+    idle_timeout: Duration,
+) -> Option<S::Item> {
+    loop {
+        match tokio::time::timeout(idle_timeout, requests.next()).await {
+            Ok(request) => return request,
+            Err(_) if Arc::strong_count(active) > 1 => {}
+            Err(_) => return None,
+        }
+    }
 }
 
 /// Conservative admission bucket used while experimental Tor proof of work is disabled.
@@ -534,23 +747,36 @@ impl Admission {
 #[derive(Debug)]
 pub struct ConnectionWriter {
     stream: tokio::io::WriteHalf<Stream>,
+    sent_bytes: u64,
 }
 /// Receiving half of a framed application stream.
 #[derive(Debug)]
 pub struct ConnectionReader {
     stream: tokio::io::ReadHalf<Stream>,
+    received_bytes: u64,
 }
 
 /// Splits a Tor stream into bounded framed application halves.
 pub fn split(stream: impl Into<Stream>) -> (ConnectionWriter, ConnectionReader) {
     let (reader, writer) = tokio::io::split(stream.into());
     (
-        ConnectionWriter { stream: writer },
-        ConnectionReader { stream: reader },
+        ConnectionWriter {
+            stream: writer,
+            sent_bytes: 0,
+        },
+        ConnectionReader {
+            stream: reader,
+            received_bytes: 0,
+        },
     )
 }
 
 impl ConnectionWriter {
+    /// Bytes in fully flushed application frames, including length prefixes.
+    pub fn sent_bytes(&self) -> u64 {
+        self.sent_bytes
+    }
+
     /// Sends and flushes one bounded message.
     ///
     /// # Errors
@@ -562,10 +788,42 @@ impl ConnectionWriter {
         }
         self.stream.write_all(&wire).await?;
         self.stream.flush().await?;
+        self.sent_bytes = self
+            .sent_bytes
+            .saturating_add(u64::try_from(wire.len()).unwrap_or(u64::MAX));
         Ok(())
     }
 }
 impl ConnectionReader {
+    /// Bytes in fully received valid frames, including length prefixes.
+    pub fn received_bytes(&self) -> u64 {
+        self.received_bytes
+    }
+
+    /// Waits separately for traffic and for completion of the frame. An idle
+    /// peer gets the idle deadline; a peer dripping a partial frame gets only
+    /// the message deadline, measured from its first byte.
+    ///
+    /// # Errors
+    /// Fails on inactivity, a stalled frame, EOF, or malformed framing.
+    pub async fn recv_with_timeouts(
+        &mut self,
+        idle: Duration,
+        message: Duration,
+    ) -> Result<Message> {
+        let first = tokio::time::timeout(idle, self.stream.read_u8())
+            .await
+            .map_err(|_| Error::Tor("peer idle timeout".into()))??;
+        tokio::time::timeout(message, async {
+            let mut rest = [0u8; 3];
+            self.stream.read_exact(&mut rest).await?;
+            let [second, third, fourth] = rest;
+            self.recv_body([first, second, third, fourth]).await
+        })
+        .await
+        .map_err(|_| Error::Tor("peer message timeout".into()))?
+    }
+
     /// Receives one frame, validating its size before allocation.
     ///
     /// # Errors
@@ -573,6 +831,10 @@ impl ConnectionReader {
     pub async fn recv(&mut self) -> Result<Message> {
         let mut prefix = [0u8; 4];
         self.stream.read_exact(&mut prefix).await?;
+        self.recv_body(prefix).await
+    }
+
+    async fn recv_body(&mut self, prefix: [u8; 4]) -> Result<Message> {
         let len =
             usize::try_from(u32::from_le_bytes(prefix)).map_err(|_| Error::TooLarge(usize::MAX))?;
         if len > MAX_MESSAGE_LEN {
@@ -580,7 +842,11 @@ impl ConnectionReader {
         }
         let mut bytes = vec![0u8; len];
         self.stream.read_exact(&mut bytes).await?;
-        Message::decode(&bytes)
+        let message = Message::decode(&bytes)?;
+        self.received_bytes = self
+            .received_bytes
+            .saturating_add(u64::try_from(len.saturating_add(4)).unwrap_or(u64::MAX));
+        Ok(message)
     }
 }
 
@@ -641,6 +907,7 @@ pub mod test_support {
                 service: true,
                 status,
                 supervisor: None,
+                settings: super::TorSettings::default(),
             }),
             receiver,
         )
@@ -682,6 +949,55 @@ pub mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_backoff_is_jittered_capped_and_never_aggressive() {
+        let settings = TorSettings::default();
+        for failures in 1..32 {
+            let shortest = settings.retry_delay(failures, 0);
+            let jittered = settings.retry_delay(failures, 101);
+            assert!(shortest >= settings.retry_initial);
+            assert!(jittered >= shortest);
+            assert!(jittered <= settings.retry_max);
+        }
+        assert!(settings.retry_delay(1, 101) > settings.retry_delay(1, 0));
+        assert!(settings.retry_delay(u32::MAX, 42) < settings.retry_max);
+        assert!(settings.retry_delay(u32::MAX, 42) > settings.retry_delay(u32::MAX, 0));
+    }
+
+    #[test]
+    fn settings_reject_zero_deadlines_and_inverted_backoff() {
+        let mut settings = TorSettings::default();
+        assert!(settings.validate().is_ok());
+        settings.connect_timeout = Duration::ZERO;
+        assert!(settings.validate().is_err());
+        settings = TorSettings::default();
+        settings.retry_initial = settings.retry_max.saturating_add(Duration::from_secs(1));
+        assert!(settings.validate().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn partial_frames_have_a_separate_deadline_from_idle_connections() {
+        let (mut remote, local) = tokio::io::duplex(1024);
+        let (_, mut reader) = split(local);
+        let waiting = tokio::spawn(async move {
+            reader
+                .recv_with_timeouts(Duration::from_secs(100), Duration::from_secs(5))
+                .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert!(
+            !waiting.is_finished(),
+            "idle is longer than the message timeout"
+        );
+        remote.write_all(&[1]).await.unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert!(
+            matches!(waiting.await.unwrap(), Err(Error::Tor(message)) if message == "peer message timeout")
+        );
+    }
 
     #[test]
     fn service_readiness_requires_bootstrap_and_reachable_publication() {
@@ -734,6 +1050,44 @@ mod tests {
         assert!(!admission.allow(now + Duration::from_millis(499)));
         assert!(admission.allow(now + Duration::from_millis(500)));
         assert!(!admission.allow(now + Duration::from_millis(500)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rendezvous_listener_outlives_active_streams_but_reaps_idle_circuits() {
+        let (sender, receiver) = mpsc::unbounded_channel::<u8>();
+        let mut receiver = Box::pin(futures_util::stream::unfold(
+            receiver,
+            |mut receiver| async { receiver.recv().await.map(|value| (value, receiver)) },
+        ));
+        let active = Arc::new(());
+        let stream_lease = Arc::clone(&active);
+        let waiting = tokio::spawn(async move {
+            let request = next_rendezvous_request(&mut receiver, &active, HANDSHAKE_TIMEOUT).await;
+            (request, receiver, active)
+        });
+        tokio::task::yield_now().await;
+        for _ in 0..3 {
+            tokio::time::advance(HANDSHAKE_TIMEOUT).await;
+            tokio::task::yield_now().await;
+            assert!(
+                !waiting.is_finished(),
+                "active stream must retain its listener"
+            );
+        }
+        sender.send(7).unwrap();
+        let (request, mut receiver, active) = waiting.await.unwrap();
+        assert_eq!(request, Some(7), "later circuit reuse must still work");
+        drop(stream_lease);
+        let idle = tokio::spawn(async move {
+            next_rendezvous_request(&mut receiver, &active, HANDSHAKE_TIMEOUT).await
+        });
+        tokio::time::advance(HANDSHAKE_TIMEOUT).await;
+        assert_eq!(
+            idle.await.unwrap(),
+            None,
+            "idle listener must release its slot"
+        );
+        assert!(sender.send(8).is_err());
     }
 
     #[tokio::test]

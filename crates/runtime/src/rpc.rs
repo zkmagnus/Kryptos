@@ -44,6 +44,11 @@ use crate::{Error, Result};
 pub const TOKEN_FILE: &str = "rpc.token";
 /// How long a client waits for one reply before giving up.
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
+/// One retry permits a fresh circuit after a transient disconnect, without
+/// keeping a command alive indefinitely during an outage.
+const CONNECT_ATTEMPTS: usize = 2;
+const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(250);
+const SESSION_TIMEOUT: Duration = Duration::from_secs(240);
 /// Largest reply a client will buffer. A full block's hex is tens of
 /// megabytes; past this the node is misbehaving and the client bails
 /// rather than allocating without bound.
@@ -483,8 +488,16 @@ impl Control for Connection {
 
 impl Control for Client {
     async fn close(&mut self) -> Result<()> {
-        self.stream.get_mut().shutdown().await?;
-        Ok(())
+        self.closed = true;
+        let Some(mut stream) = self.stream.take() else {
+            return Ok(());
+        };
+        match tokio::time::timeout(self.timeout, stream.get_mut().shutdown()).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) if disconnected(error.kind()) => Ok(()),
+            Ok(Err(error)) => Err(rpc_io("closing session", error)),
+            Err(_) => Err(rpc_timeout("closing session")),
+        }
     }
 
     async fn call(&mut self, line: &str) -> Result<String> {
@@ -494,11 +507,17 @@ impl Control for Client {
 
 fn decode_reply(reply: &str) -> Result<String> {
     let reply = reply.trim_end();
-    match reply.strip_prefix("ok") {
-        Some(rest) => Ok(rest.trim_start().to_string()),
-        None => Err(Error::Argument(
-            reply.strip_prefix("err ").unwrap_or(reply).to_string(),
-        )),
+    if reply == "ok" {
+        Ok(String::new())
+    } else if let Some(rest) = reply.strip_prefix("ok ") {
+        Ok(rest.to_string())
+    } else if let Some(reason) = reply.strip_prefix("err ") {
+        Err(Error::Argument(reason.to_string()))
+    } else {
+        Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "control RPC reading reply: invalid reply framing",
+        )))
     }
 }
 
@@ -523,77 +542,238 @@ impl Endpoint {
     }
 }
 
-/// A client for the control socket.
+/// A client for the control socket. Read-only requests can recover once from a
+/// dropped stream; requests with side effects are never automatically replayed.
 pub struct Client {
-    // Keep the client lifecycle alive for this connection.
-    _network: Arc<TorNetwork>,
-    stream: BufReader<Stream>,
+    // Keep the client lifecycle alive for this connection and its reconnect.
+    network: Arc<TorNetwork>,
+    endpoint: Option<(String, Token)>,
+    stream: Option<BufReader<Stream>>,
     timeout: Duration,
+    closed: bool,
 }
 
 impl Client {
     /// Opens an isolated connection through the application's embedded Tor client.
+    /// A failed dial or authentication transport is retried once; a rejected
+    /// credential is returned immediately.
     ///
     /// # Errors
     /// Fails on unavailable Tor, an invalid onion endpoint, or a rejected token.
     pub async fn connect(network: &Arc<TorNetwork>, addr: &str, token: &Token) -> Result<Self> {
-        let stream = network.connect(addr).await?;
-        let mut client = Self {
-            _network: Arc::clone(network),
-            stream: BufReader::new(stream),
-            timeout: CALL_TIMEOUT,
-        };
-        match client.call(&format!("auth {}", token.expose())).await {
-            Ok(_) => Ok(client),
-            Err(Error::Argument(reason)) if reason == "unauthorized" => Err(Error::Unauthorized),
-            Err(error) => Err(error),
+        p2p::address::NetAddr::parse_endpoint(addr)?;
+        let mut last = None;
+        for attempt in 0..CONNECT_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(CONNECT_RETRY_DELAY).await;
+            }
+            match open_session(network, addr, token, CALL_TIMEOUT).await {
+                Ok(stream) => {
+                    return Ok(Self {
+                        network: Arc::clone(network),
+                        endpoint: Some((addr.to_owned(), token.clone())),
+                        stream: Some(stream),
+                        timeout: CALL_TIMEOUT,
+                        closed: false,
+                    })
+                }
+                Err(error) if recoverable(&error) => last = Some(error),
+                Err(error) => return Err(error),
+            }
         }
+        Err(last.unwrap_or_else(|| rpc_timeout("opening session")))
     }
 
-    /// Sends one request line and returns the reply without the `ok `
-    /// prefix.
+    /// Sends one request line and returns the reply without the `ok ` prefix.
+    /// Read-only methods reconnect and authenticate once after transport failure.
+    /// A failed submit has an unknown outcome and must be checked by transaction
+    /// id; it is never sent a second time here.
     ///
     /// # Errors
-    /// Returns [`Error::Argument`] carrying the node's error text.
+    /// Returns a contextual transport error or the node's error response.
     pub async fn call(&mut self, line: &str) -> Result<String> {
-        tokio::time::timeout(self.timeout, async {
-            self.stream
-                .get_mut()
-                .write_all(format!("{line}\n").as_bytes())
-                .await?;
-            self.stream.get_mut().flush().await
-        })
-        .await
-        .map_err(|_| Error::Argument("control request timed out".into()))??;
-        let reply = tokio::time::timeout(self.timeout, self.read_reply())
-            .await
-            .map_err(|_| Error::Argument("control socket timed out".into()))??;
-        decode_reply(&reply)
+        if self.closed {
+            return Err(Error::Argument(
+                "control session was explicitly closed".into(),
+            ));
+        }
+        if line.contains(['\r', '\n']) {
+            return Err(Error::Argument(
+                "control request must be a single line".into(),
+            ));
+        }
+        let result = self.call_once(line).await;
+        if !matches!(result, Err(Error::Io(_))) {
+            return result;
+        }
+        // Drop partial replies and timed-out writes before any new request;
+        // reusing this stream could associate a late reply with the wrong call.
+        self.stream = None;
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(|error| !recoverable(error))
+        {
+            return result;
+        }
+        if !read_only_request(line) {
+            return result.map_err(|error| {
+                rpc_io(
+                    "request outcome unknown; check transaction status before resubmitting",
+                    error,
+                )
+            });
+        }
+        let Some((addr, token)) = self.endpoint.as_ref() else {
+            return result;
+        };
+        let stream = open_session(&self.network, addr, token, self.timeout).await?;
+        self.stream = Some(stream);
+        let retried = self.call_once(line).await;
+        if matches!(retried, Err(Error::Io(_))) {
+            self.stream = None;
+        }
+        retried
     }
 
-    /// Reads one newline-terminated reply, bounded by [`MAX_REPLY_BYTES`]
-    /// so a hostile node cannot make the client allocate without limit.
-    async fn read_reply(&mut self) -> Result<String> {
-        let mut buf = Vec::new();
-        loop {
-            let chunk = self.stream.fill_buf().await?;
-            if chunk.is_empty() {
-                return Err(Error::Argument("control socket closed".into()));
-            }
-            if let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
-                buf.extend_from_slice(chunk.get(..pos).unwrap_or_default());
-                self.stream.consume(pos.saturating_add(1));
-                break;
-            }
-            if buf.len().saturating_add(chunk.len()) > MAX_REPLY_BYTES {
-                return Err(Error::Argument("control reply too long".into()));
-            }
-            let take = chunk.len();
-            buf.extend_from_slice(chunk);
-            self.stream.consume(take);
-        }
-        String::from_utf8(buf).map_err(|_| Error::Argument("control reply not UTF-8".into()))
+    async fn call_once(&mut self, line: &str) -> Result<String> {
+        let stream = self.stream.as_mut().ok_or_else(|| {
+            rpc_io(
+                "request on disconnected session",
+                std::io::Error::from(std::io::ErrorKind::NotConnected),
+            )
+        })?;
+        exchange(stream, line, self.timeout).await
     }
+}
+
+fn read_only_request(line: &str) -> bool {
+    matches!(
+        line.split_whitespace().next(),
+        Some("status" | "block" | "compact" | "hash" | "coinbase" | "txstatus" | "spent")
+    )
+}
+
+fn disconnected(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::UnexpectedEof
+    )
+}
+
+fn recoverable(error: &Error) -> bool {
+    matches!(error, Error::Io(error) if !matches!(error.kind(),
+        std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput
+        | std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::OutOfMemory))
+}
+
+fn io_context(stage: &str, error: &std::io::Error) -> Error {
+    Error::Io(std::io::Error::new(
+        error.kind(),
+        format!("control RPC {stage}: {error}"),
+    ))
+}
+
+fn rpc_io(stage: &str, error: impl std::fmt::Display) -> Error {
+    Error::Io(std::io::Error::other(format!(
+        "control RPC {stage}: {error}"
+    )))
+}
+
+fn rpc_timeout(stage: &str) -> Error {
+    Error::Io(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!("control RPC timed out while {stage}"),
+    ))
+}
+
+async fn open_session(
+    network: &Arc<TorNetwork>,
+    addr: &str,
+    token: &Token,
+    timeout: Duration,
+) -> Result<BufReader<Stream>> {
+    tokio::time::timeout(SESSION_TIMEOUT, async {
+        network
+            .wait_ready()
+            .await
+            .map_err(|error| rpc_io("waiting for embedded Tor", error))?;
+        let stream = network.connect(addr).await.map_err(|error| {
+            rpc_io(
+                "connecting to onion control port (check node readiness and RPC port)",
+                error,
+            )
+        })?;
+        let mut stream = BufReader::new(stream);
+        match exchange(&mut stream, &format!("auth {}", token.expose()), timeout).await {
+            Ok(_) => Ok(stream),
+            Err(Error::Argument(reason)) if reason == "unauthorized" => Err(Error::Unauthorized),
+            Err(Error::Io(error)) => Err(io_context("authenticating", &error)),
+            // Do not echo an unexpected authentication reply: a broken or
+            // hostile server could include the presented credential in it.
+            Err(_) => Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "control RPC authenticating: unexpected authentication reply",
+            ))),
+        }
+    })
+    .await
+    .map_err(|_| rpc_timeout("opening onion session"))?
+}
+
+async fn exchange(stream: &mut BufReader<Stream>, line: &str, timeout: Duration) -> Result<String> {
+    tokio::time::timeout(timeout, async {
+        stream
+            .get_mut()
+            .write_all(format!("{line}\n").as_bytes())
+            .await?;
+        stream.get_mut().flush().await
+    })
+    .await
+    .map_err(|_| rpc_timeout("writing request"))?
+    .map_err(|error| io_context("writing request", &error))?;
+    let reply = tokio::time::timeout(timeout, read_reply(stream))
+        .await
+        .map_err(|_| rpc_timeout("reading reply"))??;
+    decode_reply(&reply)
+}
+
+/// A complete reply is buffered before returning, so a reconnect never mixes
+/// the old stream's partial bytes with the replacement stream's reply.
+async fn read_reply(stream: &mut BufReader<Stream>) -> Result<String> {
+    let mut buf = Vec::new();
+    loop {
+        let chunk = stream
+            .fill_buf()
+            .await
+            .map_err(|error| io_context("reading reply", &error))?;
+        if chunk.is_empty() {
+            return Err(rpc_io("reading reply", "peer closed the stream"));
+        }
+        let newline = chunk.iter().position(|&b| b == b'\n');
+        let take = newline.unwrap_or(chunk.len());
+        if buf.len().saturating_add(take) > MAX_REPLY_BYTES {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "control RPC reading reply: control reply too long",
+            )));
+        }
+        buf.extend_from_slice(chunk.get(..take).unwrap_or_default());
+        stream.consume(take.saturating_add(usize::from(newline.is_some())));
+        if newline.is_some() {
+            break;
+        }
+    }
+    String::from_utf8(buf).map_err(|_| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "control RPC reading reply: control reply not UTF-8",
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -639,12 +819,14 @@ mod tests {
             reader.read_to_end(&mut remaining).await.unwrap()
         });
         let mut client = Client {
-            _network: p2p::transport::test_support::network(
+            network: p2p::transport::test_support::network(
                 p2p::address::NetAddr::TorV3([45; 32]),
                 &[],
             )
             .0,
-            stream: BufReader::new(Stream::Memory(client_stream)),
+            stream: Some(BufReader::new(Stream::Memory(client_stream))),
+            endpoint: None,
+            closed: false,
             timeout: CALL_TIMEOUT,
         };
         client.call("auth test-token").await.unwrap();
@@ -829,18 +1011,17 @@ mod tests {
     async fn a_silent_node_times_out_instead_of_hanging() {
         let (stream, _held) = tokio::io::duplex(4096);
         let mut client = Client {
-            _network: p2p::transport::test_support::network(
+            network: p2p::transport::test_support::network(
                 p2p::address::NetAddr::TorV3([45; 32]),
                 &[],
             )
             .0,
-            stream: BufReader::new(Stream::Memory(stream)),
+            stream: Some(BufReader::new(Stream::Memory(stream))),
+            endpoint: None,
+            closed: false,
             timeout: Duration::from_millis(100),
         };
-        assert!(matches!(
-            client.call("status").await,
-            Err(Error::Argument(_))
-        ));
+        assert!(matches!(client.call("status").await, Err(Error::Io(_))));
     }
 
     #[tokio::test]
@@ -848,12 +1029,14 @@ mod tests {
         let (stream, server) = tokio::io::duplex(4096);
         drop(server);
         let mut client = Client {
-            _network: p2p::transport::test_support::network(
+            network: p2p::transport::test_support::network(
                 p2p::address::NetAddr::TorV3([45; 32]),
                 &[],
             )
             .0,
-            stream: BufReader::new(Stream::Memory(stream)),
+            stream: Some(BufReader::new(Stream::Memory(stream))),
+            endpoint: None,
+            closed: false,
             timeout: Duration::from_secs(2),
         };
         assert!(client.call("status").await.is_err());
@@ -899,6 +1082,241 @@ mod tests {
         }
         line.clear();
         assert_eq!(raw.read_line(&mut line).await.unwrap(), 0, "closed");
+    }
+
+    /// Accepts only authentication, leaving the next request to a scripted peer.
+    async fn authenticate_test_stream(stream: Stream) -> BufReader<Stream> {
+        let mut stream = BufReader::new(stream);
+        let mut line = String::new();
+        stream.read_line(&mut line).await.unwrap();
+        assert_eq!(line, "auth test-token\n");
+        stream.get_mut().write_all(b"ok\n").await.unwrap();
+        stream.get_mut().flush().await.unwrap();
+        stream
+    }
+
+    #[tokio::test]
+    async fn read_request_recovers_after_partial_reply_on_a_fresh_authenticated_stream() {
+        let identity = p2p::address::NetAddr::TorV3([151; 32]);
+        let (server, mut incoming) = p2p::transport::test_support::network(identity, &[18444]);
+        let (network, _) =
+            p2p::transport::test_support::network(p2p::address::NetAddr::TorV3([152; 32]), &[]);
+        let task = tokio::spawn(async move {
+            let _server = server;
+            for bytes in [b"ok incomplete".as_slice(), b"ok height=42\n".as_slice()] {
+                let mut stream =
+                    authenticate_test_stream(incoming.recv().await.unwrap().stream).await;
+                let mut line = String::new();
+                stream.read_line(&mut line).await.unwrap();
+                assert_eq!(line, "status\n");
+                stream.get_mut().write_all(bytes).await.unwrap();
+                stream.get_mut().flush().await.unwrap();
+                // The first stream closes in the middle of its reply.
+            }
+        });
+        let mut client = Client::connect(
+            &network,
+            &identity.endpoint(18444),
+            &Token::new("test-token").unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(client.call("status").await.unwrap(), "height=42");
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropped_read_replies_have_a_bounded_retry_budget() {
+        let identity = p2p::address::NetAddr::TorV3([153; 32]);
+        let (server, mut incoming) = p2p::transport::test_support::network(identity, &[18444]);
+        let (network, _) =
+            p2p::transport::test_support::network(p2p::address::NetAddr::TorV3([154; 32]), &[]);
+        let task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let mut stream =
+                    authenticate_test_stream(incoming.recv().await.unwrap().stream).await;
+                let mut line = String::new();
+                stream.read_line(&mut line).await.unwrap();
+                assert_eq!(line, "hash 0\n");
+            }
+            (server, incoming)
+        });
+        let mut client = Client::connect(
+            &network,
+            &identity.endpoint(18444),
+            &Token::new("test-token").unwrap(),
+        )
+        .await
+        .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), client.call("hash 0"))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(result.to_string().contains("reading reply"));
+        let (_server, mut incoming) = task.await.unwrap();
+        assert!(
+            incoming.try_recv().is_err(),
+            "only one reconnect is allowed per read"
+        );
+    }
+
+    #[tokio::test]
+    async fn uncertain_submission_is_never_replayed_and_error_does_not_echo_payload() {
+        let identity = p2p::address::NetAddr::TorV3([155; 32]);
+        let (server, mut incoming) = p2p::transport::test_support::network(identity, &[18444]);
+        let (network, _) =
+            p2p::transport::test_support::network(p2p::address::NetAddr::TorV3([156; 32]), &[]);
+        let task = tokio::spawn(async move {
+            let mut stream = authenticate_test_stream(incoming.recv().await.unwrap().stream).await;
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "submit private-payload\n");
+            drop(stream); // It may have applied the request, but its reply was lost.
+            (server, incoming)
+        });
+        let mut client = Client::connect(
+            &network,
+            &identity.endpoint(18444),
+            &Token::new("test-token").unwrap(),
+        )
+        .await
+        .unwrap();
+        let error = client
+            .call("submit private-payload")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("outcome unknown"));
+        assert!(!error.contains("private-payload"));
+        assert!(!error.contains("test-token"));
+        let (_server, mut incoming) = task.await.unwrap();
+        assert!(
+            incoming.try_recv().is_err(),
+            "a mutation must never reconnect/replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_errors_and_explicit_close_do_not_reconnect() {
+        let identity = p2p::address::NetAddr::TorV3([157; 32]);
+        let (server, mut incoming) = p2p::transport::test_support::network(identity, &[18444]);
+        let (network, _) =
+            p2p::transport::test_support::network(p2p::address::NetAddr::TorV3([158; 32]), &[]);
+        let task = tokio::spawn(async move {
+            let mut stream = authenticate_test_stream(incoming.recv().await.unwrap().stream).await;
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "hash 500\n");
+            stream
+                .get_mut()
+                .write_all(b"err not found\n")
+                .await
+                .unwrap();
+            stream.get_mut().flush().await.unwrap();
+            line.clear();
+            assert_eq!(stream.read_line(&mut line).await.unwrap(), 0);
+            (server, incoming)
+        });
+        let mut client = Client::connect(
+            &network,
+            &identity.endpoint(18444),
+            &Token::new("test-token").unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(client.call("status\nsubmit injected").await.is_err());
+        assert!(matches!(client.call("hash 500").await,
+            Err(Error::Argument(reason)) if reason == "not found"));
+        client.close().await.unwrap();
+        client.close().await.unwrap();
+        assert!(client
+            .call("status")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("explicitly closed"));
+        let (_server, mut incoming) = task.await.unwrap();
+        assert!(incoming.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn dropped_authentication_transport_is_retried_without_leaking_token() {
+        let identity = p2p::address::NetAddr::TorV3([159; 32]);
+        let (server, mut incoming) = p2p::transport::test_support::network(identity, &[18444]);
+        let (network, _) =
+            p2p::transport::test_support::network(p2p::address::NetAddr::TorV3([160; 32]), &[]);
+        let task = tokio::spawn(async move {
+            let _server = server;
+            let mut first = BufReader::new(incoming.recv().await.unwrap().stream);
+            let mut line = String::new();
+            first.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "auth test-token\n");
+            drop(first);
+            let mut next = authenticate_test_stream(incoming.recv().await.unwrap().stream).await;
+            line.clear();
+            next.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "status\n");
+            next.get_mut().write_all(b"ok height=7\n").await.unwrap();
+            next.get_mut().flush().await.unwrap();
+        });
+        let mut client = Client::connect(
+            &network,
+            &identity.endpoint(18444),
+            &Token::new("test-token").unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(client.call("status").await.unwrap(), "height=7");
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unexpected_authentication_reply_is_not_retried_or_echoed() {
+        let identity = p2p::address::NetAddr::TorV3([161; 32]);
+        let (server, mut incoming) = p2p::transport::test_support::network(identity, &[18444]);
+        let (network, _) =
+            p2p::transport::test_support::network(p2p::address::NetAddr::TorV3([162; 32]), &[]);
+        let task = tokio::spawn(async move {
+            let mut stream = BufReader::new(incoming.recv().await.unwrap().stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            stream
+                .get_mut()
+                .write_all(b"err test-token\n")
+                .await
+                .unwrap();
+            stream.get_mut().flush().await.unwrap();
+            (server, incoming)
+        });
+        let result = Client::connect(
+            &network,
+            &identity.endpoint(18444),
+            &Token::new("test-token").unwrap(),
+        )
+        .await;
+        let error = result.err().expect("unexpected auth response must fail");
+        assert!(!error.to_string().contains("test-token"));
+        assert!(
+            matches!(&error, Error::Io(error) if error.kind() == std::io::ErrorKind::InvalidData)
+        );
+        let (_server, mut incoming) = task.await.unwrap();
+        assert!(incoming.try_recv().is_err());
+    }
+
+    #[test]
+    fn reply_framing_is_unambiguous_and_does_not_echo_invalid_data() {
+        assert_eq!(decode_reply("ok").unwrap(), "");
+        assert_eq!(decode_reply("ok height=2").unwrap(), "height=2");
+        assert!(
+            matches!(decode_reply("err not found"), Err(Error::Argument(reason)) if reason == "not found")
+        );
+        for line in ["okay", "okprivate-data", "unexpected-private-data"] {
+            let error = decode_reply(line).unwrap_err();
+            assert!(
+                matches!(&error, Error::Io(error) if error.kind() == std::io::ErrorKind::InvalidData)
+            );
+            assert!(!error.to_string().contains(line));
+        }
     }
 
     #[test]

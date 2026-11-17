@@ -197,18 +197,19 @@ pub fn start(
     events: mpsc::Sender<Event>,
     tip: watch::Receiver<BlockHash>,
 ) -> Miner {
-    start_with_tor(payout, params, threads, events, tip, None)
+    start_for_node(payout, params, threads, events, tip, None, None)
 }
 
-/// Starts workers that also cancel their current work when the node's
-/// embedded Tor service loses readiness. Offline nodes pass no status.
-pub(crate) fn start_with_tor(
+/// Starts workers that cancel work when transport, peers or sync lose readiness.
+/// Offline nodes pass no Tor status.
+pub(crate) fn start_for_node(
     payout: RhombusAddress,
     params: ChainParams,
     threads: usize,
     events: mpsc::Sender<Event>,
     tip: watch::Receiver<BlockHash>,
     tor_status: Option<watch::Receiver<TorStatus>>,
+    mining_allowed: Option<watch::Receiver<bool>>,
 ) -> Miner {
     let threads = threads.max(1);
     let stop = Arc::new(AtomicBool::new(false));
@@ -230,6 +231,7 @@ pub(crate) fn start_with_tor(
                 stop: Arc::clone(&flag),
                 tip: tip.clone(),
                 tor_status: tor_status.clone(),
+                mining_allowed: mining_allowed.clone(),
             };
             workers.push(tokio::spawn(worker.run(events.clone())));
         }
@@ -260,6 +262,12 @@ fn worth_mining(
         && tor_status.is_none_or(crate::tor::service_ready)
 }
 
+/// A live node can revoke work for peer loss or sync even when Tor and tip
+/// have not changed. Standalone offline workers have no policy watch.
+fn policy_allows_mining(allowed: Option<&watch::Receiver<bool>>) -> bool {
+    allowed.is_none_or(|ready| ready.has_changed().is_ok() && *ready.borrow())
+}
+
 /// What one worker needs.
 struct Worker {
     payout: RhombusAddress,
@@ -268,6 +276,7 @@ struct Worker {
     stop: Arc<AtomicBool>,
     tip: watch::Receiver<BlockHash>,
     tor_status: Option<watch::Receiver<TorStatus>>,
+    mining_allowed: Option<watch::Receiver<bool>>,
 }
 
 impl Worker {
@@ -297,12 +306,14 @@ impl Worker {
                 template.parent.hash(),
             );
             let tor_status = self.tor_status.clone();
+            let mining_allowed = self.mining_allowed.clone();
             // Proving and solving are CPU-bound; run them on the blocking pool
             // so many workers use many cores without starving the runtime.
             let found = tokio::task::spawn_blocking(move || {
                 let mut rng = rand::rngs::OsRng;
                 template.mine(&payout, pk.as_ref(), &pow, &mut rng, || {
                     worth_mining(&stop, &tip, parent, tor_status.as_ref())
+                        && policy_allows_mining(mining_allowed.as_ref())
                 })
             })
             .await
@@ -373,5 +384,17 @@ mod tests {
         assert!(can_mine(), "recovery permits work again");
         drop(status);
         assert!(!can_mine(), "a stopped supervisor must block mining");
+    }
+    #[test]
+    fn peer_or_sync_policy_revokes_work_without_a_tip_change() {
+        let (policy, watched) = watch::channel(true);
+        assert!(policy_allows_mining(Some(&watched)));
+        policy.send_replace(false);
+        assert!(!policy_allows_mining(Some(&watched)));
+        policy.send_replace(true);
+        assert!(policy_allows_mining(Some(&watched)));
+        drop(policy);
+        assert!(!policy_allows_mining(Some(&watched)));
+        assert!(policy_allows_mining(None));
     }
 }

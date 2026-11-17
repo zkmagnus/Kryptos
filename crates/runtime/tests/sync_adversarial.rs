@@ -13,10 +13,11 @@ use chain::chain::{Chain, Import};
 use chain::params::ChainParams;
 use chain::validate::{header_lookback, recent_headers};
 use crypto::keys::SpendingKey;
-use p2p::message::{Inventory, Message, MAX_HEADERS, MAX_INVENTORY};
+use p2p::message::{CompactBlock, Inventory, Message, MAX_HEADERS, MAX_INVENTORY};
 use p2p::peer::version_info;
 use p2p::transport::{split, ConnectionReader, ConnectionWriter};
 use protocol::block::{Block, BlockHash};
+use protocol::transaction::TxId;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 use runtime::config::Config;
@@ -93,16 +94,7 @@ impl Peer {
             runtime::now(),
         )))
         .await;
-        let mut version = false;
-        let mut verack = false;
-        while !version || !verack {
-            match peer.next().await {
-                Message::Version(_) => version = true,
-                Message::Verack => verack = true,
-                other => panic!("unexpected handshake message: {other:?}"),
-            }
-        }
-        peer.send(Message::Verack).await;
+        assert!(matches!(peer.next().await, Message::Version(_)));
         peer
     }
 
@@ -167,6 +159,100 @@ async fn listener(network: &TorFixture) -> Handle {
             ..Config::test()
         })
         .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_block_inventory_requests_headers_before_any_body() {
+    let genesis = chain::genesis::genesis(&ChainParams::test());
+    let network = TorFixture::new();
+    let node = listener(&network).await;
+    let mut peer = Peer::connect(&network, &node, 0, genesis.hash()).await;
+    peer.barrier(100).await;
+    peer.send(Message::Inv(vec![Inventory::Block(BlockHash::from_bytes(
+        [123; 32],
+    ))]))
+    .await;
+    peer.send(Message::Ping(101)).await;
+
+    let mut requested_headers = false;
+    loop {
+        match peer.next().await {
+            Message::GetHeaders { locator, .. } => {
+                assert_eq!(locator, vec![genesis.hash()]);
+                requested_headers = true;
+            }
+            Message::GetData(_) => panic!("unverified block inventory triggered a body download"),
+            Message::Pong(101) => break,
+            Message::Ping(nonce) => peer.send(Message::Pong(nonce)).await,
+            _ => {}
+        }
+    }
+    assert!(requested_headers);
+    assert_eq!(status(&node).await, (0, genesis.hash(), true));
+    peer.send(Message::Headers(Vec::new())).await;
+    peer.barrier(102).await;
+    assert_eq!(status(&node).await, (0, genesis.hash(), false));
+    node.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wrong_compact_nbits_cannot_trigger_a_transaction_download() {
+    let [genesis, parent, _] = blocks();
+    let network = TorFixture::new();
+    let node = listener(&network).await;
+    let mut peer = Peer::connect(&network, &node, 0, genesis.hash()).await;
+    peer.barrier(103).await;
+    let mut compact = CompactBlock::from_block(parent).unwrap();
+    compact.header.target = 0x2100_ffff;
+    // Without validating the header first, this absent transaction would
+    // trigger GetBlockTxn even though the claimed difficulty is invalid.
+    compact.txids.push(TxId::from_bytes([124; 32]));
+    peer.send(Message::CompactBlock(Box::new(compact))).await;
+
+    tokio::time::timeout(DEADLINE, async {
+        loop {
+            match peer.reader.recv().await {
+                Err(_) => break,
+                Ok(Message::GetBlockTxn { .. } | Message::GetData(_)) => {
+                    panic!("invalid compact nBits triggered a body download")
+                }
+                Ok(Message::Ping(nonce)) => peer.send(Message::Pong(nonce)).await,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await
+    .expect("invalid compact header was not disconnected");
+    assert_eq!(status(&node).await, (0, genesis.hash(), false));
+    node.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_header_with_wrong_nbits_is_rejected_before_body_download() {
+    let [genesis, parent, _] = blocks();
+    let network = TorFixture::new();
+    let node = listener(&network).await;
+    let mut peer = Peer::connect(&network, &node, 1, genesis.hash()).await;
+    peer.until(|message| matches!(message, Message::GetHeaders { .. }))
+        .await;
+    let mut header = parent.header().clone();
+    header.target = 0x2100_ffff;
+    peer.send(Message::Headers(vec![header])).await;
+    peer.send(Message::Ping(99)).await;
+    loop {
+        match peer.next().await {
+            Message::GetData(_) => panic!("invalid nBits triggered a body download"),
+            Message::Pong(99) => break,
+            Message::Ping(nonce) => peer.send(Message::Pong(nonce)).await,
+            _ => {}
+        }
+    }
+    assert_eq!(status(&node).await, (0, genesis.hash(), false));
+    let Response::Peers(peers) = node.request(Request::Peers).await.unwrap() else {
+        panic!("peers response")
+    };
+    assert!(peers[0].score > 0);
+    node.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

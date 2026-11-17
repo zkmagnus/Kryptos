@@ -1,7 +1,7 @@
 //! The message set. Every message is `tag || payload` with the canonical
 //! encodings of the protocol crate; lists carry a `u32` count bounded by
-//! a per-list limit. There is no user agent and no optional field: every
-//! node speaks exactly the same bytes.
+//! a per-list limit. There is no user agent: all nodes use the same version
+//! layout and message set.
 
 use crate::address::{NetAddr, PeerKey};
 use protocol::block::{Block, BlockHash, BlockHeader};
@@ -12,7 +12,7 @@ use protocol::transaction::{Transaction, TxId};
 use crate::{Error, Result};
 
 /// The only protocol version.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 /// Upper bound on one encoded message, large enough for a maximum-size block.
 pub const MAX_MESSAGE_LEN: usize = 50 * 1024 * 1024;
 /// Most inventory items in one message.
@@ -29,7 +29,8 @@ pub const MAX_ADDRESSES: usize = 1_000;
 pub struct VersionInfo {
     /// Protocol version.
     pub version: u32,
-    /// Random nonce to detect connecting to ourselves.
+    /// Fresh per-connection random nonce for self-detection and duplicate linking.
+    /// An outbound nonce must never be reused in responses on inbound streams.
     pub nonce: u64,
     /// Height of the sender's tip.
     pub best_height: u32,
@@ -39,7 +40,7 @@ pub struct VersionInfo {
     pub timestamp: u64,
     /// Advertised application capabilities; bit zero means full block service.
     pub services: u64,
-    /// Claimed onion endpoint; inbound claims require a successful dial-back.
+    /// Claimed onion endpoint; an inbound claim alone is not authenticated.
     pub onion: Option<PeerKey>,
 }
 
@@ -98,6 +99,12 @@ pub enum Message {
     Version(VersionInfo),
     /// Handshake: version accepted.
     Verack,
+    /// Link simultaneous opposite-direction connections without delaying readiness.
+    /// The sender forwards an inbound Version nonce exclusively over its already
+    /// authenticated outbound stream to the claimed onion. The receiver accepts
+    /// it only if it matches a live outbound nonce sent to that same onion.
+    /// Never echo a token on the inbound stream that supplied it.
+    ConnectionLink(u64),
     /// Keepalive request.
     Ping(u64),
     /// Keepalive reply.
@@ -197,6 +204,7 @@ mod tag {
     pub const COMPACT_BLOCK: u8 = 15;
     pub const GET_BLOCK_TXN: u8 = 16;
     pub const BLOCK_TXN: u8 = 17;
+    pub const CONNECTION_LINK: u8 = 18;
 }
 
 impl Message {
@@ -205,6 +213,7 @@ impl Message {
         match self {
             Self::Version(_) => tag::VERSION,
             Self::Verack => tag::VERACK,
+            Self::ConnectionLink(_) => tag::CONNECTION_LINK,
             Self::Ping(_) => tag::PING,
             Self::Pong(_) => tag::PONG,
             Self::GetAddr => tag::GET_ADDR,
@@ -241,7 +250,7 @@ impl Message {
                 }
             }
             Self::Verack | Self::GetAddr => {}
-            Self::Ping(n) | Self::Pong(n) => {
+            Self::Ping(n) | Self::Pong(n) | Self::ConnectionLink(n) => {
                 w.put_u64_le(*n);
             }
             Self::Addr(addrs) => {
@@ -326,6 +335,7 @@ impl Message {
                 },
             }),
             tag::VERACK => Self::Verack,
+            tag::CONNECTION_LINK => Self::ConnectionLink(r.take_u64_le()?),
             tag::PING => Self::Ping(r.take_u64_le()?),
             tag::PONG => Self::Pong(r.take_u64_le()?),
             tag::GET_ADDR => Self::GetAddr,
@@ -452,6 +462,7 @@ mod tests {
                 onion: Some((NetAddr::TorV3([7; 32]), 19000)),
             }),
             Message::Verack,
+            Message::ConnectionLink(3),
             Message::Ping(1),
             Message::Pong(2),
             Message::GetAddr,
@@ -516,6 +527,23 @@ mod tests {
             Err(Error::ListTooLong("inventory"))
         ));
         assert!(Message::decode(&[tag::PING, 1, 2]).is_err(), "truncated");
+    }
+
+    #[test]
+    fn connection_link_requires_exactly_one_nonce() {
+        for nonce in [0, 1, u64::MAX] {
+            let message = Message::ConnectionLink(nonce);
+            let bytes = message.encode();
+            assert_eq!(bytes.len(), 9);
+            assert_eq!(bytes.first(), Some(&tag::CONNECTION_LINK));
+            assert_eq!(Message::decode(&bytes).unwrap(), message);
+            for len in 0..bytes.len() {
+                assert!(Message::decode(&bytes[..len]).is_err());
+            }
+            let mut extra = bytes;
+            extra.push(0);
+            assert!(Message::decode(&extra).is_err());
+        }
     }
 
     #[test]

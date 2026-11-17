@@ -2,12 +2,14 @@
 
 use std::mem::size_of;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use p2p::address::{NetAddr, PeerKey};
 use p2p::message::{Message, MAX_MESSAGE_LEN};
 use p2p::peer::Direction;
-use p2p::transport::{split, ConnectionReader, ConnectionWriter, Stream, TorNetwork, TorStatus};
+use p2p::transport::{
+    split, ConnectionReader, ConnectionWriter, Stream, TorNetwork, TorSettings, TorStatus,
+};
 use protocol::action::{Action, ACTION_LEN};
 use protocol::block::{Block, BlockHeader, HEADER_LEN};
 use protocol::consensus::MAX_BLOCK_TRANSACTIONS;
@@ -27,11 +29,31 @@ const GLOBAL_OUTBOX_BYTES: usize = 1024 * 1024 * 1024;
 const CONTROL_HEADROOM: usize = 512 * 1024;
 /// Conservative framing scratch allowance for each outbound message.
 const WRITE_SCRATCH: usize = 128 * 1024;
-/// A peer that cannot accept one message for this long is disconnected so
-/// outbound permits cannot be held indefinitely by a slow reader.
-const OUTBOUND_WRITE_TIMEOUT: Duration = Duration::from_secs(120);
-
+// Queued permits are retained through the configured per-message write deadline.
 static OUTBOUND_BYTES: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+/// Metadata recorded only after a request frame reaches the transport.
+#[derive(Debug)]
+pub enum Sent {
+    /// Ticket of a flushed headers request.
+    Headers {
+        /// Sync session identifier.
+        epoch: u64,
+        /// Reservation identifier within the session.
+        request: u64,
+    },
+    /// Flushed block-body requests.
+    Blocks {
+        /// Sync session identifier.
+        epoch: u64,
+        /// Hashes and reservation identifiers within the session.
+        requests: Vec<(protocol::block::BlockHash, u64)>,
+    },
+    /// A keepalive whose RTT starts at this write.
+    Ping(u64),
+    /// Traffic with no response deadline.
+    Other,
+}
 
 /// A peer's outbound queue, bounded by both message count and memory charges.
 /// Dropping its last clone cancels the connection and discards the backlog.
@@ -62,6 +84,7 @@ pub struct Reservation {
 #[derive(Debug)]
 struct Queued {
     message: Message,
+    sent: Option<Sent>,
     _reservation: Reservation,
 }
 
@@ -143,6 +166,30 @@ impl Outbox {
         self.sender
             .try_send(Queued {
                 message,
+                sent: None,
+                _reservation: reservation,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => SendError::Full,
+                mpsc::error::TrySendError::Closed(_) => SendError::Closed,
+            })
+    }
+
+    /// Queues a request with its local deadline ticket; tickets never go on wire.
+    ///
+    /// # Errors
+    /// Same queue and memory admission failures as [`Self::try_send`].
+    pub fn try_send_tracked(
+        &self,
+        message: Message,
+        sent: Sent,
+    ) -> std::result::Result<(), SendError> {
+        let bytes = message_charge(&message).ok_or(SendError::TooLarge)?;
+        let reservation = self.reserve(bytes, 0).ok_or(SendError::Full)?;
+        self.sender
+            .try_send(Queued {
+                message,
+                sent: Some(sent),
                 _reservation: reservation,
             })
             .map_err(|error| match error {
@@ -207,7 +254,7 @@ fn message_charge(message: &Message) -> Option<usize> {
     let (payload, heap) = match message {
         Message::Version(_) => (4 + 8 + 4 + 32 + 8 + 8 + 1 + 36, 0),
         Message::Verack | Message::GetAddr => (0, 0),
-        Message::Ping(_) | Message::Pong(_) => (8, 0),
+        Message::Ping(_) | Message::Pong(_) | Message::ConnectionLink(_) => (8, 0),
         Message::Addr(items) => (
             4usize.checked_add(items.len().checked_mul(44)?)?,
             items
@@ -281,14 +328,17 @@ fn block_charge(encoded_len: usize) -> Option<usize> {
         .checked_add(size_of::<Block>().checked_add(size_of::<Message>())?)?;
     charge(encoded_len.checked_add(1)?, retained)
 }
-/// Bounds onion circuit creation.
-const DIAL_TIMEOUT: Duration = Duration::from_secs(120);
 /// Connections waiting for admission to the node actor at once.
 /// Application handshake and inbound-slot limits are enforced by the node.
 pub const MAX_PENDING_INBOUND: usize = 8;
 
 /// Admits one anonymous onion stream to the node actor.
-pub async fn accept(stream: Stream, events: mpsc::Sender<Event>, id: PeerId) {
+pub async fn accept(
+    stream: Stream,
+    events: mpsc::Sender<Event>,
+    id: PeerId,
+    settings: TorSettings,
+) {
     run_connection(
         Accepted {
             stream,
@@ -297,6 +347,8 @@ pub async fn accept(stream: Stream, events: mpsc::Sender<Event>, id: PeerId) {
             target: "inbound onion stream".into(),
             endpoint: None,
             permit: None,
+            settings,
+            connect_time: None,
         },
         events,
     )
@@ -312,6 +364,8 @@ struct Accepted {
     endpoint: Option<PeerKey>,
     /// The admission slot, released once the node receives the connection.
     permit: Option<OwnedSemaphorePermit>,
+    settings: TorSettings,
+    connect_time: Option<Duration>,
 }
 
 /// An onion destination and its shared embedded Tor client.
@@ -324,6 +378,8 @@ pub struct Route {
     pub own: Option<NetAddr>,
     /// Readiness gate; a Tor outage cancels even an in-progress dial.
     pub readiness: watch::Receiver<TorStatus>,
+    /// Node-configured stream deadlines, also honored by test transports.
+    pub settings: TorSettings,
 }
 
 /// Dials through an isolated stream on the embedded Tor client.
@@ -361,6 +417,8 @@ pub fn dial(route: Route, id: PeerId, events: mpsc::Sender<Event>) -> JoinHandle
                 .await;
             return;
         }
+        let started = Instant::now();
+        let settings = route.settings;
         let connected = tokio::select! {
             biased;
             () = unavailable(&mut readiness) => {
@@ -368,7 +426,7 @@ pub fn dial(route: Route, id: PeerId, events: mpsc::Sender<Event>) -> JoinHandle
                 return;
             }
             connected = tokio::time::timeout(
-                DIAL_TIMEOUT,
+                settings.connect_timeout,
                 route.network.connect(&route.target),
             ) => connected,
         };
@@ -382,6 +440,8 @@ pub fn dial(route: Route, id: PeerId, events: mpsc::Sender<Event>) -> JoinHandle
                         target: route.target,
                         endpoint: Some(endpoint),
                         permit: None,
+                        settings,
+                        connect_time: Some(started.elapsed()),
                     },
                     events,
                 )
@@ -419,6 +479,8 @@ async fn run_connection(accepted: Accepted, events: mpsc::Sender<Event>) {
         target,
         endpoint,
         permit,
+        settings,
+        connect_time,
     } = accepted;
     let (writer, reader) = split(stream);
     let global = OUTBOUND_BYTES.get_or_init(|| Arc::new(Semaphore::new(GLOBAL_OUTBOX_BYTES)));
@@ -430,6 +492,7 @@ async fn run_connection(accepted: Accepted, events: mpsc::Sender<Event>) {
             addr: endpoint,
             target,
             outbox,
+            connect_time,
         })
         .await
         .is_err()
@@ -442,19 +505,10 @@ async fn run_connection(accepted: Accepted, events: mpsc::Sender<Event>) {
     tokio::select! {
         biased;
         _ = closed.changed() => {}
-        () = read_loop(reader, id, &events) => {}
-        () = write_loop(writer, inbox, id, &events) => {}
+        () = read_loop(reader, id, &events, &settings) => {}
+        () = write_loop_within(writer, inbox, id, &events, settings.message_timeout) => {}
     }
     let _ = events.send(Event::Disconnected { id }).await;
-}
-
-async fn write_loop(
-    writer: ConnectionWriter,
-    inbox: mpsc::Receiver<Queued>,
-    id: PeerId,
-    events: &mpsc::Sender<Event>,
-) {
-    write_loop_within(writer, inbox, id, events, OUTBOUND_WRITE_TIMEOUT).await;
 }
 
 async fn write_loop_within(
@@ -464,18 +518,58 @@ async fn write_loop_within(
     events: &mpsc::Sender<Event>,
     deadline: Duration,
 ) {
-    while let Some(queued) = inbox.recv().await {
+    while let Some(mut queued) = inbox.recv().await {
         match tokio::time::timeout(deadline, writer.send(&queued.message)).await {
             Ok(Ok(())) => {}
             Ok(Err(_)) | Err(_) => break,
         }
+        // A queued request is not in flight until its complete frame is flushed.
+        let sent = queued.sent.take().unwrap_or(match &queued.message {
+            Message::Ping(nonce) => Sent::Ping(*nonce),
+            _ => Sent::Other,
+        });
+        let at = Instant::now();
+        let timestamp = crate::now();
+        let bytes = writer.sent_bytes();
         drop(queued);
+        if events
+            .send(Event::Sent {
+                id,
+                sent,
+                at,
+                timestamp,
+                bytes,
+            })
+            .await
+            .is_err()
+        {
+            break;
+        }
         let _ = events.try_send(Event::Writable { id });
     }
 }
 
-async fn read_loop(mut reader: ConnectionReader, id: PeerId, events: &mpsc::Sender<Event>) {
-    while let Ok(message) = reader.recv().await {
+async fn read_loop(
+    mut reader: ConnectionReader,
+    id: PeerId,
+    events: &mpsc::Sender<Event>,
+    settings: &TorSettings,
+) {
+    while let Ok(message) = reader
+        .recv_with_timeouts(settings.idle_timeout, settings.message_timeout)
+        .await
+    {
+        if events
+            .send(Event::Received {
+                id,
+                bytes: reader.received_bytes(),
+                at: Instant::now(),
+            })
+            .await
+            .is_err()
+        {
+            break;
+        }
         if events
             .send(Event::Message {
                 id,
@@ -678,6 +772,7 @@ mod tests {
         dial(
             Route {
                 readiness: network.status(),
+                settings: TorSettings::default(),
                 network,
                 target: target.clone(),
                 own: Some(own),
@@ -705,6 +800,7 @@ mod tests {
             dial(
                 Route {
                     readiness: network.status(),
+                    settings: TorSettings::default(),
                     network: Arc::clone(&network),
                     target: target.into(),
                     own: None,
@@ -730,6 +826,7 @@ mod tests {
         dial(
             Route {
                 readiness: network.status(),
+                settings: TorSettings::default(),
                 network,
                 target: NetAddr::TorV3([82; 32]).endpoint(19000),
                 own: None,

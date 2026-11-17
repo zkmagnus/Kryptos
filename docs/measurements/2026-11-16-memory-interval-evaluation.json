@@ -1,0 +1,46 @@
+{
+  "transport": "memory_with_fixed_frame_delay",
+  "paths": [
+    {
+      "path": "first_hop",
+      "samples": 4,
+      "p50_seconds": 0.366986,
+      "p90_seconds": 0.37164,
+      "p95_seconds": 0.37164
+    },
+    {
+      "path": "second_hop",
+      "samples": 4,
+      "p50_seconds": 0.584354,
+      "p90_seconds": 0.591099,
+      "p95_seconds": 0.591099
+    }
+  ],
+  "local_stale_fraction": 0.0,
+  "competing_miners": false,
+  "candidate_interval_model": [
+    {
+      "target_seconds": 10,
+      "measured_path_p95_fraction_of_interval": 0.05910990000000001,
+      "poisson_next_block_during_path_probability": 0.05739682862402827
+    },
+    {
+      "target_seconds": 30,
+      "measured_path_p95_fraction_of_interval": 0.0197033,
+      "poisson_next_block_during_path_probability": 0.019510458598726542
+    },
+    {
+      "target_seconds": 60,
+      "measured_path_p95_fraction_of_interval": 0.00985165,
+      "poisson_next_block_during_path_probability": 0.00980328146308551
+    }
+  ],
+  "decision": "Keep the current consensus interval unchanged pending a distributed public-Tor campaign with competing miners.",
+  "limitations": [
+    "The Poisson calculation is P(at least one new block in a fixed delay) at constant aggregate block arrival rate; it is not an orphan or attack-cost estimate.",
+    "No candidate is approved by this calculation, and a small path-to-interval ratio is not a security proof.",
+    "Path timing includes source validation; it does not establish propagation to most hashrate.",
+    "Zero observed stales without competing miners does not establish a low stale rate under contention.",
+    "Small samples produce unstable tail quantiles. Repeat warm/cold, geographic, block-size and proof-count scenarios before changing consensus."
+  ]
+}

@@ -76,18 +76,7 @@ impl Client {
             )))
             .await
             .unwrap();
-        let mut version = false;
-        let mut verack = false;
-        while !version || !verack {
-            match client.recv().await {
-                Message::Version(_) => {
-                    version = true;
-                    client.writer.send(&Message::Verack).await.unwrap();
-                }
-                Message::Verack => verack = true,
-                other => panic!("unexpected handshake message {other:?}"),
-            }
-        }
+        assert!(matches!(client.recv().await, Message::Version(_)));
         client.barrier().await;
         client
     }
@@ -188,7 +177,7 @@ async fn a_wallet_discovers_a_listener_that_joins_its_seed_later() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_full_seed_verifies_and_relays_a_new_inbound_listening_node() {
+async fn a_full_seed_keeps_its_pool_and_does_not_gossip_an_unverified_inbound_claim() {
     let network = TorFixture::new();
     let mut bootstrap = Vec::new();
     for _ in 0..OUTBOUND_TARGET {
@@ -212,7 +201,7 @@ async fn a_full_seed_verifies_and_relays_a_new_inbound_listening_node() {
         peers(&seed)
             .await
             .iter()
-            .filter(|p| p.ready && p.direction == Direction::Outbound)
+            .filter(|p| p.ready && p.addr.is_some())
             .count()
             == OUTBOUND_TARGET
     })
@@ -226,24 +215,24 @@ async fn a_full_seed_verifies_and_relays_a_new_inbound_listening_node() {
         })
         .await;
     let expected = address(newcomer.onion_addr.unwrap()).key();
-    tokio::time::timeout(DEADLINE, async {
-        while !observer
-            .get_addr()
+    wait_for(&[&newcomer], async || {
+        peers(&newcomer)
             .await
             .iter()
-            .any(|a| a.key() == expected)
-        {
-            tick(&[&seed], REPLY_TICKS).await;
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+            .any(|peer| peer.ready && peer.direction == Direction::Outbound)
     })
-    .await
-    .unwrap();
+    .await;
+    tick(&[&seed], REPLY_TICKS).await;
+    let announced = observer.get_addr().await;
+    assert!(
+        !announced.iter().any(|address| address.key() == expected),
+        "a full pool must not open an extra verification rendezvous or gossip a bare inbound claim"
+    );
     assert_eq!(
         peers(&seed)
             .await
             .iter()
-            .filter(|p| p.ready && p.direction == Direction::Outbound)
+            .filter(|p| p.ready && p.addr.is_some())
             .count(),
         OUTBOUND_TARGET
     );
@@ -302,22 +291,10 @@ async fn an_unfinished_version_handshake_cannot_start_chain_sync() {
         })
         .await;
     let (stream, ()) = server.accept().await.unwrap();
-    let (mut writer, mut reader) = split(stream);
-    let Message::Version(ours) = reader.recv().await.unwrap() else {
-        panic!("expected version");
-    };
-    writer
-        .send(&Message::Version(version_info(
-            123,
-            1,
-            ours.genesis,
-            runtime::now(),
-        )))
-        .await
-        .unwrap();
-    // Receiving our Verack proves the node processed the version. The
-    // remote side deliberately never acknowledges it, so it is not ready.
-    assert_eq!(reader.recv().await.unwrap(), Message::Verack);
+    let (_writer, mut reader) = split(stream);
+    assert!(matches!(reader.recv().await.unwrap(), Message::Version(_)));
+    // A missing Version reply leaves the one-RTT exchange unfinished.
+    // A valid reply would immediately make this peer eligible for sync.
     node.events().send(Event::Tick).await.unwrap();
     let Response::Status { syncing, .. } = node.request(Request::Status).await.unwrap() else {
         panic!("expected status");
