@@ -33,14 +33,8 @@ impl Domain {
 /// `PRF^expand`: expands a 32-byte secret and a tag into 64 pseudorandom bytes.
 pub const PRF_EXPAND: Domain = Domain(b"ExpandSeed______");
 
-/// Derivation of the outgoing viewing key from the full viewing key.
-pub const OVK: Domain = Domain(b"OvkDerive_______");
-
 /// Key derivation for coin encryption from the shared secret.
 pub const COIN_KDF: Domain = Domain(b"CoinEncKDF______");
-
-/// Derivation of the outgoing cipher key from the outgoing viewing key.
-pub const OCK: Domain = Domain(b"DeriveOck_______");
 
 /// Derivation of the diversifier key from the full viewing key.
 pub const DK: Domain = Domain(b"DkDerive________");
@@ -134,7 +128,7 @@ mod tests {
 
     #[test]
     fn domains_are_sixteen_bytes() {
-        for domain in [PRF_EXPAND, OVK, COIN_KDF, OCK] {
+        for domain in [PRF_EXPAND, COIN_KDF] {
             assert_eq!(domain.as_bytes().len(), PERSONALIZATION_LEN);
         }
     }

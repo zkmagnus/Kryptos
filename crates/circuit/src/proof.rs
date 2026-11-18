@@ -21,25 +21,26 @@ fn params() -> Params<vesta::Affine> {
     Params::new(K)
 }
 
-/// Top-level private-fee transaction proof envelope containing the action proof.
+/// Marker for version 1 of the serialized action proof envelope.
+pub const ACTION_PROOF_MAGIC: &[u8; 4] = b"RHA1";
+
+/// Transaction proof envelope containing the action proof.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PrivateTransactionProofV2(Vec<u8>);
+pub struct ActionProofEnvelope(Vec<u8>);
 
-impl PrivateTransactionProofV2 {
-    const MAGIC: &'static [u8; 4] = b"RHV2";
-
-    /// Wraps a transfer proof in the V2 domain marker.
+impl ActionProofEnvelope {
+    /// Wraps a transfer proof with the version 1 marker.
     pub fn new(action: &Proof) -> Result<Self, Error> {
         if action.as_bytes().is_empty() {
             return Err(Error::CountMismatch);
         }
-        let mut bytes = Vec::with_capacity(Self::MAGIC.len() + action.as_bytes().len());
-        bytes.extend_from_slice(Self::MAGIC);
+        let mut bytes = Vec::with_capacity(ACTION_PROOF_MAGIC.len() + action.as_bytes().len());
+        bytes.extend_from_slice(ACTION_PROOF_MAGIC);
         bytes.extend_from_slice(action.as_bytes());
         Ok(Self(bytes))
     }
 
-    /// Creates the V2 transaction proof from its action witnesses.
+    /// Creates the transaction proof from its action witnesses.
     pub fn create(
         action_pk: &ProvingKey,
         action_witnesses: &[ActionWitness],
@@ -54,28 +55,34 @@ impl PrivateTransactionProofV2 {
         )?)
     }
 
-    /// Parses the canonical V2 transaction proof envelope.
+    /// Parses the canonical transaction proof envelope.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, Error> {
-        if bytes.len() <= Self::MAGIC.len() || &bytes[..Self::MAGIC.len()] != Self::MAGIC {
+        if bytes.len() <= ACTION_PROOF_MAGIC.len()
+            || &bytes[..ACTION_PROOF_MAGIC.len()] != ACTION_PROOF_MAGIC
+        {
             return Err(Error::InvalidProof);
         }
         Ok(Self(bytes))
     }
 
-    /// The canonical serialized V2 proof.
+    /// The canonical serialized proof envelope.
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 
-    /// Returns the action proof carried by the V2 envelope.
+    /// Returns the action proof carried by the envelope.
     pub fn proof(&self) -> Result<Proof, Error> {
-        if self.0.len() <= Self::MAGIC.len() || &self.0[..Self::MAGIC.len()] != Self::MAGIC {
+        if self.0.len() <= ACTION_PROOF_MAGIC.len()
+            || &self.0[..ACTION_PROOF_MAGIC.len()] != ACTION_PROOF_MAGIC
+        {
             return Err(Error::InvalidProof);
         }
-        Ok(Proof::from_bytes(self.0[Self::MAGIC.len()..].to_vec()))
+        Ok(Proof::from_bytes(
+            self.0[ACTION_PROOF_MAGIC.len()..].to_vec(),
+        ))
     }
 
-    /// Verifies the transfer proof under the V2 transaction domain.
+    /// Verifies the action proof carried by this envelope.
     pub fn verify(&self, vk: &VerifyingKey, action_public: &[PublicInputs]) -> Result<(), Error> {
         self.proof()?.verify(vk, action_public)
     }
@@ -336,5 +343,22 @@ mod tests {
     fn proof_bytes_roundtrip() {
         let proof = Proof::from_bytes(vec![1, 2, 3]);
         assert_eq!(proof.as_bytes(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn action_proof_envelope_rejects_old_markers() {
+        let proof = Proof::from_bytes(vec![1, 2, 3]);
+        let envelope = ActionProofEnvelope::new(&proof).unwrap();
+        assert!(envelope.as_bytes().starts_with(b"RHA1"));
+        let decoded = ActionProofEnvelope::from_bytes(envelope.as_bytes().to_vec()).unwrap();
+        assert_eq!(decoded.proof().unwrap(), proof);
+        for old in [b"RHV1", b"RHV2"] {
+            let mut bytes = envelope.as_bytes().to_vec();
+            bytes[..old.len()].copy_from_slice(old);
+            assert!(matches!(
+                ActionProofEnvelope::from_bytes(bytes),
+                Err(Error::InvalidProof)
+            ));
+        }
     }
 }

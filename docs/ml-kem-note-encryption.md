@@ -24,22 +24,27 @@ shielded pool or spend authorization post-quantum.
 - Each encrypted coin carries a fixed-size ML-KEM-768 ciphertext. The sender
   derives the coin AEAD key from the KEM shared secret, ciphertext, and coin
   commitment. ChaCha20-Poly1305 and the current plaintext remain in use.
-- The outgoing ciphertext carries the transmission key and KEM shared secret,
-  encrypted under the sender's outgoing viewing key, so sender recovery remains
-  possible.
+- The action carries only the ML-KEM ciphertext and recipient-encrypted coin
+  payload. There is no generic sender recovery key or outgoing ciphertext;
+  wallets still detect their own change through normal incoming scanning, while
+  payment details to other addresses must be retained locally at send time.
 - Compact actions carry the KEM ciphertext plus the existing encrypted-coin
   lead. Light-wallet scans decapsulate, decrypt the lead, and confirm the
   existing coin commitment.
-- The encrypted-coin encoding receives an explicit format tag. Old encrypted
-  coins and old addresses are not accepted by this draft encoding.
+- The encrypted coin, transaction, block, and action proof envelope each use
+  version `1` on the reset chain. Updated wallets retain support for legacy
+  addresses.
 
 ## Compatibility and activation
 
-This changes address and action bytes, transaction IDs, compact blocks, and
-stored wallet coins. It requires a new genesis for each network (or a separately
-specified height-based activation before any public deployment). The consensus
-revision and rules digest must change so existing chain stores are rejected.
-No mixed old/new validity period is defined here.
+ML-KEM changes address and action bytes and compact blocks; removing the
+outgoing ciphertext further changes full action and transaction bytes, IDs,
+and size-based fees. The reset starts at consensus revision `1` with a new
+genesis for each network and a new rules digest. A node rejects earlier chain
+databases and peers announcing an earlier genesis hash. Use a fresh data
+directory and recreate the wallet from its seed if you want to keep the same
+keys. This does not restore balances from the earlier chain. Compact action
+encoding is unchanged by removing the outgoing ciphertext.
 
 The later change from shared to diversified ML-KEM address keys does not alter
 this encryption format or transaction validity. Senders already encrypt to the
@@ -60,13 +65,16 @@ routing hint is added. The implementation must enforce the existing
 action-count and block-size limits and should benchmark scan and bandwidth
 costs before activation.
 
+Removing sender recovery removes 1,264 bytes from each full action, but it does
+not reduce compact-action bytes because they did not include that field.
+
 ## Failure behavior
 
 ML-KEM decapsulation uses implicit rejection: malformed-but-correctly-sized
 ciphertexts produce a pseudorandom shared secret. coin ownership is determined
 by the AEAD tag, then by parsing and matching the coin commitment. Wrong-sized
-encodings are rejected by the decoder. The outgoing ciphertext is authenticated
-and binds the action commitment and KEM ciphertext.
+encodings are rejected by the decoder. Recipient ciphertext is authenticated
+and binds the coin commitment and KEM ciphertext.
 
 ## Review and open requirements
 

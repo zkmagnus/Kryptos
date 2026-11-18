@@ -16,6 +16,8 @@
 //! to the last matching height, which truncates the tree to that
 //! checkpoint.
 
+mod backup;
+
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -65,12 +67,16 @@ const NEXT_ADDRESS: &str = "next_address";
 /// Active receiving index, or the sentinel when a fresh address is needed.
 const CURRENT_RECEIVE_ADDRESS: &str = "current_receive_address";
 const RECEIVE_PENDING: u64 = u64::MAX;
+/// Whether receipts to the active address automatically allocate its successor.
+const AUTO_ROTATE_RECEIVE: &str = "auto_rotate_receive";
 const NEXT_OPERATION: &str = "next_operation";
 /// Version of the wallet's address derivation metadata (not consensus).
 const ADDRESS_KEY_SCHEME: &str = "address_key_scheme";
 /// Indices below this threshold retain the legacy shared ML-KEM key.
 const ADDRESS_KEY_START: &str = "address_key_start";
 const COIN_INDEX_VERSION: &str = "coin_nullifier_index_version";
+const BACKUP_FORMAT: &str = "rhombus-wallet-plaintext-backup";
+const BACKUP_VERSION: u32 = 1;
 
 /// Half-open range of separate ML-KEM keys the wallet scans. The legacy
 /// receiver key covers every legacy address independently of this range.
@@ -257,8 +263,8 @@ impl Wallet {
         let addresses = rows!(ADDRESSES);
         let operations = rows!(OPERATIONS);
         let backup = serde_json::json!({
-            "format": "rhombus-wallet-backup",
-            "version": 2,
+            "format": BACKUP_FORMAT,
+            "version": BACKUP_VERSION,
             "encoding": "hex",
             "plaintext_secrets": true,
             "tables": {
@@ -358,6 +364,10 @@ impl Wallet {
         if stored_genesis != genesis.as_bytes() {
             return Err(Error::WrongWallet);
         }
+        {
+            let tx = db.begin_read()?;
+            read_auto_rotate_receive(&tx.open_table(META)?)?;
+        }
         let stored = stored_sk.ok_or(Error::WrongWallet)?;
         let sk_bytes: [u8; 32] = stored
             .try_into()
@@ -413,6 +423,7 @@ impl Wallet {
                     .to_le_bytes()
                     .as_slice(),
             )?;
+            meta.insert(AUTO_ROTATE_RECEIVE, [1u8].as_slice())?;
             meta.insert(COIN_INDEX_VERSION, [1u8].as_slice())?;
         }
         tx.commit()?;
@@ -874,8 +885,8 @@ impl Wallet {
         Ok(self.next_height()?.checked_sub(1))
     }
 
-    /// Returns the persisted active receiving address, allocating a fresh one
-    /// when a send or receipt retired the previous address. Returns `None` if
+    /// Returns the persisted active receiving address. Receipt scanning rotates
+    /// it atomically when enabled; a send may retire it for allocation here. Returns `None` if
     /// the local address limit is exhausted; historical funds remain scannable.
     ///
     /// # Errors
@@ -909,6 +920,30 @@ impl Wallet {
         };
         tx.commit()?;
         Ok(result)
+    }
+
+    /// Whether scanning a payment to the current receiving address allocates
+    /// and selects its successor. Defaults to enabled for older wallets.
+    ///
+    /// # Errors
+    /// Fails on an invalid setting or database error.
+    pub fn auto_rotate_receive(&self) -> Result<bool> {
+        let tx = self.db.begin_read()?;
+        let meta = tx.open_table(META)?;
+        read_auto_rotate_receive(&meta)
+    }
+
+    /// Enables or disables automatic receive-address rotation for this wallet.
+    /// Explicit address issuance and send/change behavior are unchanged.
+    ///
+    /// # Errors
+    /// Fails on a database write error.
+    pub fn set_auto_rotate_receive(&self, enabled: bool) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        tx.open_table(META)?
+            .insert(AUTO_ROTATE_RECEIVE, [u8::from(enabled)].as_slice())?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Hands out a fresh diversified address under `label` and selects it as
@@ -979,21 +1014,34 @@ impl Wallet {
     }
 
     fn retire_received_address(&self, tx: &WriteTransaction, found: &[OwnedCoin]) -> Result<()> {
-        let mut meta = tx.open_table(META)?;
-        let Some(index) = read_receive_index(&meta, read_address_range(&meta)?)? else {
-            return Ok(());
-        };
         if found.is_empty() {
             return Ok(());
         }
+        let (index, range, auto_rotate) = {
+            let meta = tx.open_table(META)?;
+            let range = read_address_range(&meta)?;
+            let auto_rotate = read_auto_rotate_receive(&meta)?;
+            (read_receive_index(&meta, range)?, range, auto_rotate)
+        };
+        let Some(index) = index.filter(|_| auto_rotate) else {
+            return Ok(());
+        };
         let current = self.keys.address(index.into())?;
         if found
             .iter()
             .any(|coin| !coin.legacy_address && coin.coin.diversifier() == current.diversifier())
         {
-            meta.insert(
+            // Rotate in the same write transaction that records the payment.
+            // A payment to an older address remains valid but does not consume
+            // another receiving index.
+            let next = if range.end < MAX_SCAN_ADDRESSES {
+                Some(self.allocate_address(tx, "receive")?.0)
+            } else {
+                None
+            };
+            tx.open_table(META)?.insert(
                 CURRENT_RECEIVE_ADDRESS,
-                RECEIVE_PENDING.to_le_bytes().as_slice(),
+                next.unwrap_or(RECEIVE_PENDING).to_le_bytes().as_slice(),
             )?;
         }
         Ok(())
@@ -1205,6 +1253,19 @@ fn read_address_range(
     .validate()
 }
 
+fn read_auto_rotate_receive(
+    meta: &impl ReadableTable<&'static str, &'static [u8]>,
+) -> Result<bool> {
+    match meta.get(AUTO_ROTATE_RECEIVE)? {
+        None => Ok(true),
+        Some(value) => match value.value() {
+            [1] => Ok(true),
+            [0] => Ok(false),
+            _ => Err(Error::Corrupt("automatic receive rotation setting")),
+        },
+    }
+}
+
 fn read_receive_index(
     meta: &impl ReadableTable<&'static str, &'static [u8]>,
     range: AddressScanRange,
@@ -1321,12 +1382,8 @@ mod tests {
     ) -> Block {
         let mut b = Builder::new(Anchor::from_base(pallas::Base::from(0u64)));
         let credit = RawCoin::from_raw(value).unwrap();
-        b.add_output(OutputInfo::new(
-            keys.default_address().unwrap(),
-            credit,
-            None,
-        ))
-        .unwrap();
+        b.add_output(OutputInfo::new(keys.default_address().unwrap(), credit))
+            .unwrap();
         let tx = b.build_coinbase(pk(), credit, BRANCH, rng).unwrap();
         let mut header: BlockHeader = empty_header(
             height,
@@ -1544,7 +1601,6 @@ mod tests {
         b.add_output(OutputInfo::new(
             other_keys.default_address().unwrap(),
             RawCoin::from_raw(1_000).unwrap(),
-            None,
         ))
         .unwrap();
         let fee = Transaction::default_fee_for_actions(2).unwrap();
@@ -1552,7 +1608,6 @@ mod tests {
         b.add_output(OutputInfo::new(
             owner.default_address().unwrap(),
             RawCoin::from_raw(change).unwrap(),
-            None,
         ))
         .unwrap();
         let spend = b.build_with_fee(fee, pk(), BRANCH, &mut rng).unwrap();
@@ -1741,6 +1796,15 @@ mod tests {
                     wallet.scan(block).unwrap();
                 }
             }
+            // Receipt scanning already committed the next address, without a
+            // receive-address RPC/getter allocating it as a side effect.
+            {
+                let tx = wallet.db.begin_read().unwrap();
+                let meta = tx.open_table(META).unwrap();
+                let range = read_address_range(&meta).unwrap();
+                assert_eq!(range.end, 2);
+                assert_eq!(read_receive_index(&meta, range).unwrap(), Some(1));
+            }
             let current = wallet.current_receive_address().unwrap().unwrap();
             assert_eq!(current.0, 1);
             assert_ne!(current.1, initial.1);
@@ -1773,6 +1837,54 @@ mod tests {
         let reopened = Wallet::open(dir.path().join("wallet.redb"), BlockHash::ZERO).unwrap();
         assert_eq!(reopened.current_receive_address().unwrap(), current);
         assert_eq!(reopened.balance().unwrap(), 100);
+    }
+
+    #[test]
+    fn receive_rotation_can_be_disabled_persisted_and_reenabled() {
+        let mut rng = ChaCha20Rng::seed_from_u64(7310);
+        let key = sk(7310);
+        let (dir, wallet) = temp_wallet(&key, BlockHash::ZERO, &mut rng);
+        let current = wallet.current_receive_address().unwrap().unwrap();
+        assert!(wallet.auto_rotate_receive().unwrap());
+        let empty = Block::new(
+            empty_header(0, BlockHash::ZERO, Anchor::from_base(pallas::Base::from(0))),
+            vec![],
+        );
+        wallet.scan(&empty).unwrap();
+
+        wallet.set_auto_rotate_receive(false).unwrap();
+        let paid = coinbase_block(&mut rng, wallet.keys(), empty.hash(), 1, 100);
+        wallet.scan(&paid).unwrap();
+        assert_eq!(
+            wallet.current_receive_address().unwrap(),
+            Some(current.clone())
+        );
+        assert_eq!(wallet.address_scan_range().unwrap().end, 1);
+        let paid_again = coinbase_block(&mut rng, wallet.keys(), paid.hash(), 2, 50);
+        wallet.scan(&paid_again).unwrap();
+        assert_eq!(
+            wallet.current_receive_address().unwrap(),
+            Some(current.clone())
+        );
+        assert_eq!(wallet.address_scan_range().unwrap().end, 1);
+        assert_eq!(wallet.balance().unwrap(), 150);
+        drop(wallet);
+
+        let wallet = Wallet::open(dir.path().join("wallet.redb"), BlockHash::ZERO).unwrap();
+        assert!(!wallet.auto_rotate_receive().unwrap());
+        assert_eq!(
+            wallet.current_receive_address().unwrap(),
+            Some(current.clone())
+        );
+        wallet.set_auto_rotate_receive(true).unwrap();
+        let parent = wallet.scanned_hash(2).unwrap().unwrap();
+        let block = coinbase_block(&mut rng, wallet.keys(), parent, 3, 25);
+        wallet.scan(&block).unwrap();
+        let rotated = wallet.current_receive_address().unwrap().unwrap();
+        assert_eq!(rotated.0, 1);
+        assert_ne!(rotated.1, current.1);
+        assert_eq!(wallet.address_scan_range().unwrap().end, 2);
+        assert_eq!(wallet.balance().unwrap(), 175);
     }
 
     #[test]
@@ -1893,11 +2005,7 @@ mod tests {
         );
         let mut builder = Builder::new(Anchor::from_base(pallas::Base::from(0)));
         builder
-            .add_output(OutputInfo::new(
-                current.1,
-                RawCoin::from_raw(100).unwrap(),
-                None,
-            ))
+            .add_output(OutputInfo::new(current.1, RawCoin::from_raw(100).unwrap()))
             .unwrap();
         let payment = builder
             .build_coinbase(pk(), RawCoin::from_raw(100).unwrap(), BRANCH, &mut rng)
@@ -1923,6 +2031,7 @@ mod tests {
         let mut rng = ChaCha20Rng::seed_from_u64(7305);
         let (dir, wallet) = temp_wallet(&sk(7305), BlockHash::ZERO, &mut rng);
         let current = wallet.current_receive_address().unwrap();
+        let before = wallet.backup_json().unwrap();
         let block = coinbase_block(&mut rng, wallet.keys(), BlockHash::ZERO, 0, 100);
         let tree = tree_transactions(&block).unwrap();
         assert!(wallet
@@ -1932,6 +2041,11 @@ mod tests {
                 Ok(scan)
             })
             .is_err());
+        assert_eq!(
+            wallet.backup_json().unwrap(),
+            before,
+            "a failed scan must roll back the new address reservation too"
+        );
         assert_eq!(wallet.current_receive_address().unwrap(), current);
         assert_eq!(wallet.balance().unwrap(), 0);
         assert_eq!(wallet.next_height().unwrap(), 0);
@@ -2132,14 +2246,12 @@ mod tests {
             .add_output(OutputInfo::new(
                 keys.address(42u64.into()).unwrap(),
                 RawCoin::from_raw(19).unwrap(),
-                None,
             ))
             .unwrap();
         builder
             .add_output(OutputInfo::new(
                 keys.legacy_address(5000u64.into()).unwrap(),
                 RawCoin::from_raw(11).unwrap(),
-                None,
             ))
             .unwrap();
         let tx = builder

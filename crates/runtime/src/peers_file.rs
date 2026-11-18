@@ -8,7 +8,7 @@
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use p2p::addrbook::{AddressBook, Snapshot, MAX_BANS, MAX_KNOWN};
+use p2p::addrbook::{AddressBook, Snapshot, MAX_SNAPSHOT_BYTES};
 use p2p::message::PeerAddr;
 
 use crate::config::Config;
@@ -16,9 +16,8 @@ use crate::{logging, paths, Result};
 
 /// File name of the saved address book in the data directory.
 pub const PEERS_FILE: &str = "peers.dat";
-/// Largest file [`load`] reads: [`MAX_KNOWN`] entries of the biggest size
-/// plus the header. Anything larger is not a book this node wrote.
-const MAX_FILE_BYTES: u64 = 9 + MAX_KNOWN as u64 * 65 + MAX_BANS as u64 * 44;
+/// Largest file [`load`] reads. Anything larger is not a book this node wrote.
+const MAX_FILE_BYTES: u64 = MAX_SNAPSHOT_BYTES as u64;
 
 /// Where `config` keeps its onion address book.
 pub(crate) fn path(config: &Config) -> PathBuf {

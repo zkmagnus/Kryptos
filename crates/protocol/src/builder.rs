@@ -5,18 +5,16 @@
 //! pads to the next action class with dummy actions, shuffles so position
 //! reveals nothing, derives every per-action secret, signs once the
 //! sighash is known, and proves every action in one action proof wrapped
-//! with the V2 domain marker. Input selection and change computation stay
+//! with its version marker. Input selection and change computation stay
 //! in the wallet.
 
 use crypto::commitment::{ValueCommitTrapdoor, ValueCommitment};
-use crypto::keys::{
-    Diversifier, FullViewingKey, OutgoingViewingKey, SpendAuthorizingKey, SpendingKey,
-};
+use crypto::keys::{Diversifier, FullViewingKey, SpendAuthorizingKey, SpendingKey};
 use crypto::merkle::{MerklePath, EMPTY_LEAF, MERKLE_DEPTH};
 use crypto::signature::{BindingSigningKey, RandomizedSigningKey, SpendAuthRandomizer};
 use rand_core::{CryptoRng, RngCore};
 use transaction_circuit::{ActionWitness, CoinWitness, SpendWitness};
-use transaction_proof::{PrivateTransactionProofV2, ProvingKey};
+use transaction_proof::{ActionProofEnvelope, ProvingKey};
 
 use crate::action::{Action, ActionBody};
 use crate::address::RhombusAddress;
@@ -77,17 +75,12 @@ impl SpendInfo {
 pub struct OutputInfo {
     recipient: RhombusAddress,
     value: RawCoin,
-    ovk: Option<OutgoingViewingKey>,
 }
 
 impl OutputInfo {
-    /// A real output. Pass `ovk` so the sender can later recover the coin.
-    pub fn new(recipient: RhombusAddress, value: RawCoin, ovk: Option<OutgoingViewingKey>) -> Self {
-        Self {
-            recipient,
-            value,
-            ovk,
-        }
+    /// A real output encrypted for its recipient.
+    pub fn new(recipient: RhombusAddress, value: RawCoin) -> Self {
+        Self { recipient, value }
     }
 
     /// A zero-valued output to a random address nobody can decrypt.
@@ -96,7 +89,7 @@ impl OutputInfo {
     /// Fails only if key derivation fails, which has negligible probability.
     pub fn dummy(rng: &mut (impl RngCore + CryptoRng)) -> Result<Self> {
         let recipient = random_address(&SpendingKey::random(rng), rng)?;
-        Ok(Self::new(recipient, RawCoin::ZERO, None))
+        Ok(Self::new(recipient, RawCoin::ZERO))
     }
 
     /// The value.
@@ -156,7 +149,7 @@ impl Builder {
     }
 
     /// Pads, shuffles, balances including the declared fee, encrypts, signs,
-    /// and proves a V2 transfer.
+    /// and proves a transfer.
     ///
     /// # Errors
     /// Returns [`Error::Unbalanced`] if spends do not equal outputs, or
@@ -182,7 +175,7 @@ impl Builder {
         branch: BranchId,
         rng: &mut (impl RngCore + CryptoRng),
     ) -> Result<Transaction> {
-        self.build_v2_with_balance(
+        self.build_with_balance(
             fee,
             pk,
             branch,
@@ -192,7 +185,7 @@ impl Builder {
         )
     }
 
-    fn build_v2_with_balance(
+    fn build_with_balance(
         mut self,
         fee: RawCoin,
         pk: &ProvingKey,
@@ -250,7 +243,7 @@ impl Builder {
         if spent_minus_created.to_i64()? != balance {
             return Err(Error::Unbalanced);
         }
-        let proof = PrivateTransactionProofV2::create(pk, &witnesses, &public, &mut *rng)?;
+        let proof = ActionProofEnvelope::create(pk, &witnesses, &public, &mut *rng)?;
 
         let binding_key = BindingSigningKey::from_trapdoors(prepared.iter().map(|p| &p.rcv))?;
         let binding_signature = binding_key.sign(rng, &sighash);
@@ -291,7 +284,7 @@ impl Builder {
             .to_i64()?
             .checked_neg()
             .ok_or(Error::RawCoinOutOfRange)?;
-        self.build_v2_with_balance(
+        self.build_with_balance(
             RawCoin::ZERO,
             pk,
             branch,
@@ -362,13 +355,7 @@ fn prepare_action(
     let rsk = RandomizedSigningKey::new(&SpendAuthorizingKey::derive(&spend.sk)?, &alpha)?;
     let rk = rsk.verification_key();
 
-    let encrypted = encrypt_coin(
-        &coin,
-        &output.recipient.kem_key(),
-        output.ovk.as_ref(),
-        &cv_net,
-        rng,
-    )?;
+    let encrypted = encrypt_coin(&coin, &output.recipient.kem_key(), rng)?;
 
     let witness = ActionWitness {
         spend: SpendWitness {
@@ -430,7 +417,7 @@ mod tests {
     use transaction_circuit::PublicInputs;
 
     use super::*;
-    use crate::encryption::{decrypt_coin_with_ivk, decrypt_coin_with_ovk};
+    use crate::encryption::decrypt_coin_with_ivk;
     use crate::test_keys;
     use crate::validate;
 
@@ -502,18 +489,10 @@ mod tests {
         let change = 100_000 - 3_000 - fee.raw();
         let mut b = Builder::new(ledger.anchor());
         b.add_spend(spend).unwrap();
-        b.add_output(OutputInfo::new(
-            bob.address.clone(),
-            amount(3_000),
-            Some(alice.fvk.outgoing_viewing_key()),
-        ))
-        .unwrap();
-        b.add_output(OutputInfo::new(
-            alice.address.clone(),
-            amount(change),
-            Some(alice.fvk.outgoing_viewing_key()),
-        ))
-        .unwrap();
+        b.add_output(OutputInfo::new(bob.address.clone(), amount(3_000)))
+            .unwrap();
+        b.add_output(OutputInfo::new(alice.address.clone(), amount(change)))
+            .unwrap();
         let tx = b
             .build_with_fee(fee, test_keys::proving_key(), BRANCH, &mut rng)
             .unwrap();
@@ -530,7 +509,7 @@ mod tests {
         eprintln!("transaction build vector: {digest}");
         assert_eq!(
             digest,
-            "20091747c3208f26ddc1f9f1bcfea312b88cf4037541cc53aa1816b98c344c33"
+            "06e989983a7b1b061b0e96863bd49e5e1d22fbc536bab27218a42d25afd2d409"
         );
         assert_eq!(tx.actions().len(), 2);
         assert!(verify_regular(&tx, BRANCH, test_keys::verifying_key(), &mut rng).is_ok());
@@ -544,12 +523,10 @@ mod tests {
     }
 
     #[test]
-    fn recipient_and_sender_can_decrypt_their_outputs() {
-        let (_, alice, bob, tx) = payment(2);
+    fn recipient_can_decrypt_their_output() {
+        let (_, _, bob, tx) = payment(2);
         let bob_ivk = bob.fvk.incoming_viewing_key().unwrap();
-        let alice_ovk = alice.fvk.outgoing_viewing_key();
         let mut bob_found = 0;
-        let mut alice_found = Vec::new();
         for action in tx.actions() {
             let body = action.body();
             let rho = Rho::from_nullifier(body.nullifier()).unwrap();
@@ -563,19 +540,8 @@ mod tests {
                 assert_eq!(coin.value(), amount(3_000));
                 bob_found += 1;
             }
-            if let Ok(coin) = decrypt_coin_with_ovk(
-                &alice_ovk,
-                body.encrypted_coin(),
-                body.cv_net(),
-                rho,
-                body.cmx(),
-            ) {
-                alice_found.push(coin.value().raw());
-            }
         }
         assert_eq!(bob_found, 1);
-        alice_found.sort_unstable();
-        assert_eq!(alice_found, vec![3_000, 100_000 - 3_000 - tx.fee().raw()]);
     }
 
     #[test]
@@ -593,7 +559,7 @@ mod tests {
             } else {
                 10_000
             };
-            b.add_output(OutputInfo::new(alice.address.clone(), amount(value), None))
+            b.add_output(OutputInfo::new(alice.address.clone(), amount(value)))
                 .unwrap();
         }
         let tx = b
@@ -615,7 +581,6 @@ mod tests {
         b.add_output(OutputInfo::new(
             alice.address.clone(),
             amount(100_000 - fee.raw()),
-            None,
         ))
         .unwrap();
         // The prover does not check constraints; the proof it emits for a
@@ -635,12 +600,8 @@ mod tests {
         let miner = wallet(&mut rng);
         let credit = amount(10_000_000);
         let mut b = Builder::new(Ledger::default().anchor());
-        b.add_output(OutputInfo::new(
-            miner.address,
-            credit,
-            Some(miner.fvk.outgoing_viewing_key()),
-        ))
-        .unwrap();
+        b.add_output(OutputInfo::new(miner.address, credit))
+            .unwrap();
         let tx = b
             .build_coinbase(test_keys::proving_key(), credit, BRANCH, &mut rng)
             .unwrap();
@@ -682,7 +643,7 @@ mod tests {
         ));
         let mut short = Builder::new(ledger.anchor());
         short
-            .add_output(OutputInfo::new(miner.address, amount(4), None))
+            .add_output(OutputInfo::new(miner.address, amount(4)))
             .unwrap();
         assert!(matches!(
             short.build_coinbase(test_keys::proving_key(), amount(5), BRANCH, &mut rng),
@@ -698,7 +659,7 @@ mod tests {
         let spend = ledger.fund(&mut rng, &alice, 1_000);
         let mut b = Builder::new(ledger.anchor());
         b.add_spend(spend).unwrap();
-        b.add_output(OutputInfo::new(alice.address, amount(999), None))
+        b.add_output(OutputInfo::new(alice.address, amount(999)))
             .unwrap();
         assert!(matches!(
             b.build(test_keys::proving_key(), BRANCH, &mut rng),
@@ -741,7 +702,7 @@ mod tests {
         let alice = wallet(&mut rng);
         let mut ledger = Ledger::default();
         let spend = ledger.fund(&mut rng, &alice, 500);
-        let output = OutputInfo::new(alice.address, amount(200), None);
+        let output = OutputInfo::new(alice.address, amount(200));
         let prepared = prepare_action(&spend, &output, &mut rng).unwrap();
         let anchor = ledger.anchor();
         let aggregate = *prepared.body.cv_net().as_point();

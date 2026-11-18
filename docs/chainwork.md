@@ -20,6 +20,14 @@ returned by this check. Headers accepted for sync must also pass linkage and
 proof-of-work validation, or prove their hash ancestry to a trusted checkpoint.
 A mere height below a checkpoint is not sufficient proof of ancestry.
 
+The chain's RandomX verifier keeps a bounded FIFO cache of successful checks
+keyed by the complete serialized header hash. Headers-first sync and later full
+block validation can reuse the same proof result. A cache hit skips only
+RandomX recomputation: each path still validates its own ancestry, target,
+transaction root, authorization and state effects. Only successful exact
+headers are cached; eviction causes a fresh proof check and does not affect
+validity.
+
 Fork choice compares the indexed totals. A strictly larger total wins. Equal
 work keeps the first successfully imported tip; a smaller block hash cannot
 replace it. "First seen" here means accepted block arrival, not an unverified
@@ -32,12 +40,15 @@ Reverting a block retains both its bytes and work. Recovery of an interrupted
 reorganization reuses the recorded values. Genesis and the current tip must have
 work index entries when the chain opens.
 
-Storage layout version **2** requires this index. An older database is refused
-with the existing resync error; no unvalidated values are reconstructed from
-claimed targets. Consensus revision **2** records exact compact difficulty and
+Storage layout version **1** under the new chain store marker requires this
+index. An older database is refused with the existing resync error; no
+unvalidated values are reconstructed from claimed targets. Consensus revision
+**1** includes exact compact difficulty and
 checked 256-bit accumulation in the rules digest. The configured mainnet block
-interval is **300 seconds**; changing these launch parameters is not a scheduled
-upgrade of an existing live chain.
+interval is **120 seconds** from launch. Both network configurations permit
+reverting at most **50 canonical blocks**; deeper forks are rejected before
+fork choice.
+See [the policy and compatibility procedure](release-hardening.md).
 
 `MIN_CHAIN_WORK` is node download/IBD policy, initially zero. It is not part of
 block validation or the consensus rules digest. Sync only downloads bodies once
@@ -60,8 +71,8 @@ Implementation choices:
 - `crates/chain/src/chain.rs`: reads indexed cumulative work for fork choice and
   crash recovery; defines genesis work and preserves arrival-order ties.
 - `crates/chain/src/error.rs`: gives overflow a distinct error.
-- `crates/chain/src/params.rs`: sets the requested five-minute mainnet interval
-  and documents the resulting 100-block difficulty window (8 hours 20 minutes).
+- `crates/chain/src/params.rs` sets the two-minute mainnet interval and documents
+  the resulting 100-block difficulty window of about 3 hours 20 minutes.
 - `crates/storage/src/store.rs`: stores cumulative work atomically beside each
   block and refuses the old layout rather than silently serving an absent index.
 - `crates/chain/tests/chain.rs`: covers monotonic persisted work, arrival-order

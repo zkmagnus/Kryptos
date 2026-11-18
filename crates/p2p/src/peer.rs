@@ -341,7 +341,7 @@ mod tests {
         );
         let (mut inb, _) = Peer::new(Direction::Inbound, info(2), 0);
         let mut old = info(3);
-        old.version = 0;
+        old.version = 4;
         assert!(matches!(
             inb.handle(&Message::Version(old), 1)[0],
             Event::Disconnect { ban: false, .. }

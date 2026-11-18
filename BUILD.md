@@ -224,6 +224,42 @@ CARGO_BUILD_JOBS=2 cargo build --locked --offline -p runtime --bins
 
 These executables are written under `target/debug/` by default.
 
+### Keeping development builds small
+
+The workspace's `dev` and `test` profiles disable debug information and
+incremental compilation. This avoids full Rust debug symbols in each test
+executable and the additional incremental compiler cache. Changed crates may
+take longer to recompile; Cargo still reuses unchanged compiled dependencies.
+Rust debug assertions and overflow checks remain enabled. Test optimization
+stays at level 1. See [Cargo profiles](https://doc.rust-lang.org/cargo/reference/profiles.html)
+for these settings and their overrides.
+
+During iteration, check and test the affected package before running the full
+workspace suite:
+
+```sh
+cargo check -p wallet --locked --offline
+cargo test -p wallet --lib --locked --offline -- --test-threads=2
+```
+
+Reuse one target directory and consistent CPU flags for routine commands; the
+default directory is `target/`. Different profiles, features, CPU flags and
+target directories can retain additional artifacts. Avoid cleaning after every
+test, which forces dependencies to compile again. These settings reduce cache
+growth but do not impose a disk quota or remove existing artifacts.
+
+For a debugging session, explicitly enable full debug information, for example
+on POSIX shells:
+
+```sh
+CARGO_PROFILE_DEV_DEBUG=2 CARGO_PROFILE_TEST_DEBUG=2 \
+cargo test -p wallet --lib --locked --offline -- --test-threads=2
+```
+
+PowerShell: set `$env:CARGO_PROFILE_DEV_DEBUG = "2"` and
+`$env:CARGO_PROFILE_TEST_DEBUG = "2"` before the command, then remove both
+environment variables afterwards to restore the smaller defaults.
+
 Run the repository checks with portable CPU flags:
 
 ```sh

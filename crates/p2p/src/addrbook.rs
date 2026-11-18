@@ -33,8 +33,12 @@ const MAX_BACKOFF_DOUBLINGS: u32 = 6;
 /// when, or in which order, this node connected to each one.
 pub const SHARED_TIME_GRANULARITY: u64 = 60 * 60;
 
+// Older development snapshots began directly with a version byte.
+const SNAPSHOT_MAGIC: &[u8; 4] = b"RHPA";
 /// Version byte of the [`Snapshot`] layout.
-pub const SNAPSHOT_VERSION: u8 = 2;
+pub const SNAPSHOT_VERSION: u8 = 1;
+/// Largest peer snapshot this node can encode, in bytes.
+pub const MAX_SNAPSHOT_BYTES: usize = SNAPSHOT_MAGIC.len() + 9 + MAX_KNOWN * 65 + MAX_BANS * 44;
 
 #[derive(Clone, Copy, Debug)]
 struct Entry {
@@ -454,7 +458,7 @@ impl Snapshot {
     /// The canonical peer-state encoding.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut writer = Writer::default();
-        writer.put_u8(SNAPSHOT_VERSION);
+        writer.put(SNAPSHOT_MAGIC).put_u8(SNAPSHOT_VERSION);
         put_count(&mut writer, self.entries.len());
         for saved in &self.entries {
             saved.addr.write(&mut writer);
@@ -477,13 +481,16 @@ impl Snapshot {
         writer.into_bytes()
     }
 
-    /// Decodes peer state, rejecting old IP-based snapshots and malformed data.
+    /// Decodes peer state, rejecting snapshots from earlier development builds.
     ///
     /// # Errors
-    /// Fails on unknown versions, unbounded counts, duplicates, out-of-order
-    /// identities, bad flags, truncation, or trailing bytes.
+    /// Fails on a wrong magic prefix, unknown versions, unbounded counts,
+    /// duplicates, out-of-order identities, bad flags, truncation, or trailing bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let mut reader = Reader::new(bytes);
+        if reader.take(SNAPSHOT_MAGIC.len())? != SNAPSHOT_MAGIC {
+            return Err(Error::BadSnapshot("unknown format"));
+        }
         if reader.take_u8()? != SNAPSHOT_VERSION {
             return Err(Error::BadSnapshot("unknown version"));
         }
@@ -760,19 +767,27 @@ mod tests {
         let bytes = snapshot.to_bytes();
         assert_eq!(Snapshot::from_bytes(&bytes).unwrap(), snapshot);
         assert_eq!(bytes, saved_book().snapshot().to_bytes(), "deterministic");
-        assert_eq!(bytes.len(), 1 + 4 + 3 * (36 + 8 + 1 + 4 + 8) + 8 + 4);
+        assert!(bytes.starts_with(b"RHPA\x01"));
+        assert_eq!(
+            bytes.len(),
+            SNAPSHOT_MAGIC.len() + 1 + 4 + 3 * (36 + 8 + 1 + 4 + 8) + 8 + 4
+        );
     }
 
     #[test]
     fn snapshots_reject_garbage() {
         let good = saved_book().snapshot().to_bytes();
+        let version_at = SNAPSHOT_MAGIC.len();
+        let count_at = version_at + 1;
+        let flag_at = count_at + 4 + 36 + 8;
         let mut bad_version = good.clone();
-        *bad_version.first_mut().unwrap() = 1;
+        bad_version[version_at] = 2;
+        let legacy_tor = bad_version[version_at..].to_vec();
         let mut bad_flag = good.clone();
-        *bad_flag.get_mut(49).unwrap() = 2;
+        bad_flag[flag_at] = 2;
         let mut too_many = good.clone();
         too_many
-            .get_mut(1..5)
+            .get_mut(count_at..count_at + 4)
             .unwrap()
             .copy_from_slice(&u32::try_from(MAX_KNOWN + 1).unwrap().to_le_bytes());
         let saved = saved_book().snapshot();
@@ -786,6 +801,8 @@ mod tests {
         let trailing = [good.as_slice(), &[0]].concat();
         for (name, bytes) in [
             ("empty", Vec::new()),
+            ("legacy IP snapshot", vec![1, 0, 0, 0, 0]),
+            ("legacy Tor snapshot", legacy_tor),
             ("version", bad_version),
             ("flag", bad_flag),
             ("count", too_many),

@@ -54,6 +54,7 @@ const MAX_ATTEMPTS: u32 = 5;
 pub const METHODS: &[&str] = &[
     "getwalletinfo",
     "getreceiveaddress",
+    "setreceiveaddressrotation",
     "getnewaddress",
     "listaddresses",
     "getaddressinfo",
@@ -863,8 +864,14 @@ fn parse_amount(value: Option<&Value>) -> core::result::Result<RawCoin, RpcError
 impl Dispatch for WalletDaemon {
     async fn call(&self, method: &str, params: &Params) -> core::result::Result<Value, RpcError> {
         match method {
-            "getwalletinfo" | "getreceiveaddress" | "getnewaddress" | "listaddresses"
-            | "getaddressinfo" | "validateaddress" | "help" => self.wallet_methods(method, params),
+            "getwalletinfo"
+            | "getreceiveaddress"
+            | "setreceiveaddressrotation"
+            | "getnewaddress"
+            | "listaddresses"
+            | "getaddressinfo"
+            | "validateaddress"
+            | "help" => self.wallet_methods(method, params),
             "rescan" => {
                 let from: u32 = params.opt(0, "from_height")?.unwrap_or(0);
                 let _guard = self.0.sync_lock.lock().await;
@@ -912,6 +919,7 @@ impl WalletDaemon {
                     "receive_address": receiving.as_ref().map(|(_, address)| address.encode(prefix)),
                     "receive_address_index": receiving.as_ref().map(|(index, _)| *index),
                     "address_rotation_exhausted": receiving.is_none(),
+                    "auto_receive_rotation": wallet.auto_rotate_receive()?,
                     "legacy_address_scanning": true,
                     "max_separate_address_keys": wallet::keys::MAX_SCAN_ADDRESSES,
                     "last_error": self.0.last_error.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone(),
@@ -924,6 +932,11 @@ impl WalletDaemon {
                     "address": receiving.as_ref().map(|(_, address)| address.encode(prefix)),
                     "exhausted": receiving.is_none(),
                 }))
+            }
+            "setreceiveaddressrotation" => {
+                let enabled: bool = params.get(0, "enabled")?;
+                wallet.set_auto_rotate_receive(enabled)?;
+                Ok(json!({ "auto_receive_rotation": enabled }))
             }
             "getnewaddress" => {
                 let label: String = params.opt(0, "label")?.unwrap_or_default();
@@ -1200,7 +1213,6 @@ mod tests {
             .add_output(OutputInfo::new(
                 wallet.keys().default_address().unwrap(),
                 mint,
-                None,
             ))
             .unwrap();
         let coinbase = builder
@@ -1308,6 +1320,50 @@ mod tests {
         assert_ne!(current["address"], first["address"]);
         assert_eq!(current["address"], manual["address"]);
         assert_eq!(current["index"], manual["index"]);
+    }
+
+    #[test]
+    fn receive_rotation_setting_is_persisted_and_explicit_address_issuance_still_works() {
+        let (directory, wallet) = wallet_file();
+        let first = wallet.current_receive_address().unwrap().unwrap();
+        let daemon = offline_daemon(wallet);
+        let params = Params::new(json!([]));
+        assert_eq!(
+            daemon.wallet_methods("getwalletinfo", &params).unwrap()["auto_receive_rotation"],
+            true
+        );
+        assert_eq!(
+            daemon
+                .wallet_methods("setreceiveaddressrotation", &Params::new(json!([false])),)
+                .unwrap(),
+            json!({ "auto_receive_rotation": false })
+        );
+        assert_eq!(
+            daemon.wallet_methods("getwalletinfo", &params).unwrap()["auto_receive_rotation"],
+            false
+        );
+        assert!(daemon
+            .wallet_methods("setreceiveaddressrotation", &Params::new(json!(["false"])),)
+            .is_err());
+        let manual = daemon
+            .wallet_methods("getnewaddress", &Params::new(json!(["manual"])))
+            .unwrap();
+        assert_ne!(
+            manual["address"],
+            json!(first.1.encode(Network::Test.address_prefix()))
+        );
+        assert_eq!(
+            daemon.wallet_methods("getreceiveaddress", &params).unwrap()["address"],
+            manual["address"]
+        );
+        drop(daemon);
+
+        let reopened = Wallet::open(
+            directory.path().join("wallet.redb"),
+            genesis(&Network::Test.params()).hash(),
+        )
+        .unwrap();
+        assert!(!reopened.auto_rotate_receive().unwrap());
     }
 
     #[test]
@@ -1425,7 +1481,6 @@ mod tests {
             .add_output(protocol::builder::OutputInfo::new(
                 keys.default_address().unwrap(),
                 RawCoin::ZERO,
-                None,
             ))
             .unwrap();
         builder

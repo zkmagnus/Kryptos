@@ -120,7 +120,14 @@ async fn a_pool_mines_through_templates_and_submissions() {
     assert_eq!(info["next_target"].as_str().unwrap().len(), 8);
 
     // A template, reused while fresh.
-    let template = call(addr, t, "getblocktemplate", json!([payout])).await;
+    let (template, concurrent) = tokio::join!(
+        call(addr, t, "getblocktemplate", json!([payout])),
+        call(addr, t, "getblocktemplate", json!([payout])),
+    );
+    assert_eq!(
+        template["template_id"], concurrent["template_id"],
+        "concurrent requests share preparation"
+    );
     assert_eq!(template["height"], 1);
     assert_eq!(template["transaction_count"], 1);
     assert!(template.get("coinbase_value").is_none());
@@ -133,6 +140,15 @@ async fn a_pool_mines_through_templates_and_submissions() {
     )
     .await;
     assert_eq!(again["template_id"], template["template_id"]);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let refreshed = call(addr, t, "getblocktemplate", json!([payout])).await;
+    assert_ne!(refreshed["template_id"], template["template_id"]);
+    assert_eq!(
+        refreshed["tx_root"], template["tx_root"],
+        "timestamp refresh retains the proved coinbase"
+    );
+    assert_eq!(refreshed["commitment_root"], template["commitment_root"]);
+    assert!(refreshed["timestamp"].as_u64().unwrap() > template["timestamp"].as_u64().unwrap());
     assert_eq!(
         call_err(addr, t, "getblocktemplate", json!(["tnull1nonsense"])).await,
         runtime::jsonrpc::INVALID_PARAMS

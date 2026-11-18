@@ -1,6 +1,6 @@
 //! The transaction: a fixed-shape bundle of actions, a proof
 //! envelope and one binding signature. Transfers are native chain
-//! transactions; the action proof remains tagged with `RHV2`.
+//! transactions; the action proof envelope is tagged with `RHA1`.
 //!
 //! ```text
 //! effecting data = version || kind || anchor || fee || n_actions ||
@@ -65,8 +65,8 @@ impl Encodable for Anchor {
     }
 }
 
-use transaction_proof::PrivateTransactionProofV2;
-pub use transaction_proof::Proof;
+use transaction_proof::ActionProofEnvelope;
+pub use transaction_proof::{Proof, ACTION_PROOF_MAGIC};
 
 /// A transaction identifier.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -123,7 +123,9 @@ impl Transaction {
                     .ok_or(crate::Error::Malformed("transaction size overflow"))?,
             )
             .and_then(|len| {
-                len.checked_add(action_proof_len + 4 + crypto::signature::SIGNATURE_LEN)
+                len.checked_add(
+                    action_proof_len + ACTION_PROOF_MAGIC.len() + crypto::signature::SIGNATURE_LEN,
+                )
             })
             .ok_or(crate::Error::Malformed("transaction size overflow"))
     }
@@ -155,12 +157,12 @@ impl Transaction {
         }
     }
 
-    /// Assembles a transaction using the current V2 proof envelope.
+    /// Assembles a transaction using an action proof envelope.
     pub fn new(
         anchor: Anchor,
         fee: crate::amount::RawCoin,
         actions: Vec<Action>,
-        proof: PrivateTransactionProofV2,
+        proof: ActionProofEnvelope,
         binding_signature: BindingSignature,
     ) -> Result<Self> {
         Self::new_with_kind(
@@ -177,7 +179,7 @@ impl Transaction {
     pub fn new_coinbase(
         anchor: Anchor,
         actions: Vec<Action>,
-        proof: PrivateTransactionProofV2,
+        proof: ActionProofEnvelope,
         binding_signature: BindingSignature,
     ) -> Result<Self> {
         Self::new_with_kind(
@@ -194,7 +196,7 @@ impl Transaction {
         anchor: Anchor,
         fee: crate::amount::RawCoin,
         actions: Vec<Action>,
-        proof: PrivateTransactionProofV2,
+        proof: ActionProofEnvelope,
         binding_signature: BindingSignature,
         kind: u8,
     ) -> Result<Self> {
@@ -220,10 +222,10 @@ impl Transaction {
         self.kind
     }
 
-    /// The complete V2 private-proof envelope.
-    pub fn private_proof_v2(&self) -> Option<PrivateTransactionProofV2> {
+    /// The complete action proof envelope.
+    pub fn action_proof_envelope(&self) -> Option<ActionProofEnvelope> {
         (self.kind == TRANSFER_KIND || self.kind == COINBASE_KIND)
-            .then(|| PrivateTransactionProofV2::new(&self.proof).ok())
+            .then(|| ActionProofEnvelope::new(&self.proof).ok())
             .flatten()
     }
 
@@ -248,9 +250,9 @@ impl Transaction {
     }
 
     /// The number of serialized bytes used by this transaction's proof data.
-    /// V2 includes its envelope marker.
+    /// Includes the envelope marker when present.
     pub fn proof_size(&self) -> usize {
-        self.private_proof_v2().map_or_else(
+        self.action_proof_envelope().map_or_else(
             || self.proof.as_bytes().len(),
             |proof| proof.as_bytes().len(),
         )
@@ -376,7 +378,7 @@ impl Encodable for Transaction {
         for action in &self.actions {
             w.put(&action.spend_auth_sig().to_bytes());
         }
-        if let Some(proof) = self.private_proof_v2() {
+        if let Some(proof) = self.action_proof_envelope() {
             w.put(proof.as_bytes());
         }
         w.put(&self.binding_signature.to_bytes());
@@ -404,13 +406,14 @@ impl Encodable for Transaction {
                 body.sign(crypto::signature::SpendAuthSignature::from_bytes(signature))
             })
             .collect();
-        let len = 4usize
+        let len = ACTION_PROOF_MAGIC
+            .len()
             .checked_add(proof_len(count)?)
-            .ok_or(crate::Error::Malformed("invalid v2 proof length"))?;
+            .ok_or(crate::Error::Malformed("invalid proof envelope length"))?;
         let bytes = r.take(len)?.to_vec();
-        let proof = PrivateTransactionProofV2::from_bytes(bytes)
-            .and_then(|v2| v2.proof())
-            .map_err(|_| crate::Error::Malformed("invalid v2 transaction proof"))?;
+        let proof = ActionProofEnvelope::from_bytes(bytes)
+            .and_then(|envelope| envelope.proof())
+            .map_err(|_| crate::Error::Malformed("invalid transaction proof envelope"))?;
         let binding_signature = BindingSignature::from_bytes(r.take_array()?);
         Ok(Self {
             version,
@@ -452,7 +455,7 @@ pub(crate) mod tests {
             crate::fee::fee_for_len(Transaction::encoded_len_for_actions(count).unwrap_or(0))
                 .unwrap(),
             actions,
-            PrivateTransactionProofV2::new(&dummy_proof(count)).unwrap(),
+            ActionProofEnvelope::new(&dummy_proof(count)).unwrap(),
             BindingSignature::from_bytes([9; 64]),
         )
         .unwrap()

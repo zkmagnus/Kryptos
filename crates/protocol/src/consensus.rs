@@ -5,14 +5,14 @@
 use crate::amount::{RawCoin, RAWCOIN};
 use crate::{Error, Result};
 
-/// Native chain transaction format with public byte fees.
+/// Native chain transaction format with recipient-only encrypted outputs.
 pub const TX_VERSION: u8 = 1;
 /// Native transaction kind: shielded transfer.
 pub const TRANSFER_KIND: u8 = 0;
 /// Coinbase kind. Consensus also requires this transaction at block index 0.
 pub const COINBASE_KIND: u8 = 1;
 
-/// The only block version.
+/// Block version whose transactions use the recipient-only output encoding.
 pub const BLOCK_VERSION: u8 = 1;
 
 /// Identifies one set of consensus rules. Every signature hash binds the

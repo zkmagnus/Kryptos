@@ -6,12 +6,11 @@
 //! change and requires an explicit consensus revision and activation rule.
 
 pub use circuit::proof::{
-    proof_len, PrivateTransactionProofV2, Proof, ProofBatch, ProvingKey, VerifyingKey,
+    proof_len, ActionProofEnvelope, Proof, ProofBatch, ProvingKey, VerifyingKey, ACTION_PROOF_MAGIC,
 };
 pub use transaction_circuit::Error;
 
-/// Version of the proof adapter API, not the wire transaction
-/// version. V2 exposes a top-level private-fee transaction proof envelope.
+/// Version of the proof adapter API, independent of the transaction encoding.
 pub const API_VERSION: u16 = 1;
 
 /// Name of the proving backend currently used by this adapter.

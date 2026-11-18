@@ -43,8 +43,10 @@ fn check_shape_and_kind(tx: &Transaction, kind: u8) -> Result<()> {
     if tx.kind() != kind {
         return Err(Error::InvalidTransaction("wrong native transaction kind"));
     }
-    if tx.private_proof_v2().is_none() {
-        return Err(Error::InvalidTransaction("V2 proof envelope is missing"));
+    if tx.action_proof_envelope().is_none() {
+        return Err(Error::InvalidTransaction(
+            "action proof envelope is missing",
+        ));
     }
     if !is_action_class(tx.actions().len()) {
         return Err(Error::InvalidTransaction(
@@ -176,19 +178,23 @@ pub fn queue_coinbase_proof(tx: &Transaction, batch: &mut ProofBatch) -> Result<
 }
 
 fn queue_proof_with_kind(tx: &Transaction, coinbase: bool, batch: &mut ProofBatch) -> Result<()> {
-    if tx.private_proof_v2().is_none() {
-        return Err(Error::InvalidTransaction("V2 proof envelope is missing"));
+    if tx.action_proof_envelope().is_none() {
+        return Err(Error::InvalidTransaction(
+            "action proof envelope is missing",
+        ));
     }
     Ok(batch.add(tx.proof(), &tx.public_inputs(coinbase)?)?)
 }
 
-/// Verifies the V2 proof of one transaction on its own.
+/// Verifies the proof of one transaction on its own.
 ///
 /// # Errors
 /// Returns [`transaction_proof::Error::InvalidProof`] if the proof is wrong.
 pub fn verify_proof(tx: &Transaction, vk: &VerifyingKey) -> Result<()> {
-    tx.private_proof_v2()
-        .ok_or(Error::InvalidTransaction("V2 proof envelope is missing"))?
+    tx.action_proof_envelope()
+        .ok_or(Error::InvalidTransaction(
+            "action proof envelope is missing",
+        ))?
         .verify(vk, &tx.public_inputs(tx.kind() == COINBASE_KIND)?)?;
     Ok(())
 }
@@ -238,7 +244,7 @@ mod tests {
     use crypto::signature::BindingSignature;
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
-    use transaction_proof::PrivateTransactionProofV2;
+    use transaction_proof::ActionProofEnvelope;
 
     use super::*;
     use crate::action::tests::sample_action;
@@ -255,7 +261,7 @@ mod tests {
         } else {
             dummy_proof(count)
         };
-        let v2_proof = PrivateTransactionProofV2::new(&action_proof).unwrap();
+        let envelope = ActionProofEnvelope::new(&action_proof).unwrap();
         let fee = crate::consensus::proof_len(count)
             .and_then(|_| Transaction::encoded_len_for_actions(count))
             .and_then(crate::fee::fee_for_len)
@@ -264,7 +270,7 @@ mod tests {
             sample_anchor(),
             fee,
             actions,
-            v2_proof,
+            envelope,
             BindingSignature::from_bytes([0; 64]),
         )
         .unwrap()
@@ -293,12 +299,12 @@ mod tests {
     fn structure_rejects_wrong_proof_length() {
         let mut rng = ChaCha20Rng::seed_from_u64(9);
         let actions = (0..2).map(|_| sample_action(&mut rng, b"x")).collect();
-        let v2_proof = PrivateTransactionProofV2::new(&dummy_proof(4)).unwrap();
+        let envelope = ActionProofEnvelope::new(&dummy_proof(4)).unwrap();
         let tx = Transaction::new(
             sample_anchor(),
             crate::amount::RawCoin::ZERO,
             actions,
-            v2_proof,
+            envelope,
             BindingSignature::from_bytes([0; 64]),
         )
         .unwrap();

@@ -73,12 +73,12 @@ pub struct ChainParams {
 
 const MAIN_EMISSION_UPGRADES: [Upgrade; 1] = [Upgrade {
     height: 1,
-    branch: BranchId::new(0x4d41_4931),
+    branch: BranchId::new(0x4d41_5231),
 }];
 
 const TEST_EMISSION_UPGRADES: [Upgrade; 1] = [Upgrade {
     height: 1,
-    branch: BranchId::new(0x5445_5331),
+    branch: BranchId::new(0x5445_5231),
 }];
 
 impl ChainParams {
@@ -139,15 +139,15 @@ impl ChainParams {
             randomx_key: b"Rhombus Mainnet RandomX v1",
             pow_limit: Target::from_compact(0x207f_ffff).expect("valid compact target"),
             pow_limit_change: None,
-            block_interval: 300,
-            // A 100-block LWMA window (about 8 hours 20 minutes at
-            // the 300-second target block interval).
+            block_interval: 120,
+            // A 100-block LWMA window spans about 3 hours 20 minutes
+            // at the two-minute target.
             difficulty_window: 100,
-            // Native transaction v3 genesis; distinct from earlier networks.
-            genesis_timestamp: 1_793_700_000,
+            // Keep the v1 reset distinct from earlier development genesis hashes.
+            genesis_timestamp: 1_793_700_002,
             anchor_max_age: 100,
             max_future_seconds: 2 * 60 * 60,
-            max_reorg_depth: 100,
+            max_reorg_depth: 50,
             checkpoints: &[],
             address_prefix: AddressPrefix::Main,
             genesis_branch: BranchId::new(0x4d41_494e),
@@ -170,11 +170,11 @@ impl ChainParams {
             // and the miner that started first wins every block.
             block_interval: 5,
             difficulty_window: 6,
-            // Native transaction v3 genesis; distinct from earlier networks.
-            genesis_timestamp: 1_793_700_001,
+            // Keep the v1 reset distinct from earlier development genesis hashes.
+            genesis_timestamp: 1_793_700_003,
             anchor_max_age: 100,
             max_future_seconds: 2 * 60 * 60,
-            max_reorg_depth: 200,
+            max_reorg_depth: 50,
             checkpoints: &[],
             address_prefix: AddressPrefix::Test,
             genesis_branch: BranchId::new(0x5445_5354),
@@ -261,6 +261,13 @@ mod tests {
         assert_eq!(all.len(), count, "a branch id is shared between networks");
         for p in networks {
             assert!(p.upgrades_are_well_formed());
+        }
+    }
+
+    #[test]
+    fn both_networks_limit_reorganizations_to_fifty_blocks() {
+        for params in [ChainParams::mainnet(), ChainParams::test()] {
+            assert_eq!(params.max_reorg_depth, 50);
         }
     }
 

@@ -28,7 +28,7 @@ RHOMBUS_PROPAGATION_REPORT=/tmp/rhombus-public-tor.json \
 
 Both nodes in that experiment run on one host, so it is still not a geographically distributed campaign. Repeat it from multiple locations, with warm and cold Tor clients, varied block sizes and proof counts, and at least two competing miners before changing a consensus interval.
 
-The evaluator shows a simple Poisson arrival calculation for candidate intervals of 10, 30, and 60 seconds. That number is only the probability of at least one block arriving during the measured path delay under a constant-rate model. It is not an orphan-rate estimate, an attack-cost estimate, or a consensus recommendation. The mainnet target is now 300 seconds. The measurements below used the earlier 10-second target; a distributed campaign is still needed to measure p95 path delay and stale blocks while miners compete.
+The evaluator shows a simple Poisson arrival calculation for candidate intervals of 10, 30, and 60 seconds. That number is only the probability of at least one block arriving during the measured path delay under a constant-rate model. It is not an orphan-rate estimate, an attack-cost estimate, or a consensus recommendation. The current mainnet target is 120 seconds. The measurements below used the earlier 10-second target; a distributed campaign is still needed to measure p95 path delay and stale blocks while miners compete.
 
 For an existing node, obtain the same counters and histogram snapshots with its
 authenticated loopback JSON-RPC service (substitute the configured port):

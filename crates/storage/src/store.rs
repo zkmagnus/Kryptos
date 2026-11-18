@@ -17,7 +17,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use protocol::block::{Block, BlockHash};
+use protocol::block::{Block, BlockHash, BlockHeader, HEADER_LEN};
 use protocol::bytes::Encodable;
 use protocol::consensus::next_height;
 use protocol::nullifier::Nullifier;
@@ -45,7 +45,7 @@ const SCHEMA: &str = "schema";
 /// The on-disk layout this code writes and reads. Bumped whenever a table
 /// is added or changed; an older store is refused rather than served with
 /// tables it never filled.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 1;
 
 /// The chain tip.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,9 +93,9 @@ impl Store {
             let recorded = meta.get(SCHEMA)?.map(|v| *v.value());
             let fresh = meta.get(TIP)?.is_none();
             match recorded {
-                Some(v) if v == schema_bytes(SCHEMA_VERSION) => {}
+                Some(v) if v == schema_bytes() => {}
                 None if fresh => {
-                    meta.insert(SCHEMA, &schema_bytes(SCHEMA_VERSION))?;
+                    meta.insert(SCHEMA, &schema_bytes())?;
                 }
                 _ => {
                     return Err(Error::Corrupt(
@@ -161,11 +161,13 @@ impl Store {
             return Ok(None);
         };
         let hash = BlockHash::from_bytes(*hash.value());
-        let block = self
-            .block(&hash)?
+        let blocks = tx.open_table(BLOCKS)?;
+        let bytes = blocks
+            .get(hash.as_bytes())?
             .ok_or(Error::Corrupt("tip block missing"))?;
+        let header = decode_header(bytes.value(), &hash)?;
         Ok(Some(Tip {
-            height: block.header().height,
+            height: header.height,
             hash,
         }))
     }
@@ -243,6 +245,30 @@ impl Store {
             .map(|bytes| bytes.value().len()))
     }
 
+    /// The stored block header, without decoding or allocating transactions.
+    /// The header must match its database key. This is not a body-integrity check;
+    /// callers needing transactions must use [`Self::block`].
+    ///
+    /// # Errors
+    /// Fails on a database error, a truncated/malformed header, or a key mismatch.
+    pub fn header(&self, hash: &BlockHash) -> Result<Option<BlockHeader>> {
+        let tx = self.db.begin_read()?;
+        let blocks = tx.open_table(BLOCKS)?;
+        blocks
+            .get(hash.as_bytes())?
+            .map(|bytes| decode_header(bytes.value(), hash))
+            .transpose()
+    }
+
+    /// Whether a block with a well-formed, matching header is stored.
+    /// This avoids decoding its body and does not certify body integrity.
+    ///
+    /// # Errors
+    /// Returns the same read/header errors as [`Self::header`].
+    pub fn contains_block(&self, hash: &BlockHash) -> Result<bool> {
+        Ok(self.header(hash)?.is_some())
+    }
+
     /// The block with the given hash.
     ///
     /// # Errors
@@ -310,8 +336,7 @@ impl Store {
         let tip_block = blocks
             .get(tip_hash.as_bytes())?
             .ok_or(Error::Corrupt("tip block missing"))?;
-        let tip = Block::from_slice(tip_block.value())?;
-        let tip_height = tip.header().height;
+        let tip_height = decode_header(tip_block.value(), &tip_hash)?.height;
         let floor = tip_height.saturating_sub(max_anchor_age);
 
         let frontiers = read.open_table(FRONTIERS)?;
@@ -533,13 +558,26 @@ fn decode_location(bytes: [u8; 8]) -> (u32, u32) {
     )
 }
 
-fn schema_bytes(version: u32) -> [u8; 32] {
+/// Decode only the fixed-size header while checking its storage-key identity.
+fn decode_header(bytes: &[u8], hash: &BlockHash) -> Result<BlockHeader> {
+    let prefix = bytes
+        .get(..HEADER_LEN)
+        .ok_or(Error::Corrupt("truncated block header"))?;
+    let header = BlockHeader::from_slice(prefix)?;
+    if header.hash() != *hash {
+        return Err(Error::Corrupt("block header hash mismatch"));
+    }
+    Ok(header)
+}
+
+fn schema_bytes() -> [u8; 32] {
     let mut out = [0u8; 32];
-    // Domain-separate the pre-release V1 layout so an older database that
-    // happened to use the numeric schema version 1 cannot be mistaken for it.
-    const SCHEMA_DOMAIN: &[u8; 14] = b"RHOMBUS:STORE:";
+    // The new namespace distinguishes this layout from pre-release stores
+    // that also used numeric schema version 1.
+    const SCHEMA_DOMAIN: &[u8] = b"RHOMBUS:CHAINSTORE:";
     out[..SCHEMA_DOMAIN.len()].copy_from_slice(SCHEMA_DOMAIN);
-    out[SCHEMA_DOMAIN.len()..SCHEMA_DOMAIN.len() + 4].copy_from_slice(&version.to_le_bytes());
+    out[SCHEMA_DOMAIN.len()..SCHEMA_DOMAIN.len() + 4]
+        .copy_from_slice(&SCHEMA_VERSION.to_le_bytes());
     out
 }
 
@@ -584,24 +622,29 @@ mod tests {
     }
 
     #[test]
-    fn the_layout_without_a_work_index_requires_resync() {
+    fn legacy_layouts_require_resync_even_if_the_version_matches() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("v1.redb");
-        {
-            let db = Database::create(&path).unwrap();
-            let tx = db.begin_write().unwrap();
-            tx.open_table(META)
-                .unwrap()
-                .insert(SCHEMA, &schema_bytes(1))
-                .unwrap();
-            tx.commit().unwrap();
+        for version in [1u32, 2] {
+            let path = dir.path().join(format!("old-{version}.redb"));
+            let mut old_stamp = [0u8; 32];
+            old_stamp[..14].copy_from_slice(b"RHOMBUS:STORE:");
+            old_stamp[14..18].copy_from_slice(&version.to_le_bytes());
+            {
+                let db = Database::create(&path).unwrap();
+                let tx = db.begin_write().unwrap();
+                tx.open_table(META)
+                    .unwrap()
+                    .insert(SCHEMA, &old_stamp)
+                    .unwrap();
+                tx.commit().unwrap();
+            }
+            assert!(matches!(
+                Store::open(path),
+                Err(Error::Corrupt(
+                    "store layout outdated; delete it and resync"
+                ))
+            ));
         }
-        assert!(matches!(
-            Store::open(path),
-            Err(Error::Corrupt(
-                "store layout outdated; delete it and resync"
-            ))
-        ));
     }
 
     fn temp_store() -> (tempfile::TempDir, Store) {
@@ -659,6 +702,112 @@ mod tests {
             .apply(&next, &CommitmentTree::empty(), &[0; 32])
             .unwrap();
         assert_eq!(store.tip().unwrap().unwrap().height, 1);
+    }
+
+    #[test]
+    fn header_queries_match_bodies_and_distinguish_missing_from_corrupt() {
+        let (_dir, store) = temp_store();
+        let genesis = block(0, BlockHash::ZERO);
+        let hash = genesis.hash();
+        assert_eq!(store.header(&hash).unwrap(), None);
+        assert!(!store.contains_block(&hash).unwrap());
+        store
+            .apply(&genesis, &CommitmentTree::empty(), &[0; 32])
+            .unwrap();
+        assert_eq!(store.header(&hash).unwrap(), Some(genesis.header().clone()));
+        assert!(store.contains_block(&hash).unwrap());
+
+        // Header queries deliberately do not decode the body. Full reads still
+        // detect truncation, so this optimization never certifies transactions.
+        let mut bytes = genesis.to_vec();
+        bytes.truncate(HEADER_LEN + 1);
+        replace_block_bytes(&store, hash, &bytes);
+        assert_eq!(store.header(&hash).unwrap(), Some(genesis.header().clone()));
+        assert_eq!(store.tip().unwrap().unwrap().height, 0);
+        assert!(store.block(&hash).is_err());
+
+        replace_block_bytes(&store, hash, &bytes[..HEADER_LEN - 1]);
+        assert!(matches!(
+            store.header(&hash),
+            Err(Error::Corrupt("truncated block header"))
+        ));
+        assert!(store.contains_block(&hash).is_err());
+        assert!(store.tip().is_err());
+
+        let other = block(1, hash);
+        replace_block_bytes(&store, hash, &other.to_vec());
+        assert!(matches!(
+            store.header(&hash),
+            Err(Error::Corrupt("block header hash mismatch"))
+        ));
+        assert!(store.contains_block(&hash).is_err());
+        assert!(store.tip().is_err());
+    }
+
+    fn replace_block_bytes(store: &Store, hash: BlockHash, bytes: &[u8]) {
+        let tx = store.db.begin_write().unwrap();
+        tx.open_table(BLOCKS)
+            .unwrap()
+            .insert(hash.as_bytes(), bytes)
+            .unwrap();
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    #[ignore = "explicit local header/body decoding measurement"]
+    fn measure_header_reads_against_full_block_decoding() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        const SAMPLES: u32 = 20;
+
+        let (_dir, store) = temp_store();
+        // A syntactically decodable maximum-shape body with dummy proofs and
+        // signatures. This is not consensus-valid or a throughput benchmark.
+        let count = protocol::consensus::MAX_ACTIONS;
+        let mut bytes = protocol::bytes::Writer::default();
+        bytes
+            .put_u8(protocol::consensus::TX_VERSION)
+            .put_u8(protocol::consensus::COINBASE_KIND)
+            .put(&[0; 32])
+            .put_u64_le(0)
+            .put_u8(u8::try_from(count).unwrap());
+        let rk = crypto::encoding::point_to_bytes(&crypto::curve::Generator::SpendAuth.point());
+        for _ in 0..count {
+            bytes
+                .put(&[0; 32])
+                .put(&rk)
+                .put(&[0; 32])
+                .put(&crypto::commitment::ValueCommitment::identity().to_bytes())
+                .put_u8(protocol::encryption::ENCRYPTED_COIN_VERSION)
+                .put(&vec![0; protocol::encryption::ENCRYPTED_COIN_LEN - 1]);
+        }
+        bytes
+            .put(&vec![0; count * crypto::signature::SIGNATURE_LEN])
+            .put(protocol::transaction::ACTION_PROOF_MAGIC)
+            .put(&vec![0; protocol::consensus::proof_len(count).unwrap()])
+            .put(&[0; crypto::signature::SIGNATURE_LEN]);
+        let tx = Transaction::from_slice(&bytes.into_bytes()).unwrap();
+        let transactions = vec![tx; protocol::consensus::MAX_BLOCK_TRANSACTIONS];
+        let mut header = block(1, BlockHash::ZERO).header().clone();
+        header.tx_root = protocol::block::tx_root(transactions.iter().map(Transaction::txid));
+        let large = Block::new(header, transactions);
+        let hash = large.hash();
+        store.put_block(&large, &[0; 32]).unwrap();
+        assert_eq!(store.header(&hash).unwrap(), Some(large.header().clone()));
+        assert_eq!(store.block(&hash).unwrap(), Some(large));
+
+        let start = Instant::now();
+        for _ in 0..SAMPLES {
+            black_box(store.block(&hash).unwrap());
+        }
+        let bodies = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..SAMPLES {
+            black_box(store.header(&hash).unwrap());
+        }
+        let headers = start.elapsed();
+        println!("header_read_measurement samples={SAMPLES} block_bytes={} full_body_total_us={} header_total_us={}",
+            store.block_encoded_len(&hash).unwrap().unwrap(), bodies.as_micros(), headers.as_micros());
     }
 
     #[test]

@@ -129,10 +129,10 @@ impl SyncHeaders {
         } else {
             let parent = chain
                 .store()
-                .block(&first.prev_hash)?
+                .header(&first.prev_hash)?
                 .ok_or(chain::Error::Orphan)?;
             (
-                branch_headers(chain.store(), parent.header(), lookback)?,
+                branch_headers(chain.store(), &parent, lookback)?,
                 chain.chainwork(&first.prev_hash)?,
             )
         };

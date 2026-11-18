@@ -27,7 +27,7 @@ already pads to an allowed action class whose minimum is two actions.
 
 - Shielded transfers are validated and applied directly by chain consensus.
   The `systemcall` dispatcher and `program-vm` opcode crate were removed.
-- Transaction format version is now `3`. The former transfer opcode and
+- The reset chain uses transaction format version `1`. The former transfer opcode and
   SystemCall entrypoint fields are gone; a native transaction kind distinguishes
   transfers from coinbase records.
 - The transaction header includes the fee as an unsigned 64-bit little-endian
@@ -62,7 +62,7 @@ already pads to an allowed action class whose minimum is two actions.
 
 - `crates/protocol/src/fee.rs`: deterministic fee calculation, block mint,
   and overflow-checked fee summation.
-- `crates/protocol/src/transaction.rs` and `consensus.rs`: transaction v3,
+- `crates/protocol/src/transaction.rs` and `consensus.rs`: the native transaction format,
   encoded fee field, and fee inclusion in effecting data after removing the
   opcode and SystemCall target.
 - `crates/protocol/src/builder.rs` and `validate.rs`: fee-aware transaction
@@ -88,8 +88,8 @@ upgrade. Transaction bytes and block bytes changed; chain reset is assumed.
 
 - `cargo check --workspace` passes after replacing the dispatcher and VM
   opcode crates with native chain transaction validation.
-- `cargo test --workspace --no-run` compiles all active workspace test targets
-  with native transaction version 3.
+- `cargo test --workspace --no-run` compiled all active workspace test targets
+  before the version reset.
 - `cargo test -p protocol --lib`: 104 passed.
 - `cargo test -p chain --test chain --test mempool`: 27 passed.
 - Runtime RPC, sync, and wallet daemon integration tests pass (7 total).

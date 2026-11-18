@@ -170,7 +170,7 @@ async fn json_rpc_serves_the_chain_and_accepts_transactions() {
     assert_eq!(info["network"], "test");
     assert_eq!(info["genesis_hash"], genesis_hash);
     assert!(info.get("block_producer_output_per_action").is_none());
-    assert_eq!(info["branch"], "0x54455331");
+    assert_eq!(info["branch"], "0x54455231");
     assert_eq!(info["pow_limit"], "207fffff");
     assert!(info["pow_limit_change"].is_null());
     assert_eq!(info["proof_lengths"]["2"], 8736);

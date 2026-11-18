@@ -32,7 +32,7 @@ within a bounded range even at the cap. Jitter changes retry timing, not the
 configured peer count. Active streams are not rotated when a circuit becomes
 ineligible for new streams; long-lived duplex connections retain their circuit.
 
-Protocol version 4 completes the application handshake on receipt of a valid
+Protocol version 1 completes the application handshake on receipt of a valid
 Version. The listener queues its Version reply and first application messages
 in the same flight. There is no Verack wait, user-agent string, per-node protocol
 version, or additional application authentication exchange. Version still checks

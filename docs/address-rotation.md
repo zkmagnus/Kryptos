@@ -1,10 +1,12 @@
 # Wallet receive and change address rotation
 
 The wallet tracks a persistent current receive address separately from its
-historical default address. A current address remains stable while unused, and a
-new diversified address is selected after the current one receives a scanned
-payment or the wallet prepares a new outgoing transaction. Previously published
-addresses remain valid and continue to be scanned.
+historical default address. Automatic rotation after a receipt is configurable
+per wallet and enabled by default. When enabled, a new diversified address is
+allocated atomically when the current one receives a scanned payment. Preparing
+an outgoing transaction retires the current address; the next receive-address
+request allocates its replacement. Previously published addresses remain valid
+and continue to be scanned.
 
 This policy changes local wallet allocation and transaction construction. It does
 not change address encoding, key derivation, transaction validity, proof rules,
@@ -15,18 +17,29 @@ addresses are described in [the derivation design](diversified-ml-kem-addresses.
 
 The wallet stores the index of its current receive address. Asking for that
 address repeatedly returns the same value while it is unused. When a full or
-compact scan detects a payment to it, the scanner invalidates that selection in
-the same database transaction that records the received coins. The next request
-for a receive address allocates and persists a fresh index before returning it.
-This lazy allocation avoids creating an address during every scan iteration.
-`getwalletinfo` also requests the current selection, so its first call after
-invalidation can allocate an address; repeated polls return the persisted value.
+compact scan detects a payment to it, and automatic rotation is enabled, the
+scanner records the coins and allocates the next ML-KEM address in the same
+database transaction. After the scan, `getreceiveaddress` and `getwalletinfo`
+immediately return the new address; no extra RPC call is needed to trigger
+rotation.
+
+Set `auto_receive_rotation` to `false` to keep reusing the current address after
+receipts. The wallet still scans and records every payment and spend. The choice
+is stored in wallet metadata and included in version-1 plaintext wallet backups.
+Wallets or supported backups without the field default to enabled. Re-enabling
+the option keeps the current address until its next receipt, unless the user
+explicitly requests a fresh address with `getnewaddress`.
+
+Disabling rotation reduces address-index consumption and scan growth. Anyone
+you give the reused address to can recognize that same address in their own
+payment requests; Rhombus's shielded block data does not publish which wallet
+address received an output.
 
 Receipt detection is tied to the current address being used, not to an exact
 counter of incoming transactions. Compact scan data does not expose the same
 transaction boundaries as a full block scan. Multiple outputs to the current
-address therefore invalidate it once; they do not allocate an address for each
-output. Receiving another payment at an older address continues to credit the
+address therefore rotate it once when automatic rotation is enabled; they do
+not allocate an address for each output. Receiving another payment at an older address continues to credit the
 wallet and does not invalidate an unrelated unused current address.
 
 Rotating the current address cannot change an address already copied by a sender.
@@ -64,10 +77,12 @@ published before the reorganization.
 
 | Entry point | Result |
 | --- | --- |
-| `getreceiveaddress` | `{ "index": <number or null>, "address": <string or null>, "exhausted": <bool> }`; obtains the persisted current selection, allocating lazily if needed. |
-| `getwalletinfo` | Adds `receive_address`, `receive_address_index` and `address_rotation_exhausted`; the existing `next_address_index` includes any allocation performed by this call. |
+| `getreceiveaddress` | `{ "index": <number or null>, "address": <string or null>, "exhausted": <bool> }`; obtains the persisted current selection; pending selections after sends allocate here. |
+| `getwalletinfo` | Adds `receive_address`, `receive_address_index`, `address_rotation_exhausted` and `auto_receive_rotation`; the existing `next_address_index` includes any allocation performed by this call. |
+| `setreceiveaddressrotation` | Takes a required boolean `enabled`, persists the per-wallet receipt-rotation preference, and returns `{ "auto_receive_rotation": <bool> }`. |
 | `getnewaddress` | Existing `{ "index", "address", "label" }` result; always requests a fresh allocation and makes it current. |
 | `rhombus address --network <network> --wallet <path>` | Prints the current receive address and persists a fresh selection if needed; returns an explicit error at exhaustion. |
+| `rhombus set-receive-rotation --network <network> --wallet <path> --enabled <bool>` | Sets the same persisted preference from the CLI. With a running wallet daemon, use the RPC method instead. |
 | `rhombus create` | Prints `address_index` and `address` when available. A restore that reserves the entire range still succeeds and reports `address_rotation_exhausted: true`. |
 
 `keygen` has no wallet database or allocation state and still prints the historical
@@ -147,6 +162,15 @@ Runtime tests cover receive/status RPC, manual selection, exhaustion and live
 daemon receipt/rebroadcast behavior. Formatting, the network source guard and
 whitespace checks passed. Clippy exited successfully with existing legacy
 warnings and no new diagnostics from this change.
+
+On 2026-11-18, the optional per-wallet receive-rotation setting passed the
+wallet suite (**56 passed**), the focused runtime CLI/RPC tests (**2 passed**),
+and the wallet receive-rotation regression (**1 passed**). These reruns cover
+disabled receipt rotation, persisted/re-enabled behavior, continued scanning,
+explicit address issuance, and backups without the preference defaulting to
+enabled.
+Wallet/runtime library Clippy passed with their existing warnings; formatting
+and whitespace checks passed.
 
 Local result logs are `/tmp/rhombus-rotation-wallet-tests.log`,
 `/tmp/rhombus-rotation-runtime-tests.log`,

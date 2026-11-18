@@ -213,17 +213,33 @@ the container's UID/GID with private permissions and test access before deployme
 
 ## Wallet address rotation
 
-Use the wallet's current receive address for new payment requests. It remains
-stable until the wallet scans a payment to it or prepares a new outgoing
-transaction. The next receive-address request then persists and returns a fresh
-diversified address. Previously shared addresses remain valid and scanned; another
-payment to an older address does not invalidate an unrelated unused current one.
+Use the wallet's current receive address for new payment requests. By default,
+it remains stable until the wallet scans a payment to it or prepares a new
+outgoing transaction. When receipt rotation is enabled, the scan immediately
+persists a fresh diversified address; a send retires the selection and the next
+receive-address request allocates its replacement. Previously shared addresses
+remain valid and scanned; another payment to an older address does not invalidate
+an unrelated unused current one.
 `getreceiveaddress` returns the current `{index, address, exhausted}` result.
 `getwalletinfo` also reports `receive_address`, `receive_address_index` and
-`address_rotation_exhausted`. Both methods can allocate the next address on their
-first call after invalidation; repeated calls reuse the persisted current value.
+`address_rotation_exhausted`. With receipt rotation enabled, scans persist the
+next address.
+After a send retires the selection, these methods allocate its replacement;
+repeated calls reuse the persisted current value.
 `getnewaddress` explicitly allocates a new address and selects it as current.
 The CLI `address` command prints that same current selection.
+
+Receipt rotation can be disabled per wallet without disabling scanning. Use
+`setreceiveaddressrotation` with a boolean `enabled` parameter through Wallet
+RPC, or use the CLI while the wallet daemon is stopped:
+
+```sh
+rhombus set-receive-rotation --network main --wallet wallet.redb --enabled false
+```
+
+The setting is saved in wallet metadata and version-1 plaintext backups.
+It defaults to enabled when the field is absent. Manual `getnewaddress` and the
+existing send/change address behavior are unchanged.
 
 Sending uses the recipient address supplied by the caller. Change, when present,
 goes to a freshly reserved wallet address. Reservations are durable before proof
@@ -257,8 +273,24 @@ target/release/rhombus backupwallet --network test \
   --wallet local-test/wallet.redb --out local-test/wallet-backup.json
 ```
 
-The CLI currently exports complete JSON state but has no matching JSON import
-command. A stopped wallet database copy preserves local state. To rebuild
+Restore a version-1 plaintext JSON export into a **new** wallet file:
+
+```sh
+target/release/rhombus restorewallet --network test \
+  --backup local-test/wallet-backup.json --wallet local-test/restored.redb
+```
+
+Both commands refuse to replace an existing destination and publish only a
+complete file. Restoration checks the selected network and validates keys,
+address allocation, coin records, witnesses, scan history and operations before
+publishing the database. The derived nullifier index is rebuilt. Labels,
+pending-operation history, receiving state and reserved address indices are
+preserved; restoring a JSON backup does not require `--restore-through`.
+Synchronize the restored wallet before spending. Restore only your own trusted
+backup: validation is not authentication of the backup or a chain revalidation.
+See [wallet backups](wallet-backup.md) for guarantees and limitations.
+
+A stopped wallet database copy also preserves local state. To rebuild
 coin state from a phrase, supply the highest previously reserved address
 index with `--restore-through` (inclusive, `0..4095`). This bound is required
 because a seed does not reveal which indices were reserved for receiving or
@@ -328,8 +360,9 @@ grows with the number of address keys times the number of outputs; an oversized
 range is rejected rather than silently truncated.
 `getaddressinfo` also reports `scan_covered`: an address may belong to the wallet
 while its new key lies outside the configured scan range. Receipt records keep
-the actual legacy/new address scheme, including after mixed recovery. JSON
-backup format version 2 identifies this metadata and the extended coin records.
+the actual legacy/new address scheme, including after mixed recovery.
+Version-1 plaintext JSON backups include this metadata and the extended coin
+records.
 
 An interrupted reorg has an automatic durable recovery path: restart with the
 same compatible updated binary and allow recovery to finish. See

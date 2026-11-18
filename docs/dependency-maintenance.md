@@ -42,6 +42,44 @@ Clippy warnings remain outside the new networking code. No fresh RustSec audit o
 this expanded graph was run. Dependency security updates for embedded Tor require
 a new application release.
 
+## Dependency validation on 2026-11-18
+
+The cached audit command failed with three vulnerabilities and two unmaintained
+dependency warnings:
+
+```sh
+cargo audit --deny warnings --no-fetch --db "$HOME/.cargo/advisory-db"
+```
+
+The advisory database was commit `02e2517f457a359fc6d3440ea4560c8ea188fee8`,
+dated 2026-11-15. Offline dependency-tree checks, including workspace
+`--all-features --target all`, established the following scope:
+
+| Package | Advisory | Scope and required update |
+| --- | --- | --- |
+| `crypto-bigint 0.5.5` | `RUSTSEC-2026-0387` | Timing variability; retained in the lockfile through inactive SSH elliptic-curve dependencies, absent from the selected build graph. Patched in >=0.7.6. |
+| `libsqlite3-sys 0.38.2` | `RUSTSEC-2026-0459` | Active through `tor-dirmgr` and `rusqlite`; patched crate >=0.39.0. Selected features link system SQLite, without `bundled`; review the system library separately. |
+| `rsa 0.9.10` | `RUSTSEC-2023-0071` | Active through Arti crypto/key-management dependencies; private-key timing advisory, patched in >=0.10.0. Application RSA private-key exposure was not established by this dependency review. |
+| `bincode 2.0.1` | `RUSTSEC-2025-0141` | Unmaintained; inactive optional lockfile dependency through `typed-index-collections`. No patched version listed. |
+| `paste 1.0.15` | `RUSTSEC-2024-0436` | Unmaintained proc macro active through Arti and supporting crates. No patched version listed. |
+
+The SQLite advisory concerns opening a database and sibling WAL written by a
+less trusted party. This host reports system SQLite 3.46.1, older than the
+advisory's fixed 3.54.0; distribution backports were not verified. The affected
+bundled source is also present in vendor, although not selected by this build.
+Fixed crate versions are unavailable in the current vendor tree. Updating them
+requires reviewing upstream migrations: current Arti dependencies constrain RSA
+to 0.9 and rusqlite below 0.41. The inactive elliptic-curve dependencies and
+unmaintained packages also require dependency maintenance.
+
+These findings block the configured `cargo audit --deny warnings` CI check and
+public-release readiness. No dependency updates or advisory suppressions were
+performed. Restricted network access blocked a fresh database fetch, and the
+automatic approval reviewer returned an account/API error for the escalation.
+The cached run also could not lock the crates.io index, so it provides neither
+current advisory coverage nor yanked-release coverage. A fresh online audit is
+still required after remediation.
+
 ## RandomX binding generation
 
 Keep bindgen 0.58.1 and enable only its `runtime` feature. The build script uses

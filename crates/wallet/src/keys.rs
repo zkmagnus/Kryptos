@@ -3,9 +3,7 @@
 use crypto::diversifier::DiversifierIndex;
 use crypto::encryption::{ReceiverKey, TransmissionKey};
 use crypto::hash::{blake2b_short, PIN};
-use crypto::keys::{
-    Diversifier, FullViewingKey, IncomingViewingKey, NullifierKey, OutgoingViewingKey, SpendingKey,
-};
+use crypto::keys::{Diversifier, FullViewingKey, IncomingViewingKey, NullifierKey, SpendingKey};
 use protocol::address::RhombusAddress;
 use protocol::coin::Coin;
 
@@ -122,7 +120,6 @@ pub struct WalletKeys {
     spending: SpendingKey,
     fvk: FullViewingKey,
     ivk: IncomingViewingKey,
-    ovk: OutgoingViewingKey,
     receiver_key: ReceiverKey,
     transmission_key: TransmissionKey,
     legacy_default: bool,
@@ -136,13 +133,11 @@ impl WalletKeys {
     pub fn from_spending_key(sk: SpendingKey) -> Result<Self> {
         let fvk = FullViewingKey::derive(&sk)?;
         let ivk = fvk.incoming_viewing_key()?;
-        let ovk = fvk.outgoing_viewing_key();
         let (receiver_key, transmission_key) = fvk.receiver_key();
         Ok(Self {
             spending: sk,
             fvk,
             ivk,
-            ovk,
             receiver_key,
             transmission_key,
             legacy_default: false,
@@ -161,17 +156,12 @@ impl WalletKeys {
 
     /// Stable identifier used to bind wallet state to its derived keys.
     pub(crate) fn fingerprint(&self) -> [u8; 32] {
-        blake2b_short(PIN, &[&self.fvk.ak().to_bytes(), self.ovk.as_bytes()])
+        blake2b_short(PIN, &[&self.fvk.to_bytes()])
     }
 
     /// The incoming viewing key, for trial decryption.
     pub fn incoming_viewing_key(&self) -> &IncomingViewingKey {
         &self.ivk
-    }
-
-    /// The outgoing viewing key, for recovering what was sent.
-    pub fn outgoing_viewing_key(&self) -> &OutgoingViewingKey {
-        &self.ovk
     }
 
     /// Legacy ML-KEM decapsulation key for old addresses. Use [`ScanKeys`]

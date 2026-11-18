@@ -7,9 +7,7 @@
 //! ct        = ChaCha20-Poly1305(key, nonce = 0, pt)
 //! ```
 //!
-//! The nonce is zero because every key is used exactly once. The outgoing
-//! cipher key `ock` lets the sender, or anyone with its `ovk`, recover
-//! `pk_d` and `esk` and therefore the coin.
+//! The nonce is zero because every key is used exactly once.
 
 use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 use chacha20::ChaCha20;
@@ -24,8 +22,8 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::curve::is_identity;
 use crate::encoding::{point_from_bytes, point_to_bytes, Encoded};
-use crate::hash::{blake2b_short, COIN_KDF, OCK, SHORT_OUTPUT_LEN};
-use crate::keys::{DiversifiedTransmissionKey, IncomingViewingKey, OutgoingViewingKey};
+use crate::hash::{blake2b_short, COIN_KDF, SHORT_OUTPUT_LEN};
+use crate::keys::{DiversifiedTransmissionKey, IncomingViewingKey};
 use crate::secret::SecretScalar;
 use crate::{Error, Result};
 
@@ -139,11 +137,6 @@ impl KemCiphertext {
 }
 
 impl KemSharedSecret {
-    /// Wraps a shared secret recovered from an authenticated outgoing payload.
-    pub fn from_bytes(bytes: [u8; KEM_SHARED_SECRET_LEN]) -> Self {
-        Self(bytes)
-    }
-
     /// Borrows the raw 32-byte shared secret.
     pub fn as_bytes(&self) -> &[u8; KEM_SHARED_SECRET_LEN] {
         &self.0
@@ -155,21 +148,6 @@ impl KemSharedSecret {
         SymmetricKey(blake2b_short(
             COIN_KDF,
             &[&self.0, &ciphertext.to_bytes(), cmx],
-        ))
-    }
-}
-
-impl SymmetricKey {
-    /// Derives the outgoing-coin cipher key for an ML-KEM output.
-    pub fn outgoing_kem(
-        ovk: &OutgoingViewingKey,
-        cv: &[u8; 32],
-        cmx: &[u8; 32],
-        ciphertext: &KemCiphertext,
-    ) -> Self {
-        Self(blake2b_short(
-            OCK,
-            &[ovk.as_bytes(), cv, cmx, &ciphertext.to_bytes()],
         ))
     }
 }
@@ -243,7 +221,7 @@ impl EphemeralSecretKey {
         Self::from_scalar(pallas::Scalar::random(rng))
     }
 
-    /// Canonical encoding, for the outgoing plaintext.
+    /// Canonical encoding of the ephemeral secret scalar.
     pub fn to_bytes(&self) -> Encoded {
         crate::encoding::scalar_to_bytes(&self.0.expose())
     }
@@ -323,12 +301,7 @@ impl core::fmt::Debug for SharedSecret {
 pub struct SymmetricKey([u8; SYMMETRIC_KEY_LEN]);
 
 impl SymmetricKey {
-    /// `ock = PRF_ovk(cv, cmx, epk)`: the outgoing cipher key.
-    pub fn outgoing(ovk: &OutgoingViewingKey, cv: &Encoded, cmx: &Encoded, epk: &Encoded) -> Self {
-        Self(blake2b_short(OCK, &[ovk.as_bytes(), cv, cmx, epk]))
-    }
-
-    /// A random key, for outputs whose sender does not want to recover them.
+    /// Samples a random symmetric key.
     pub fn random(rng: &mut (impl RngCore + CryptoRng)) -> Self {
         let mut bytes = [0u8; SYMMETRIC_KEY_LEN];
         rng.fill_bytes(&mut bytes);
@@ -459,34 +432,6 @@ mod tests {
             let recovered = key.decrypt_lead(&ciphertext[..lead]);
             assert_eq!(recovered, &plaintext[..lead], "lead {lead}");
         }
-    }
-
-    #[test]
-    fn outgoing_key_depends_on_every_input() {
-        let ovk = OutgoingViewingKey::from_bytes([1; 32]);
-        let base = SymmetricKey::outgoing(&ovk, &[2; 32], &[3; 32], &[4; 32]);
-        assert_ne!(
-            base.0,
-            SymmetricKey::outgoing(
-                &OutgoingViewingKey::from_bytes([9; 32]),
-                &[2; 32],
-                &[3; 32],
-                &[4; 32]
-            )
-            .0
-        );
-        assert_ne!(
-            base.0,
-            SymmetricKey::outgoing(&ovk, &[9; 32], &[3; 32], &[4; 32]).0
-        );
-        assert_ne!(
-            base.0,
-            SymmetricKey::outgoing(&ovk, &[2; 32], &[9; 32], &[4; 32]).0
-        );
-        assert_ne!(
-            base.0,
-            SymmetricKey::outgoing(&ovk, &[2; 32], &[3; 32], &[9; 32]).0
-        );
     }
 
     #[test]

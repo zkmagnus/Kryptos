@@ -286,11 +286,37 @@ pub enum Command {
         #[arg(long, default_value = "main")]
         network: Network,
     },
+    /// Restore a plaintext JSON backup to a new wallet database.
+    #[command(name = "restorewallet")]
+    RestoreWallet {
+        /// Version 1 JSON backup created by backupwallet.
+        #[arg(long)]
+        backup: PathBuf,
+        /// New destination wallet file; an existing path is never overwritten.
+        #[arg(long)]
+        wallet: PathBuf,
+        /// Network recorded in the backup.
+        #[arg(long, default_value = "main")]
+        network: Network,
+    },
     /// Show the current unused receiving address of a wallet.
     Address {
         /// The wallet.
         #[command(flatten)]
         wallet: WalletArgs,
+        /// Network, for a wallet file.
+        #[arg(long, default_value = "main")]
+        network: Network,
+    },
+    /// Enable or disable automatic rotation after a payment to the current receive address.
+    #[command(name = "set-receive-rotation")]
+    SetReceiveRotation {
+        /// The wallet.
+        #[command(flatten)]
+        wallet: WalletArgs,
+        /// Enable automatic rotation (`true` or `false`).
+        #[arg(long, action = clap::ArgAction::Set, value_parser = clap::value_parser!(bool))]
+        enabled: bool,
         /// Network, for a wallet file.
         #[arg(long, default_value = "main")]
         network: Network,
@@ -449,7 +475,17 @@ pub async fn run(cli: Cli) -> Result<()> {
             out,
             network,
         } => backup_wallet(&wallet, &out, network),
+        Command::RestoreWallet {
+            backup,
+            wallet,
+            network,
+        } => restore_wallet(&backup, &wallet, network),
         Command::Address { wallet, network } => show_address(&wallet, network),
+        Command::SetReceiveRotation {
+            wallet,
+            enabled,
+            network,
+        } => set_receive_rotation(&wallet, enabled, network),
         Command::Balance { wallet, rpc, light } => balance(&wallet, &rpc, light).await,
         Command::Send {
             wallet,
@@ -722,10 +758,26 @@ fn backup_wallet(wallet: &WalletArgs, out: &Path, network: Network) -> Result<()
     let genesis = genesis(&network.params()).hash();
     let wallet = open_wallet(wallet, genesis)?;
     let bytes = wallet.backup_json()?;
-    let mut file = paths::create_private(out)?;
+    let parent = out
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut file = tempfile::Builder::new()
+        .prefix(".rhombus-wallet-backup-")
+        .tempfile_in(parent)?;
     file.write_all(&bytes)?;
-    file.sync_all()?;
-    println!("wrote JSON wallet backup to {}", out.display());
+    file.as_file().sync_all()?;
+    file.persist_noclobber(out).map_err(|error| error.error)?;
+    println!("wrote plaintext JSON wallet backup to {}", out.display());
+    Ok(())
+}
+
+/// Restores a complete backup without allocating or changing any address.
+fn restore_wallet(backup: &Path, out: &Path, network: Network) -> Result<()> {
+    let bytes = std::fs::read(backup)?;
+    Wallet::restore_backup_json(out, &bytes, genesis(&network.params()).hash())?;
+    println!("restored plaintext wallet backup to {}", out.display());
+    println!("synchronize with the node before spending; retain the original backup");
     Ok(())
 }
 
@@ -752,6 +804,18 @@ fn show_address(wallet: &WalletArgs, network: Network) -> Result<()> {
         )
     })?;
     println!("{}", address.encode(network.address_prefix()));
+    Ok(())
+}
+
+/// Sets the persisted automatic receive-address rotation preference.
+fn set_receive_rotation(wallet: &WalletArgs, enabled: bool, network: Network) -> Result<()> {
+    let genesis = genesis(&network.params()).hash();
+    let wallet = open_wallet(wallet, genesis)?;
+    wallet.set_auto_rotate_receive(enabled)?;
+    println!(
+        "automatic receive-address rotation {}",
+        if enabled { "enabled" } else { "disabled" }
+    );
     Ok(())
 }
 
@@ -953,6 +1017,28 @@ mod tests {
             "unused.redb",
             "--sk",
             "00"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn receive_rotation_command_requires_an_explicit_boolean() {
+        for value in ["true", "false"] {
+            assert!(Cli::try_parse_from([
+                "rhombus",
+                "set-receive-rotation",
+                "--wallet",
+                "wallet.redb",
+                "--enabled",
+                value,
+            ])
+            .is_ok());
+        }
+        assert!(Cli::try_parse_from([
+            "rhombus",
+            "set-receive-rotation",
+            "--wallet",
+            "wallet.redb",
         ])
         .is_err());
     }
@@ -1200,8 +1286,53 @@ mod tests {
             Command::Run { network, .. }
             | Command::Keygen { network }
             | Command::Create { network, .. }
-            | Command::Address { network, .. } => Some(*network),
+            | Command::BackupWallet { network, .. }
+            | Command::RestoreWallet { network, .. }
+            | Command::Address { network, .. }
+            | Command::SetReceiveRotation { network, .. } => Some(*network),
             _ => None,
+        }
+    }
+
+    #[test]
+    fn wallet_backup_and_restore_commands_preserve_state_without_overwrite() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("original.redb");
+        let backup = directory.path().join("backup.json");
+        let restored = directory.path().join("restored.redb");
+        let genesis = genesis(&Network::Test.params()).hash();
+        let mut rng = rand::rngs::OsRng;
+        let wallet =
+            Wallet::create(&original, &SpendingKey::random(&mut rng), genesis, &mut rng).unwrap();
+        wallet.new_address("retained label").unwrap();
+        let expected = wallet.backup_json().unwrap();
+        drop(wallet);
+        let args = WalletArgs { wallet: original };
+        backup_wallet(&args, &backup, Network::Test).unwrap();
+        assert_eq!(std::fs::read(&backup).unwrap(), expected);
+        assert!(backup_wallet(&args, &backup, Network::Test).is_err());
+        assert_eq!(std::fs::read(&backup).unwrap(), expected);
+        assert!(restore_wallet(&backup, &restored, Network::Main).is_err());
+        assert!(!restored.exists());
+        restore_wallet(&backup, &restored, Network::Test).unwrap();
+        let wallet = Wallet::open(&restored, genesis).unwrap();
+        assert_eq!(wallet.backup_json().unwrap(), expected);
+        drop(wallet);
+        assert!(restore_wallet(&backup, &restored, Network::Test).is_err());
+        assert_eq!(
+            Wallet::open(&restored, genesis)
+                .unwrap()
+                .backup_json()
+                .unwrap(),
+            expected
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(backup).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
     }
 
@@ -1212,6 +1343,22 @@ mod tests {
             &["Rhombus", "keygen"],
             &["Rhombus", "create", "--wallet", "w"],
             &["Rhombus", "address", "--wallet", "w"],
+            &[
+                "Rhombus",
+                "backupwallet",
+                "--wallet",
+                "w",
+                "--out",
+                "backup.json",
+            ],
+            &[
+                "Rhombus",
+                "restorewallet",
+                "--backup",
+                "backup.json",
+                "--wallet",
+                "w",
+            ],
         ] {
             let cli = Cli::try_parse_from(argv).unwrap();
             assert_eq!(

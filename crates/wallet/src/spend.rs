@@ -164,19 +164,14 @@ fn build_selected(
         builder.add_spend(SpendInfo::new(sk.clone(), owned.coin.clone(), path))?;
         total = total.saturating_add(owned.coin.value().raw());
     }
-    let ovk = Some(keys.outgoing_viewing_key().clone());
-    builder.add_output(OutputInfo::new(
-        payment.recipient,
-        payment.amount,
-        ovk.clone(),
-    ))?;
+    builder.add_output(OutputInfo::new(payment.recipient, payment.amount))?;
     let change = total
         .checked_sub(amount.raw())
         .and_then(|value| value.checked_sub(fee.raw()))
         .ok_or(protocol::Error::RawCoinOutOfRange)?;
     let change_address = wallet.reserve_send_address(change > 0)?;
     if let Some(address) = change_address {
-        builder.add_output(OutputInfo::new(address, RawCoin::from_raw(change)?, ovk))?;
+        builder.add_output(OutputInfo::new(address, RawCoin::from_raw(change)?))?;
     }
     let transaction = builder.build_with_fee(fee, pk, branch, rng)?;
     Ok(Built {

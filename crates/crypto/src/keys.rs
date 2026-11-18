@@ -9,7 +9,6 @@
 //! SpendValidatingKey ak = [ask] G_spend        (`RedPallas` basepoint)
 //! FullViewingKey    = (ak, nk, rivk)
 //! IncomingViewingKey ivk = H_ivk(ak, nk, rivk)
-//! OutgoingViewingKey ovk = H_ovk(rivk, ak, nk)
 //! DiversifiedTransmissionKey pk_d = [ivk] g_d,   g_d = HashToCurve(d)
 //! ```
 //!
@@ -30,7 +29,7 @@ use crate::encoding::{
 };
 use crate::encryption::{ReceiverKey, TransmissionKey, KEM_SEED_LEN};
 use crate::hash::{
-    blake2b_short, prf_expand, wide_to_base, wide_to_scalar, DK, KEM_ADDRESS_SEED, KEM_SEED, OVK,
+    blake2b_short, prf_expand, wide_to_base, wide_to_scalar, DK, KEM_ADDRESS_SEED, KEM_SEED,
 };
 use crate::poseidon::ivk as poseidon_ivk;
 use crate::secret::{SecretBase, SecretScalar};
@@ -51,9 +50,6 @@ const RIVK_TAG: u8 = 0x08;
 const KEM_TAG: u8 = 0x0A;
 
 const _: () = assert!(KEM_SEED_LEN == crate::hash::WIDE_OUTPUT_LEN);
-/// Byte length of an outgoing viewing key.
-pub const OUTGOING_VIEWING_KEY_LEN: usize = 32;
-
 /// The root secret. Everything else is derived from it.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct SpendingKey([u8; SPENDING_KEY_LEN]);
@@ -267,7 +263,7 @@ impl CommitIvkRandomness {
 /// Byte length of a serialized full viewing key: `ak || nk || rivk`.
 pub const FULL_VIEWING_KEY_LEN: usize = 3 * ENCODED_LEN;
 
-/// The full viewing key: sees incoming and outgoing coins, cannot spend.
+/// The full viewing key: detects incoming coins and tracks spends, cannot spend.
 #[derive(Clone, Debug, Zeroize, ZeroizeOnDrop)]
 pub struct FullViewingKey {
     #[zeroize(skip)]
@@ -337,13 +333,6 @@ impl FullViewingKey {
     /// The ivk commitment randomness.
     pub fn rivk(&self) -> &CommitIvkRandomness {
         &self.rivk
-    }
-
-    /// Derives the outgoing viewing key, which lets the holder decrypt the
-    /// coins this key sent.
-    pub fn outgoing_viewing_key(&self) -> OutgoingViewingKey {
-        let [rivk, ak, nk] = self.viewing_key_material();
-        OutgoingViewingKey(blake2b_short(OVK, &[&rivk, &ak, &nk]))
     }
 
     /// The legacy ML-KEM key pair derived from this full viewing key.
@@ -433,34 +422,6 @@ impl IncomingViewingKey {
     /// The inner scalar, for key agreement.
     pub(crate) fn expose(&self) -> pallas::Scalar {
         self.0.expose()
-    }
-}
-
-/// `ovk`: decrypts the outgoing ciphertext of coins this key sent.
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
-pub struct OutgoingViewingKey([u8; OUTGOING_VIEWING_KEY_LEN]);
-
-impl OutgoingViewingKey {
-    /// Wraps raw bytes.
-    pub fn from_bytes(bytes: [u8; OUTGOING_VIEWING_KEY_LEN]) -> Self {
-        Self(bytes)
-    }
-
-    /// The raw bytes, for the outgoing cipher key derivation.
-    pub fn as_bytes(&self) -> &[u8; OUTGOING_VIEWING_KEY_LEN] {
-        &self.0
-    }
-}
-
-impl ConstantTimeEq for OutgoingViewingKey {
-    fn ct_eq(&self, other: &Self) -> Choice {
-        self.0.ct_eq(&other.0)
-    }
-}
-
-impl core::fmt::Debug for OutgoingViewingKey {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("OutgoingViewingKey(<redacted>)")
     }
 }
 
@@ -678,35 +639,6 @@ mod tests {
     }
 
     #[test]
-    fn diversifier_key_differs_from_outgoing_viewing_key() {
-        let fvk = FullViewingKey::derive(&sk(15)).unwrap();
-        assert_ne!(
-            fvk.diversifier_key().as_bytes(),
-            fvk.outgoing_viewing_key().as_bytes()
-        );
-    }
-
-    #[test]
-    fn outgoing_viewing_key_is_deterministic_and_key_dependent() {
-        let a = FullViewingKey::derive(&sk(13))
-            .unwrap()
-            .outgoing_viewing_key();
-        let b = FullViewingKey::derive(&sk(13))
-            .unwrap()
-            .outgoing_viewing_key();
-        let c = FullViewingKey::derive(&sk(14))
-            .unwrap()
-            .outgoing_viewing_key();
-        assert!(bool::from(a.ct_eq(&b)));
-        assert!(!bool::from(a.ct_eq(&c)));
-        assert_eq!(format!("{a:?}"), "OutgoingViewingKey(<redacted>)");
-        assert_eq!(
-            OutgoingViewingKey::from_bytes(*a.as_bytes()).as_bytes(),
-            a.as_bytes()
-        );
-    }
-
-    #[test]
     fn receiver_key_is_deterministic_and_key_dependent() {
         let a = FullViewingKey::derive(&sk(20)).unwrap().receiver_key().1;
         let b = FullViewingKey::derive(&sk(20)).unwrap().receiver_key().1;
@@ -772,10 +704,6 @@ mod tests {
         assert!(bool::from(
             again.incoming_viewing_key().unwrap().ct_eq(&ivk)
         ));
-        assert_eq!(
-            again.outgoing_viewing_key().as_bytes(),
-            fvk.outgoing_viewing_key().as_bytes()
-        );
         assert!(FullViewingKey::from_bytes(&[0xff; FULL_VIEWING_KEY_LEN]).is_err());
     }
 }

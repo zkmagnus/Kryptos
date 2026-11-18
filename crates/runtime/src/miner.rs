@@ -15,6 +15,7 @@ use protocol::transaction::Transaction;
 use protocol::tree_order::tree_transactions;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use transaction_proof::ProvingKey;
 
 use rand_core::{CryptoRng, RngCore};
@@ -25,8 +26,10 @@ use tokio::task::JoinHandle;
 use crate::node::Event;
 use crate::{Error, Result};
 
-/// Nonces tried per template before asking for a fresh one.
-const NONCES_PER_TEMPLATE: u32 = 32;
+/// Yield to the node to refresh selected transactions after this many nonces.
+const NONCES_PER_BATCH: u32 = 32;
+/// Also refresh after this interval, even on slow hashing machines.
+const WORK_REFRESH: Duration = Duration::from_secs(5);
 /// How long a worker waits before asking again when the node is not
 /// ready to mine (Tor unavailable, no peers, or catching up).
 const NOT_READY_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
@@ -49,6 +52,25 @@ pub struct Template {
 }
 
 impl Template {
+    /// Whether an already proved coinbase and block body remain usable.
+    /// Time alone changes only the header; every other input must match.
+    pub(crate) fn same_work(&self, other: &Self) -> bool {
+        self.same_context(other) && self.transactions == other.transactions
+    }
+
+    /// Inputs other than timestamp and selected transactions. Pool caches
+    /// compare transactions against their shared block body to avoid a copy.
+    pub(crate) fn same_context(&self, other: &Self) -> bool {
+        self.parent == other.parent
+            && self.recent == other.recent
+            && self.tree == other.tree
+            && self.params == other.params
+    }
+
+    pub(crate) fn timestamp(&self) -> u64 {
+        self.now.max(self.parent.timestamp.saturating_add(1))
+    }
+
     /// Builds the coinbase paying `miner` and assembles the header over
     /// it and the template's transactions, with the nonce and solution
     /// still empty. This is the block a pool grinds.
@@ -64,7 +86,7 @@ impl Template {
         let height = next_height(self.parent.height)?;
         let mint = self.mint()?;
         let mut coinbase = Builder::new(self.parent.commitment_root);
-        coinbase.add_output(OutputInfo::new(miner.clone(), mint, None))?;
+        coinbase.add_output(OutputInfo::new(miner.clone(), mint))?;
         let coinbase = coinbase.build_coinbase(pk, mint, self.params.branch_at(height), rng)?;
 
         let mut transactions = vec![coinbase];
@@ -86,7 +108,7 @@ impl Template {
             version: BLOCK_VERSION,
             prev_hash: self.parent.hash(),
             height,
-            timestamp: self.now.max(self.parent.timestamp.saturating_add(1)),
+            timestamp: self.timestamp(),
             commitment_root: tree.root(),
             tx_root: tx_root(transactions.iter().map(Transaction::txid)),
             target: self.next_target()?.to_compact(),
@@ -144,11 +166,41 @@ impl Template {
             return Ok(None);
         }
         let (mut header, transactions) = self.assemble(miner, pk, rng)?;
-        if pow.mine_while(&mut header, NONCES_PER_TEMPLATE, rng, keep_going)? {
+        if pow.mine_while(&mut header, NONCES_PER_BATCH, rng, keep_going)? {
             Ok(Some(Block::new(header, transactions)))
         } else {
             Ok(None)
         }
+    }
+}
+
+/// A proved block body, retained across nonce batches while its inputs match.
+struct PreparedWork {
+    source: Template,
+    header: BlockHeader,
+    transactions: Vec<Transaction>,
+}
+
+impl PreparedWork {
+    fn refresh(&mut self, source: &Template) -> bool {
+        if !self.source.same_work(source) {
+            return false;
+        }
+        self.header.timestamp = source.timestamp();
+        self.header.solution = PowSolution::empty();
+        true
+    }
+
+    fn mine_batch(
+        &mut self,
+        pow: &RandomXPow,
+        rng: &mut (impl RngCore + CryptoRng),
+        keep_going: impl Fn() -> bool,
+    ) -> Result<bool> {
+        let started = Instant::now();
+        Ok(pow.mine_while(&mut self.header, NONCES_PER_BATCH, rng, || {
+            keep_going() && started.elapsed() < WORK_REFRESH
+        })?)
     }
 }
 
@@ -283,6 +335,7 @@ impl Worker {
     /// Fetches a template, mines it on the blocking pool, submits any block
     /// found, and repeats until stopped or the node loop is gone.
     async fn run(self, events: mpsc::Sender<Event>) -> Result<()> {
+        let mut prepared: Option<PreparedWork> = None;
         while !self.stop.load(Ordering::Relaxed) {
             let (reply, response) = oneshot::channel();
             events
@@ -292,6 +345,7 @@ impl Worker {
             let template = match response.await {
                 Ok(Ok(template)) => template,
                 Ok(Err(_)) => {
+                    prepared = None;
                     // The node logs why; mining on its tip now would only
                     // find blocks the network has already moved past.
                     tokio::time::sleep(NOT_READY_RETRY).await;
@@ -309,15 +363,47 @@ impl Worker {
             let mining_allowed = self.mining_allowed.clone();
             // Proving and solving are CPU-bound; run them on the blocking pool
             // so many workers use many cores without starving the runtime.
-            let found = tokio::task::spawn_blocking(move || {
-                let mut rng = rand::rngs::OsRng;
-                template.mine(&payout, pk.as_ref(), &pow, &mut rng, || {
+            let (retained, found) = tokio::task::spawn_blocking(move || -> Result<_> {
+                let can_mine = || {
                     worth_mining(&stop, &tip, parent, tor_status.as_ref())
                         && policy_allows_mining(mining_allowed.as_ref())
-                })
+                };
+                if !can_mine() {
+                    return Ok((None, None));
+                }
+                let mut rng = rand::rngs::OsRng;
+                let mut work = match prepared.filter(|work| work.source.same_work(&template)) {
+                    Some(mut work) => {
+                        work.refresh(&template);
+                        work
+                    }
+                    None => {
+                        let (header, transactions) =
+                            template.assemble(&payout, pk.as_ref(), &mut rng)?;
+                        PreparedWork {
+                            source: template,
+                            header,
+                            transactions,
+                        }
+                    }
+                };
+                // Age from completion of proving so a slow proof does not use
+                // the whole nonce budget. Cancellation is checked after proving
+                // and before every nonce, including across batch boundaries.
+                work.header.timestamp = crate::now().max(work.header.timestamp);
+                let found = work.mine_batch(&pow, &mut rng, can_mine)?;
+                if !can_mine() {
+                    return Ok((None, None));
+                }
+                if found {
+                    Ok((None, Some(Block::new(work.header, work.transactions))))
+                } else {
+                    Ok((Some(work), None))
+                }
             })
             .await
             .map_err(|_| Error::Stopped)??;
+            prepared = retained;
             if let Some(block) = found {
                 events
                     .send(Event::Mined(Box::new(block)))
@@ -332,7 +418,140 @@ impl Worker {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::arithmetic_side_effects
+    )]
+
     use super::*;
+    use rand::SeedableRng;
+
+    fn fixture() -> (Template, RhombusAddress) {
+        let params = ChainParams::test();
+        let (block, tree) = chain::genesis::genesis_with_tree(&params);
+        let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(972);
+        let keys = wallet::keys::WalletKeys::from_spending_key(crypto::keys::SpendingKey::random(
+            &mut rng,
+        ))
+        .unwrap();
+        (
+            Template {
+                parent: block.header().clone(),
+                recent: vec![block.header().clone()],
+                tree,
+                transactions: Vec::new(),
+                params,
+                now: crate::now(),
+            },
+            keys.default_address().unwrap(),
+        )
+    }
+
+    #[test]
+    fn prepared_work_reuses_proof_but_rejects_changed_inputs_and_cancels() {
+        use protocol::bytes::Encodable;
+        let (source, payout) = fixture();
+        let pk = ProvingKey::build().unwrap();
+        let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(973);
+        let started = Instant::now();
+        let (header, transactions) = source.assemble(&payout, &pk, &mut rng).unwrap();
+        let preparation = started.elapsed();
+        let mut work = PreparedWork {
+            source: source.clone(),
+            header,
+            transactions,
+        };
+        let original = work.transactions.clone();
+        let original_root = work.header.tx_root;
+        let mut refreshed = source.clone();
+        refreshed.now += 5;
+        let started = Instant::now();
+        for _ in 0..64 {
+            assert!(work.refresh(&refreshed));
+        }
+        let refresh = started.elapsed();
+        eprintln!("mining preparation: {preparation:?}; 64 retained-work refreshes: {refresh:?}");
+        assert_eq!(
+            work.transactions, original,
+            "coinbase proof/body remain identical"
+        );
+        assert_eq!(work.header.tx_root, original_root);
+        assert_eq!(work.header.timestamp, refreshed.timestamp());
+
+        // Comparing full transactions also catches changed authorization/proof
+        // bytes, whose txid is intentionally unchanged by the protocol.
+        let mut changed = source.clone();
+        changed.transactions = original.clone();
+        assert!(
+            !work.refresh(&changed),
+            "new included transactions require a new body"
+        );
+        changed = source.clone();
+        changed.parent.nonce[0] ^= 1;
+        assert!(
+            !work.refresh(&changed),
+            "same-height parent replacement invalidates work"
+        );
+        changed = source.clone();
+        changed.recent[0].timestamp += 1;
+        assert!(!work.refresh(&changed), "difficulty history changed");
+        changed = source.clone();
+        changed.params.block_interval += 1;
+        assert!(!work.refresh(&changed), "network parameters changed");
+        changed = source.clone();
+        changed
+            .tree
+            .append(original[0].actions()[0].body().cmx())
+            .unwrap();
+        assert!(!work.refresh(&changed), "commitment frontier changed");
+
+        let pow = RandomXPow::new(source.params.randomx_key).unwrap();
+        let before = work.header.clone();
+        assert!(!work.mine_batch(&pow, &mut rng, || false).unwrap());
+        assert_eq!(
+            work.header, before,
+            "cancellation prevents even the first nonce"
+        );
+        let parent = source.parent.hash();
+        let (tip, watched) = watch::channel(parent);
+        let stop = AtomicBool::new(false);
+        tip.send_replace(BlockHash::from_bytes([99; 32]));
+        assert!(!work
+            .mine_batch(&pow, &mut rng, || worth_mining(
+                &stop, &watched, parent, None
+            ))
+            .unwrap());
+        assert_eq!(work.header, before, "tip movement cancels retained work");
+        // Retained work still produces a valid solution after cancellation.
+        assert!(work.mine_batch(&pow, &mut rng, || true).unwrap());
+        pow.check(&work.header).unwrap();
+        assert_eq!(work.transactions, original);
+
+        // On a hard target, unsuccessful batches keep the body and continue
+        // sampling fresh random nonces rather than restarting a nonce stream.
+        work.header.target = 0x0300_0001;
+        assert!(!work.mine_batch(&pow, &mut rng, || true).unwrap());
+        let nonce = work.header.nonce;
+        assert!(!work.mine_batch(&pow, &mut rng, || true).unwrap());
+        assert_ne!(work.header.nonce, nonce);
+        assert_eq!(work.transactions, original);
+
+        let mut with_tx = source.clone();
+        with_tx.transactions = original.clone();
+        let mut altered = with_tx.clone();
+        let mut bytes = altered.transactions[0].to_vec();
+        *bytes.last_mut().unwrap() ^= 1;
+        altered.transactions[0] = Transaction::from_slice(&bytes).unwrap();
+        assert_eq!(
+            with_tx.transactions[0].txid(),
+            altered.transactions[0].txid()
+        );
+        assert!(
+            !with_tx.same_work(&altered),
+            "authorization changes invalidate reuse even with the same txid"
+        );
+    }
 
     #[test]
     fn work_continues_only_while_unstopped_and_on_the_best_tip() {

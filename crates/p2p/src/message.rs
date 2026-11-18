@@ -12,7 +12,7 @@ use protocol::transaction::{Transaction, TxId};
 use crate::{Error, Result};
 
 /// The only protocol version.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 1;
 /// Upper bound on one encoded message, large enough for a maximum-size block.
 pub const MAX_MESSAGE_LEN: usize = 50 * 1024 * 1024;
 /// Most inventory items in one message.

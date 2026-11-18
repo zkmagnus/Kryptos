@@ -132,7 +132,6 @@ fn a_coinbase_output_can_be_spent_once() {
     b.add_output(OutputInfo::new(
         recipient.address,
         RawCoin::from_raw(pay).unwrap(),
-        None,
     ))
     .unwrap();
     let tx = b
@@ -241,7 +240,7 @@ fn with_corrupted_proof(block: &Block) -> Block {
         + 1
         + tx.actions().len() * protocol::action::ACTION_BODY_LEN
         + tx.actions().len() * crypto::signature::SIGNATURE_LEN;
-    // Preserve the V2 domain marker and alter the first action-proof byte.
+    // Preserve the proof envelope marker and alter the first action-proof byte.
     bytes[proof_offset + 4] ^= 1;
     let bad = Transaction::from_slice(&bytes).unwrap();
     assert_eq!(bad.txid(), tx.txid(), "the txid excludes the proof");
@@ -313,6 +312,118 @@ fn a_longer_side_chain_triggers_a_reorganization() {
         h.chain.store().block(&main_3.hash()).unwrap().is_some(),
         "old block kept"
     );
+}
+
+#[test]
+fn deep_side_branches_are_refused_before_persisting_body_or_work() {
+    let mut h = Harness::with_params(
+        401,
+        ChainParams {
+            max_reorg_depth: 2,
+            ..ChainParams::test()
+        },
+    );
+    h.extend(Vec::new());
+    let fork = h.tip_header();
+    let fork_tree = h.chain.store().tree().unwrap();
+    let (side, side_tree) = h.make_block_on(&fork, &fork_tree, Vec::new());
+    let (unseen_side, _) = h.make_block_on(&fork, &fork_tree, Vec::new());
+    h.extend(Vec::new());
+    assert_eq!(h.import(&side).unwrap(), Import::SideChain);
+    let (descendant, _) = h.make_block_on(side.header(), &side_tree, Vec::new());
+    h.extend(Vec::new());
+    h.extend(Vec::new());
+    let tip = h.chain.tip().unwrap();
+    let work = h.chain.tip_chainwork().unwrap();
+
+    // The stored branch has now aged out; neither its child nor another direct
+    // fork from that old canonical parent may leave new persistent entries.
+    for rejected in [unseen_side, descendant] {
+        assert!(matches!(
+            h.import(&rejected),
+            Err(Error::InvalidBlock("reorganization too deep"))
+        ));
+        assert!(!h.chain.store().contains_block(&rejected.hash()).unwrap());
+        assert_eq!(h.chain.store().chainwork(&rejected.hash()).unwrap(), None);
+        assert_eq!(h.chain.tip().unwrap(), tip);
+        assert_eq!(h.chain.tip_chainwork().unwrap(), work);
+        assert!(h.chain.store().pending_reorg().unwrap().is_none());
+    }
+}
+
+#[test]
+fn side_branch_can_reorganize_at_the_exact_depth_boundary() {
+    let mut h = Harness::with_params(
+        402,
+        ChainParams {
+            max_reorg_depth: 2,
+            ..ChainParams::test()
+        },
+    );
+    h.extend(Vec::new());
+    let fork = h.tip_header();
+    let fork_tree = h.chain.store().tree().unwrap();
+    let main_2 = h.extend(Vec::new());
+    let main_3 = h.extend(Vec::new());
+    let (side_2, tree_2) = h.make_block_on(&fork, &fork_tree, Vec::new());
+    assert_eq!(h.import(&side_2).unwrap(), Import::SideChain);
+    let (side_3, tree_3) = h.make_block_on(side_2.header(), &tree_2, Vec::new());
+    assert_eq!(h.import(&side_3).unwrap(), Import::SideChain);
+    let (side_4, _) = h.make_block_on(side_3.header(), &tree_3, Vec::new());
+    assert_eq!(
+        h.import(&side_4).unwrap(),
+        Import::Reorganized {
+            reverted: vec![main_3, main_2],
+            applied: 3,
+        }
+    );
+    assert_eq!(h.chain.tip().unwrap().hash, side_4.hash());
+    assert_eq!(h.chain.store().hash_at(2).unwrap(), Some(side_2.hash()));
+    assert_eq!(h.chain.store().hash_at(3).unwrap(), Some(side_3.hash()));
+    assert!(h.chain.store().pending_reorg().unwrap().is_none());
+}
+
+#[test]
+fn boundary_reorg_retains_anchors_needed_before_the_fork() {
+    let mut h = Harness::with_params(
+        403,
+        ChainParams {
+            max_reorg_depth: 1,
+            anchor_max_age: 1,
+            ..ChainParams::test()
+        },
+    );
+    h.extend(Vec::new());
+    let old_anchor = h.tip_header().commitment_root;
+    let spender = h.miner.clone_for_test(0);
+    let recipient = Wallet::new(&mut ChaCha20Rng::seed_from_u64(404));
+    let branch = h.chain.params().branch_at(3);
+    let transaction = spend_first_coin_for(&mut h, &spender, &recipient.address, 1_000, branch);
+    assert_eq!(transaction.anchor(), &old_anchor);
+    h.extend(Vec::new());
+    let fork = h.tip_header();
+    let fork_tree = h.chain.store().tree().unwrap();
+    let main = h.extend(Vec::new());
+    assert!(
+        h.chain.store().tree_at(1).unwrap().is_some(),
+        "fork at height 2 still needs height-1 anchors"
+    );
+    let (side, side_tree) = h.make_block_on(&fork, &fork_tree, vec![transaction]);
+    assert_eq!(h.import(&side).unwrap(), Import::SideChain);
+    let (winner, _) = h.make_block_on(side.header(), &side_tree, Vec::new());
+    assert_eq!(
+        h.import(&winner).unwrap(),
+        Import::Reorganized {
+            reverted: vec![main],
+            applied: 2,
+        }
+    );
+    assert_eq!(h.chain.tip().unwrap().hash, winner.hash());
+    assert!(
+        h.chain.store().tree_at(1).unwrap().is_none(),
+        "the old anchor may be pruned after the new tip no longer needs it"
+    );
+    assert!(h.chain.store().tree_at(2).unwrap().is_some());
 }
 
 #[test]
@@ -434,7 +545,7 @@ fn coinbase_for(
 ) -> protocol::transaction::Transaction {
     let credit = subsidy(parent.height + 1);
     let mut b = Builder::new(parent.commitment_root);
-    b.add_output(OutputInfo::new(h.miner.address.clone(), credit, None))
+    b.add_output(OutputInfo::new(h.miner.address.clone(), credit))
         .unwrap();
     b.build_coinbase(proving_key(), credit, branch, &mut h.rng)
         .unwrap()
@@ -494,7 +605,7 @@ fn a_coinbase_claiming_the_wrong_credit_is_rejected() {
     for wrong in [subsidy(height).raw() + 1, subsidy(height).raw() - 1] {
         let credit = RawCoin::from_raw(wrong).unwrap();
         let mut b = Builder::new(parent.commitment_root);
-        b.add_output(OutputInfo::new(h.miner.address.clone(), credit, None))
+        b.add_output(OutputInfo::new(h.miner.address.clone(), credit))
             .unwrap();
         let coinbase = b
             .build_coinbase(
@@ -523,7 +634,7 @@ fn coinbase_with_nonzero_fee_is_rejected_before_binding_verification() {
     let credit = subsidy(parent.height + 1);
     let mut builder = Builder::new(parent.commitment_root);
     builder
-        .add_output(OutputInfo::new(h.miner.address.clone(), credit, None))
+        .add_output(OutputInfo::new(h.miner.address.clone(), credit))
         .unwrap();
     let coinbase = builder
         .build_coinbase(
@@ -554,7 +665,7 @@ fn only_the_first_transaction_may_create_value() {
     let credit = subsidy(parent.height + 1);
     let mut first = Builder::new(parent.commitment_root);
     first
-        .add_output(OutputInfo::new(h.miner.address.clone(), credit, None))
+        .add_output(OutputInfo::new(h.miner.address.clone(), credit))
         .unwrap();
     let coinbase = first
         .build_coinbase(
@@ -566,7 +677,7 @@ fn only_the_first_transaction_may_create_value() {
         .unwrap();
     let mut second = Builder::new(parent.commitment_root);
     second
-        .add_output(OutputInfo::new(h.miner.address.clone(), credit, None))
+        .add_output(OutputInfo::new(h.miner.address.clone(), credit))
         .unwrap();
     let extra = second
         .build_coinbase(

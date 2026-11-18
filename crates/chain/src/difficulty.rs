@@ -123,6 +123,21 @@ mod tests {
     }
 
     #[test]
+    fn mainnet_retargets_around_two_minutes() {
+        let params = ChainParams::mainnet();
+        // LWMA divides each target by 100. Use a target divisible by 100
+        // so the test can check the configured spacing without rounding.
+        let target = Target::from_compact(0x1364_0000).unwrap();
+        let count = params.difficulty_window + 1;
+        assert_eq!(
+            next_target(&params, 101, &history(120, target, count)),
+            target
+        );
+        assert!(next_target(&params, 101, &history(60, target, count)) < target);
+        assert!(next_target(&params, 101, &history(240, target, count)) > target);
+    }
+
+    #[test]
     fn results_survive_the_compact_roundtrip() {
         let p = params();
         let target = Target::from_u256((U256::one() << 150) + U256::from(12345u64));

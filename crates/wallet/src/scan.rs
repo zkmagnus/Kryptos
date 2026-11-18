@@ -325,7 +325,7 @@ mod tests {
         use protocol::compact::CompactAction;
         use protocol::encryption::{encrypt_coin, COMPACT_COIN_LEAD};
         use protocol::transaction::Anchor;
-        use transaction_proof::{PrivateTransactionProofV2, Proof};
+        use transaction_proof::{ActionProofEnvelope, Proof};
 
         let mut rng = ChaCha20Rng::seed_from_u64(70);
         let keys = WalletKeys::from_spending_key(SpendingKey::random(&mut rng)).unwrap();
@@ -352,7 +352,7 @@ mod tests {
             );
             let cmx = coin.cmx().unwrap();
             let cv = ValueCommitment::commit(0, &ValueCommitTrapdoor::random(&mut rng));
-            let encrypted = encrypt_coin(&coin, address.kem_key(), None, &cv, &mut rng).unwrap();
+            let encrypted = encrypt_coin(&coin, address.kem_key(), &mut rng).unwrap();
             let rk = RandomizedSigningKey::new(
                 &SpendAuthorizingKey::derive(keys.spending_key()).unwrap(),
                 &SpendAuthRandomizer::random(&mut rng),
@@ -382,18 +382,19 @@ mod tests {
                 expected_coin = Some(coin);
             }
         }
-        let tx =
-            Transaction::new(
-                Anchor::from_base(crypto::pallas::Base::zero()),
-                RawCoin::ZERO,
-                actions,
-                PrivateTransactionProofV2::new(&Proof::from_bytes(
-                    vec![0; protocol::consensus::proof_len(4).unwrap()],
-                ))
-                .unwrap(),
-                BindingSignature::from_bytes([0; 64]),
-            )
-            .unwrap();
+        let tx = Transaction::new(
+            Anchor::from_base(crypto::pallas::Base::zero()),
+            RawCoin::ZERO,
+            actions,
+            ActionProofEnvelope::new(&Proof::from_bytes(vec![
+                0;
+                protocol::consensus::proof_len(4)
+                    .unwrap()
+            ]))
+            .unwrap(),
+            BindingSignature::from_bytes([0; 64]),
+        )
+        .unwrap();
         let block = Block::new(empty_header(7, BlockHash::ZERO, *tx.anchor()), vec![tx]);
         let tree = vec![&block.transactions()[0]];
         let full = scan_block(&keys, &block, &tree, 20).unwrap();
@@ -434,7 +435,7 @@ mod tests {
         use protocol::compact::CompactAction;
         use protocol::encryption::{encrypt_coin, EncryptedCoin, COMPACT_COIN_LEAD};
         use protocol::transaction::Anchor;
-        use transaction_proof::{PrivateTransactionProofV2, Proof};
+        use transaction_proof::{ActionProofEnvelope, Proof};
 
         let mut rng = ChaCha20Rng::seed_from_u64(71);
         let keys = WalletKeys::from_spending_key(SpendingKey::random(&mut rng)).unwrap();
@@ -475,15 +476,12 @@ mod tests {
             } else {
                 address.kem_key()
             };
-            let mut encrypted = encrypt_coin(&coin, ek, None, &cv, &mut rng).unwrap();
+            let mut encrypted = encrypt_coin(&coin, ek, &mut rng).unwrap();
             if index == 5 {
                 let mut ciphertext = *encrypted.enc_ciphertext();
                 ciphertext[0] ^= 1;
-                encrypted = EncryptedCoin::from_parts(
-                    encrypted.kem_ciphertext().clone(),
-                    ciphertext,
-                    *encrypted.out_ciphertext(),
-                );
+                encrypted =
+                    EncryptedCoin::from_parts(encrypted.kem_ciphertext().clone(), ciphertext);
             }
             let rk = RandomizedSigningKey::new(
                 &SpendAuthorizingKey::derive(keys.spending_key()).unwrap(),
@@ -504,19 +502,19 @@ mod tests {
                     .sign(SpendAuthSignature::from_bytes([0; 64])),
             );
         }
-        let tx =
-            Transaction::new(
-                Anchor::from_base(crypto::pallas::Base::zero()),
-                RawCoin::ZERO,
-                actions,
-                PrivateTransactionProofV2::new(&Proof::from_bytes(vec![
+        let tx = Transaction::new(
+            Anchor::from_base(crypto::pallas::Base::zero()),
+            RawCoin::ZERO,
+            actions,
+            ActionProofEnvelope::new(&Proof::from_bytes(vec![
                 0;
-                protocol::consensus::proof_len(8).unwrap()
+                protocol::consensus::proof_len(8)
+                    .unwrap()
             ]))
-                .unwrap(),
-                BindingSignature::from_bytes([0; 64]),
-            )
-            .unwrap();
+            .unwrap(),
+            BindingSignature::from_bytes([0; 64]),
+        )
+        .unwrap();
         let block = Block::new(empty_header(7, BlockHash::ZERO, *tx.anchor()), vec![tx]);
         let tree = vec![&block.transactions()[0]];
 

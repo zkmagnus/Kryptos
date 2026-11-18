@@ -24,7 +24,7 @@ initial synchronization, and five seconds of stable readiness. The first node
 of a new chain must explicitly use `--bootstrap-mining` to mine without peers.
 See [mining readiness](docs/mining-readiness.md) for configuration and
 [block propagation measurements](docs/block-propagation.md) for measured results
-and the limits of the 300-second mainnet target.
+and the limits of the 120-second mainnet target.
 
 ## Build from source
 
@@ -55,6 +55,15 @@ committed and Cargo uses the vendored dependencies offline.
 
 Follow the [operations guide](docs/operations.md) for a two-node test network
 over Tor, wallet recovery, and public-network readiness requirements.
+
+Each newly issued receiving address has its own ML-KEM key. Scanning a payment
+to the active address atomically selects the next address by default; automatic
+receipt rotation can be disabled per wallet, and older addresses remain
+scannable. A full wallet export can be recovered with `restorewallet`, preserving
+address reservations and local state; see [backup and restoration](docs/wallet-backup.md).
+Wallet exports currently contain plaintext secrets. The selected reorganization
+limit is 50 blocks on both networks; [compatibility notes](docs/release-hardening.md)
+explain why chain databases built with previous limits require a fresh sync.
 
 Repository [CI](.github/workflows/ci.yml) checks formatting, builds, tests, and
 dependency advisories. Validation limits and public-release requirements are

@@ -1,25 +1,17 @@
 //! Coin plaintext layout, encryption, and trial decryption.
 //!
 //! ```text
-//! coin plaintext  = version(1) || d(11) || value(8 LE) || rseed(32) ||
-//! out plaintext   = pk_d(32) || ek(1184) || KEM shared secret(32)
+//! coin plaintext  = version(1) || d(11) || value(8 LE) || rseed(32)
 //! ```
 //!
 //! The receiver decapsulates with its ML-KEM key and uses `ivk` to reconstruct
-//! the recipient. The sender, or a holder of its `ovk`, recovers the KEM shared
-//! secret and `pk_d` from the outgoing ciphertext. Both paths rebuild the coin
-//! and check it against the public commitment.
+//! the recipient. It rebuilds the coin and checks it against the public
+//! commitment.
 
-use crypto::commitment::ValueCommitment;
-use crypto::encoding::ENCODED_LEN;
 use crypto::encryption::{
-    KemCiphertext, KemSharedSecret, ReceiverKey, SymmetricKey, TransmissionKey, KEM_CIPHERTEXT_LEN,
-    KEM_ENCAPSULATION_KEY_LEN, KEM_SHARED_SECRET_LEN, TAG_LEN,
+    KemCiphertext, KemSharedSecret, ReceiverKey, TransmissionKey, KEM_CIPHERTEXT_LEN, TAG_LEN,
 };
-use crypto::keys::{
-    DiversifiedTransmissionKey, Diversifier, IncomingViewingKey, OutgoingViewingKey,
-    DIVERSIFIER_LEN,
-};
+use crypto::keys::{DiversifiedTransmissionKey, Diversifier, IncomingViewingKey, DIVERSIFIER_LEN};
 use rand_core::{CryptoRng, RngCore};
 
 use crate::amount::RawCoin;
@@ -29,19 +21,15 @@ use crate::{Error, Result};
 
 /// The only plaintext version currently defined.
 const PLAINTEXT_VERSION: u8 = 0x01;
+/// Version of the recipient-only encrypted coin encoding.
+pub const ENCRYPTED_COIN_VERSION: u8 = 1;
 
 /// Byte length of a coin plaintext.
 pub const COIN_PLAINTEXT_LEN: usize = 1 + DIVERSIFIER_LEN + 8 + RANDOM_SEED_LEN;
 /// Byte length of a coin ciphertext.
 pub const COIN_CIPHERTEXT_LEN: usize = COIN_PLAINTEXT_LEN + TAG_LEN;
-/// Byte length of an outgoing plaintext.
-pub const OUT_PLAINTEXT_LEN: usize =
-    ENCODED_LEN + KEM_ENCAPSULATION_KEY_LEN + KEM_SHARED_SECRET_LEN;
-/// Byte length of an outgoing ciphertext.
-pub const OUT_CIPHERTEXT_LEN: usize = OUT_PLAINTEXT_LEN + TAG_LEN;
 /// Byte length of an encoded [`EncryptedCoin`].
-pub const ENCRYPTED_COIN_LEN: usize =
-    1 + KEM_CIPHERTEXT_LEN + COIN_CIPHERTEXT_LEN + OUT_CIPHERTEXT_LEN;
+pub const ENCRYPTED_COIN_LEN: usize = 1 + KEM_CIPHERTEXT_LEN + COIN_CIPHERTEXT_LEN;
 /// Bytes of the coin ciphertext a light client needs to detect and
 /// rebuild a coin: version, diversifier, value and seed.
 pub const COMPACT_COIN_LEAD: usize = 1 + DIVERSIFIER_LEN + 8 + RANDOM_SEED_LEN;
@@ -51,7 +39,6 @@ pub const COMPACT_COIN_LEAD: usize = 1 + DIVERSIFIER_LEN + 8 + RANDOM_SEED_LEN;
 pub struct EncryptedCoin {
     kem_ciphertext: KemCiphertext,
     enc_ciphertext: [u8; COIN_CIPHERTEXT_LEN],
-    out_ciphertext: [u8; OUT_CIPHERTEXT_LEN],
 }
 
 impl EncryptedCoin {
@@ -65,89 +52,58 @@ impl EncryptedCoin {
         &self.enc_ciphertext
     }
 
-    /// The outgoing ciphertext.
-    pub fn out_ciphertext(&self) -> &[u8; OUT_CIPHERTEXT_LEN] {
-        &self.out_ciphertext
-    }
-
     /// Builds from parts already validated elsewhere.
     pub fn from_parts(
         kem_ciphertext: KemCiphertext,
         enc_ciphertext: [u8; COIN_CIPHERTEXT_LEN],
-        out_ciphertext: [u8; OUT_CIPHERTEXT_LEN],
     ) -> Self {
         Self {
             kem_ciphertext,
             enc_ciphertext,
-            out_ciphertext,
         }
     }
 }
 
 impl Encodable for EncryptedCoin {
     fn write(&self, w: &mut Writer) {
-        w.put_u8(2)
+        w.put_u8(ENCRYPTED_COIN_VERSION)
             .put(&self.kem_ciphertext.to_bytes())
-            .put(&self.enc_ciphertext)
-            .put(&self.out_ciphertext);
+            .put(&self.enc_ciphertext);
     }
     fn read(r: &mut Reader<'_>) -> Result<Self> {
-        if r.take_u8()? != 2 {
+        if r.take_u8()? != ENCRYPTED_COIN_VERSION {
             return Err(Error::Malformed("unsupported encrypted-coin version"));
         }
         let kem_ciphertext = KemCiphertext::from_bytes(r.take(KEM_CIPHERTEXT_LEN)?)?;
-        Ok(Self::from_parts(
-            kem_ciphertext,
-            r.take_array()?,
-            r.take_array()?,
-        ))
+        Ok(Self::from_parts(kem_ciphertext, r.take_array()?))
     }
 }
 
-/// Encrypts `coin` for its recipient and, if `ovk` is given, for the sender.
-///
-/// `cv` is the action's value commitment, bound into the outgoing key so a
-/// sender can only recover outputs of the action it actually created.
+/// Encrypts `coin` for its recipient.
 ///
 /// # Errors
 /// Fails if the coin's recipient has an invalid diversifier.
 pub fn encrypt_coin(
     coin: &Coin,
     ek: &TransmissionKey,
-    ovk: Option<&OutgoingViewingKey>,
-    cv: &ValueCommitment,
     rng: &mut (impl RngCore + CryptoRng),
 ) -> Result<EncryptedCoin> {
     let (kem_ciphertext, shared_secret) = ek.encapsulate(rng)?;
-    encrypt_coin_with_kem(coin, ek, kem_ciphertext, &shared_secret, ovk, cv, rng)
+    encrypt_coin_with_kem(coin, kem_ciphertext, &shared_secret)
 }
 
 fn encrypt_coin_with_kem(
     coin: &Coin,
-    ek: &TransmissionKey,
     kem_ciphertext: KemCiphertext,
     shared_secret: &KemSharedSecret,
-    ovk: Option<&OutgoingViewingKey>,
-    cv: &ValueCommitment,
-    rng: &mut (impl RngCore + CryptoRng),
 ) -> Result<EncryptedCoin> {
     let cmx = coin.cmx()?.to_bytes();
     let key = shared_secret.coin_key(&kem_ciphertext, &cmx);
     let enc_ciphertext = fixed(key.encrypt(&CoinPlaintext::from_coin(coin).encode()))?;
 
-    let (ock, out_plaintext) = match ovk {
-        Some(ovk) => (
-            SymmetricKey::outgoing_kem(ovk, &cv.to_bytes(), &cmx, &kem_ciphertext),
-            out_plaintext(coin.pk_d(), ek, shared_secret),
-        ),
-        None => (SymmetricKey::random(rng), random_out_plaintext(rng)),
-    };
-    let out_ciphertext = fixed(ock.encrypt(&out_plaintext))?;
-
     Ok(EncryptedCoin {
         kem_ciphertext,
         enc_ciphertext,
-        out_ciphertext,
     })
 }
 /// Trial-decrypts as the receiver.
@@ -230,63 +186,6 @@ fn finish_trial_decryption(
     }
 }
 
-/// Decrypts as the sender, using the outgoing viewing key.
-///
-/// # Errors
-/// Returns [`crypto::Error::DecryptionFailed`] when this key did not
-/// send the coin, or [`Error::CoinDecryption`] on an inconsistent plaintext.
-pub fn decrypt_coin_with_ovk(
-    ovk: &OutgoingViewingKey,
-    encrypted: &EncryptedCoin,
-    cv: &ValueCommitment,
-    rho: Rho,
-    cmx: &ExtractedCoinCommitment,
-) -> Result<Coin> {
-    let (pk_d, _, shared_secret) = recover_output_keys(ovk, encrypted, cv, cmx)?;
-    decrypt_coin_with_keys(&pk_d, &shared_secret, encrypted, rho, cmx)
-}
-
-/// Recovers, as the sender, the transmission key and KEM shared secret of
-/// an output: the two values that let anyone decrypt exactly that coin.
-///
-/// # Errors
-/// Returns [`crypto::Error::DecryptionFailed`] when this key did not
-/// send the coin.
-pub fn recover_output_keys(
-    ovk: &OutgoingViewingKey,
-    encrypted: &EncryptedCoin,
-    cv: &ValueCommitment,
-    cmx: &ExtractedCoinCommitment,
-) -> Result<(DiversifiedTransmissionKey, TransmissionKey, KemSharedSecret)> {
-    let ock = SymmetricKey::outgoing_kem(
-        ovk,
-        &cv.to_bytes(),
-        &cmx.to_bytes(),
-        &encrypted.kem_ciphertext,
-    );
-    let out_plaintext = ock.decrypt(&encrypted.out_ciphertext)?;
-    parse_out_plaintext(&out_plaintext)
-}
-
-/// Decrypts one output with its recovered KEM secret and checks it against the
-/// action's public data.
-///
-/// # Errors
-/// Returns [`crypto::Error::DecryptionFailed`] if the keys do not
-/// open the ciphertext, or [`Error::CoinDecryption`] if the plaintext
-/// does not match the action.
-pub fn decrypt_coin_with_keys(
-    pk_d: &DiversifiedTransmissionKey,
-    shared_secret: &KemSharedSecret,
-    encrypted: &EncryptedCoin,
-    rho: Rho,
-    cmx: &ExtractedCoinCommitment,
-) -> Result<Coin> {
-    let key = shared_secret.coin_key(&encrypted.kem_ciphertext, &cmx.to_bytes());
-    let plaintext = CoinPlaintext::decode(&key.decrypt(&encrypted.enc_ciphertext)?)?;
-    finish_decryption(plaintext, *pk_d, rho, cmx)
-}
-
 /// Rebuilds the coin and checks it against the action's public data.
 fn finish_decryption(
     plaintext: CoinPlaintext,
@@ -358,40 +257,10 @@ fn fixed<const N: usize>(bytes: Vec<u8>) -> Result<[u8; N]> {
         .map_err(|_| Error::Malformed("unexpected ciphertext length"))
 }
 
-fn out_plaintext(
-    pk_d: &DiversifiedTransmissionKey,
-    ek: &TransmissionKey,
-    shared_secret: &KemSharedSecret,
-) -> Vec<u8> {
-    let mut w = Writer::with_capacity(OUT_PLAINTEXT_LEN);
-    w.put(&pk_d.to_bytes())
-        .put(&ek.to_bytes())
-        .put(shared_secret.as_bytes());
-    w.into_bytes()
-}
-
-fn random_out_plaintext(rng: &mut (impl RngCore + CryptoRng)) -> Vec<u8> {
-    let mut bytes = vec![0u8; OUT_PLAINTEXT_LEN];
-    rng.fill_bytes(&mut bytes);
-    bytes
-}
-
-fn parse_out_plaintext(
-    bytes: &[u8],
-) -> Result<(DiversifiedTransmissionKey, TransmissionKey, KemSharedSecret)> {
-    let mut r = Reader::new(bytes);
-    let pk_d = DiversifiedTransmissionKey::from_bytes(&r.take_array::<ENCODED_LEN>()?)?;
-    let ek = TransmissionKey::from_bytes(r.take(KEM_ENCAPSULATION_KEY_LEN)?)?;
-    let shared_secret = KemSharedSecret::from_bytes(r.take_array()?);
-    r.finish()?;
-    Ok((pk_d, ek, shared_secret))
-}
-
 #[cfg(test)]
 mod tests {
     use crate::address::RhombusAddress as Address;
     use crate::amount::RawCoin;
-    use crypto::commitment::ValueCommitTrapdoor;
     use crypto::encryption::ReceiverKey;
     use crypto::keys::{FullViewingKey, SpendingKey};
     use crypto::pallas;
@@ -403,7 +272,6 @@ mod tests {
     struct Party {
         ivk: IncomingViewingKey,
         receiver_key: ReceiverKey,
-        ovk: OutgoingViewingKey,
         address: Address,
     }
 
@@ -415,7 +283,6 @@ mod tests {
         Party {
             ivk,
             receiver_key,
-            ovk: fvk.outgoing_viewing_key(),
             address,
         }
     }
@@ -423,17 +290,14 @@ mod tests {
     struct Scenario {
         rng: ChaCha20Rng,
         shared_secret: KemSharedSecret,
-        sender: Party,
         receiver: Party,
         coin: Coin,
-        cv: ValueCommitment,
         cmx: ExtractedCoinCommitment,
         encrypted: EncryptedCoin,
     }
 
-    fn scenario(seed: u64, with_ovk: bool) -> Scenario {
+    fn scenario(seed: u64) -> Scenario {
         let mut rng = ChaCha20Rng::seed_from_u64(seed);
-        let sender = party(&mut rng);
         let receiver = party(&mut rng);
         let rho = Rho::from_base(pallas::Base::from(seed));
         let coin = Coin::new(
@@ -443,28 +307,17 @@ mod tests {
             rho,
             RandomSeed::random(&mut rng),
         );
-        let cv = ValueCommitment::commit(-4_200, &ValueCommitTrapdoor::random(&mut rng));
         let cmx = coin.cmx().unwrap();
-        let ovk = with_ovk.then_some(&sender.ovk);
-        let (kem_ciphertext, shared_secret) =
-            receiver.address.kem_key().encapsulate(&mut rng).unwrap();
-        let encrypted = encrypt_coin_with_kem(
-            &coin,
-            receiver.address.kem_key(),
-            kem_ciphertext,
-            &shared_secret,
-            ovk,
-            &cv,
-            &mut rng,
-        )
-        .unwrap();
+        let encrypted = encrypt_coin(&coin, receiver.address.kem_key(), &mut rng).unwrap();
+        let shared_secret = receiver
+            .receiver_key
+            .decapsulate(encrypted.kem_ciphertext())
+            .unwrap();
         Scenario {
             rng,
             shared_secret,
-            sender,
             receiver,
             coin,
-            cv,
             cmx,
             encrypted,
         }
@@ -480,7 +333,7 @@ mod tests {
 
     #[test]
     fn authenticated_malformed_plaintext_is_rejected_after_trial_reconstruction() {
-        let s = scenario(31, true);
+        let s = scenario(31);
         let key = s
             .shared_secret
             .coin_key(s.encrypted.kem_ciphertext(), &s.cmx.to_bytes());
@@ -489,7 +342,6 @@ mod tests {
         let bad = EncryptedCoin::from_parts(
             s.encrypted.kem_ciphertext().clone(),
             fixed(key.encrypt(&plaintext)).unwrap(),
-            *s.encrypted.out_ciphertext(),
         );
         assert_eq!(
             decrypt_coin_with_ivk(
@@ -530,7 +382,7 @@ mod tests {
 
     #[test]
     fn receiver_decrypts_with_ivk() {
-        let s = scenario(1, true);
+        let s = scenario(1);
         let coin = decrypt_coin_with_ivk(
             &s.receiver.ivk,
             &s.receiver.receiver_key,
@@ -543,16 +395,8 @@ mod tests {
     }
 
     #[test]
-    fn sender_decrypts_with_ovk() {
-        let s = scenario(2, true);
-        let coin = decrypt_coin_with_ovk(&s.sender.ovk, &s.encrypted, &s.cv, *s.coin.rho(), &s.cmx)
-            .unwrap();
-        assert_same_coin(&coin, &s.coin);
-    }
-
-    #[test]
     fn wrong_keys_fail_to_decrypt() {
-        let mut s = scenario(3, true);
+        let mut s = scenario(3);
         let stranger = party(&mut s.rng);
         let (stranger_receiver, _) = FullViewingKey::derive(&SpendingKey::random(&mut s.rng))
             .unwrap()
@@ -568,42 +412,14 @@ mod tests {
             ivk_result.unwrap_err(),
             Error::Crypto(crypto::Error::DecryptionFailed)
         );
-        let ovk_result =
-            decrypt_coin_with_ovk(&stranger.ovk, &s.encrypted, &s.cv, *s.coin.rho(), &s.cmx);
-        assert_eq!(
-            ovk_result.unwrap_err(),
-            Error::Crypto(crypto::Error::DecryptionFailed)
-        );
-    }
-
-    #[test]
-    fn without_ovk_the_sender_cannot_recover_the_coin() {
-        let s = scenario(4, false);
-        assert!(
-            decrypt_coin_with_ovk(&s.sender.ovk, &s.encrypted, &s.cv, *s.coin.rho(), &s.cmx)
-                .is_err()
-        );
-        // The receiver is unaffected.
-        assert!(decrypt_coin_with_ivk(
-            &s.receiver.ivk,
-            &s.receiver.receiver_key,
-            &s.encrypted,
-            *s.coin.rho(),
-            &s.cmx
-        )
-        .is_ok());
     }
 
     #[test]
     fn tampered_ciphertext_is_rejected() {
-        let s = scenario(5, true);
+        let s = scenario(5);
         let mut enc = *s.encrypted.enc_ciphertext();
         enc[10] ^= 1;
-        let tampered = EncryptedCoin::from_parts(
-            s.encrypted.kem_ciphertext().clone(),
-            enc,
-            *s.encrypted.out_ciphertext(),
-        );
+        let tampered = EncryptedCoin::from_parts(s.encrypted.kem_ciphertext().clone(), enc);
         assert!(decrypt_coin_with_ivk(
             &s.receiver.ivk,
             &s.receiver.receiver_key,
@@ -616,7 +432,7 @@ mod tests {
 
     #[test]
     fn mismatched_commitment_is_rejected() {
-        let s = scenario(6, true);
+        let s = scenario(6);
         let wrong_cmx = ExtractedCoinCommitment::from_bytes(&[1; 32]).unwrap();
         let result = decrypt_coin_with_ivk(
             &s.receiver.ivk,
@@ -634,7 +450,7 @@ mod tests {
     #[test]
     fn mismatched_rho_is_rejected() {
         // A different rho changes the commitment, so the cmx check catches it.
-        let s = scenario(7, true);
+        let s = scenario(7);
         let other_rho = Rho::from_base(pallas::Base::from(999u64));
         assert!(decrypt_coin_with_ivk(
             &s.receiver.ivk,
@@ -648,7 +464,7 @@ mod tests {
 
     #[test]
     fn plaintext_roundtrips_and_rejects_bad_version_and_length() {
-        let s = scenario(8, true);
+        let s = scenario(8);
         let encoded = CoinPlaintext::from_coin(&s.coin).encode();
         assert_eq!(encoded.len(), COIN_PLAINTEXT_LEN);
         let decoded = CoinPlaintext::decode(&encoded).unwrap();
@@ -668,7 +484,7 @@ mod tests {
 
     #[test]
     fn plaintext_accepts_the_full_raw_amount_range() {
-        let s = scenario(9, true);
+        let s = scenario(9);
         let mut encoded = CoinPlaintext::from_coin(&s.coin).encode();
         encoded[12..20].copy_from_slice(&u64::MAX.to_le_bytes());
         assert_eq!(
@@ -678,27 +494,21 @@ mod tests {
     }
 
     #[test]
-    fn out_plaintext_roundtrips() {
-        let s = scenario(10, true);
-        let bytes = out_plaintext(
-            s.coin.pk_d(),
-            s.receiver.address.kem_key(),
-            &s.shared_secret,
-        );
-        let (pk_d, ek, shared) = parse_out_plaintext(&bytes).unwrap();
-        assert_eq!(&pk_d, s.coin.pk_d());
-        assert_eq!(ek, *s.receiver.address.kem_key());
-        assert_eq!(shared.as_bytes(), s.shared_secret.as_bytes());
-    }
-
-    #[test]
-    fn encrypted_coin_roundtrips_and_rejects_identity_epk() {
-        let s = scenario(11, true);
+    fn encrypted_coin_roundtrips_and_rejects_previous_formats() {
+        let s = scenario(11);
         let bytes = s.encrypted.to_vec();
         assert_eq!(bytes.len(), ENCRYPTED_COIN_LEN);
+        assert_eq!(bytes.len(), 1 + KEM_CIPHERTEXT_LEN + COIN_CIPHERTEXT_LEN);
+        assert_eq!(bytes[0], ENCRYPTED_COIN_VERSION);
         assert_eq!(EncryptedCoin::from_slice(&bytes), Ok(s.encrypted.clone()));
-        let mut bad = bytes;
-        bad[..32].copy_from_slice(&[0; 32]);
-        assert!(EncryptedCoin::from_slice(&bad).is_err());
+        for old_version in [2, 3] {
+            let mut old = bytes.clone();
+            old[0] = old_version;
+            assert_eq!(
+                EncryptedCoin::from_slice(&old),
+                Err(Error::Malformed("unsupported encrypted-coin version"))
+            );
+        }
+        assert!(EncryptedCoin::from_slice(&bytes[..bytes.len() - 1]).is_err());
     }
 }

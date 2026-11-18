@@ -46,6 +46,26 @@ mod tests {
     }
 
     #[test]
+    fn version_one_reset_has_new_genesis_hashes() {
+        for (params, old_timestamp) in [
+            (ChainParams::mainnet(), 1_793_700_000),
+            (ChainParams::test(), 1_793_700_001),
+        ] {
+            let current = genesis(&params);
+            let previous_params = ChainParams {
+                genesis_timestamp: old_timestamp,
+                ..params
+            };
+            let previous = genesis(&previous_params);
+            let mut previous_v2 = previous.header().clone();
+            previous_v2.version = 2;
+
+            assert_ne!(current.hash(), previous.hash());
+            assert_ne!(current.hash(), previous_v2.hash());
+        }
+    }
+
+    #[test]
     fn both_networks_start_without_transactions_or_allocated_coins() {
         for params in [ChainParams::mainnet(), ChainParams::test()] {
             let (block, tree) = genesis_with_tree(&params);

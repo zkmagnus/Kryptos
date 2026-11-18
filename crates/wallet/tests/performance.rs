@@ -3,7 +3,6 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use crypto::commitment::{ValueCommitTrapdoor, ValueCommitment};
 use crypto::keys::SpendingKey;
 use crypto::pallas;
 use protocol::amount::RawCoin;
@@ -39,8 +38,7 @@ fn fixture(
             RandomSeed::random(rng),
         );
         let cmx = coin.cmx()?;
-        let cv = ValueCommitment::commit(0, &ValueCommitTrapdoor::random(rng));
-        let encrypted = encrypt_coin(&coin, address.kem_key(), None, &cv, rng)?;
+        let encrypted = encrypt_coin(&coin, address.kem_key(), rng)?;
         let mut enc_lead = [0; COMPACT_COIN_LEAD];
         enc_lead.copy_from_slice(&encrypted.enc_ciphertext()[..COMPACT_COIN_LEAD]);
         actions.push(CompactAction {

@@ -50,6 +50,11 @@ pub fn header_lookback(params: &ChainParams) -> usize {
         .max(MEDIAN_TIME_SPAN)
 }
 
+/// Keep the anchors needed immediately after the deepest permitted rollback.
+pub(crate) fn frontier_retention(params: &ChainParams) -> u32 {
+    params.max_reorg_depth.saturating_add(params.anchor_max_age)
+}
+
 /// What the validator needs besides the block.
 pub struct Validator<'a> {
     /// Network parameters.
@@ -90,7 +95,7 @@ impl Validator<'_> {
             return Err(Error::InvalidHeader("commitment root mismatch"));
         }
         store.apply(block, &tree, &work.to_be_bytes())?;
-        if let Some(prune_below) = header.height.checked_sub(self.params.max_reorg_depth) {
+        if let Some(prune_below) = header.height.checked_sub(frontier_retention(self.params)) {
             store.prune_frontiers_below(prune_below)?;
         }
         Ok(tree)
@@ -111,12 +116,12 @@ impl Validator<'_> {
         rng: &mut (impl RngCore + CryptoRng),
     ) -> Result<()> {
         let header = block.header();
-        let parent = store.block(&header.prev_hash)?.ok_or(Error::Orphan)?;
-        if header.height != next_height(parent.header().height)? {
+        let parent = store.header(&header.prev_hash)?.ok_or(Error::Orphan)?;
+        if header.height != next_height(parent.height)? {
             return Err(Error::InvalidHeader("height does not follow the parent"));
         }
         self.check_checkpoint(block)?;
-        let recent = branch_headers(store, parent.header(), self.window())?;
+        let recent = branch_headers(store, &parent, self.window())?;
         let target = self.check_header(header, &recent)?;
         let work = child_chainwork(store, header, target)?;
         block.check_tx_root()?;
@@ -381,9 +386,12 @@ pub fn branch_headers(
             break;
         }
         let ancestor = store
-            .block(&last.prev_hash)?
+            .header(&last.prev_hash)?
             .ok_or(Error::InvalidBlock("ancestor missing"))?;
-        headers.push(ancestor.header().clone());
+        if ancestor.height.checked_add(1) != Some(last.height) {
+            return Err(Error::InvalidBlock("ancestor height mismatch"));
+        }
+        headers.push(ancestor);
     }
     headers.reverse();
     Ok(headers)
@@ -401,10 +409,13 @@ pub fn recent_headers(store: &Store, tip_height: u32, count: usize) -> Result<Ve
             let hash = store
                 .hash_at(height)?
                 .ok_or(Error::InvalidBlock("height index gap"))?;
-            let block = store
-                .block(&hash)?
+            let header = store
+                .header(&hash)?
                 .ok_or(Error::InvalidBlock("block missing"))?;
-            Ok(block.header().clone())
+            if header.height != height {
+                return Err(Error::InvalidBlock("height index mismatch"));
+            }
+            Ok(header)
         })
         .collect()
 }

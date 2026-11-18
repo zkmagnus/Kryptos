@@ -112,5 +112,12 @@ lto = "fat"
 codegen-units = 1
 opt-level = 3
 
+[profile.dev]
+# Keep routine builds small. Enable debug info explicitly when using a debugger.
+debug = 0
+incremental = false
+
 [profile.test]
 opt-level = 1
+debug = 0
+incremental = false

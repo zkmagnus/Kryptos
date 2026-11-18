@@ -190,7 +190,7 @@ impl Harness {
         let credit = subsidy(height).checked_add(fees).unwrap();
         let anchor = parent.commitment_root;
         let mut b = Builder::new(anchor);
-        b.add_output(OutputInfo::new(self.miner.address.clone(), credit, None))
+        b.add_output(OutputInfo::new(self.miner.address.clone(), credit))
             .unwrap();
         let branch = self.chain.params().branch_at(height);
         let coinbase = b
@@ -307,14 +307,12 @@ pub fn spend_first_coin_for(
     b.add_output(OutputInfo::new(
         recipient.clone(),
         Rhombus::from_raw(pay).unwrap(),
-        None,
     ))
     .unwrap();
     if change > 0 {
         b.add_output(OutputInfo::new(
             wallet.address.clone(),
             Rhombus::from_raw(change).unwrap(),
-            None,
         ))
         .unwrap();
     }
@@ -346,14 +344,12 @@ pub fn spend_first_coin_with_fee(
     b.add_output(OutputInfo::new(
         recipient.clone(),
         Rhombus::from_raw(pay).unwrap(),
-        None,
     ))
     .unwrap();
     if change > 0 {
         b.add_output(OutputInfo::new(
             wallet.address.clone(),
             Rhombus::from_raw(change).unwrap(),
-            None,
         ))
         .unwrap();
     }

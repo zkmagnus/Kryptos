@@ -182,8 +182,10 @@ impl From<Error> for RpcError {
 struct CachedTemplate {
     payout: RhombusAddress,
     header: BlockHeader,
-    transactions: Vec<Transaction>,
+    transactions: Arc<Vec<Transaction>>,
     created_at: u64,
+    /// Template context only; transactions live once in the shared block body.
+    source: Arc<Template>,
 }
 
 /// Templates by id, so a submission needs only the header fields the
@@ -211,6 +213,26 @@ impl TemplateCache {
             })
             .max_by_key(|(_, t)| t.created_at)
             .map(|(id, t)| (id.clone(), t.clone()))
+    }
+
+    /// Reuse the proof/body after the short refresh interval if selected
+    /// transactions and all other template inputs still match.
+    fn compatible(
+        &self,
+        payout: &RhombusAddress,
+        source: &Template,
+        at: u64,
+    ) -> Option<CachedTemplate> {
+        self.entries
+            .values()
+            .filter(|t| {
+                t.payout == *payout
+                    && at.saturating_sub(t.created_at) < TEMPLATE_TTL_SECONDS
+                    && t.source.same_context(source)
+                    && t.transactions.get(1..) == Some(source.transactions.as_slice())
+            })
+            .max_by_key(|t| t.created_at)
+            .cloned()
     }
 
     /// Stores a template, dropping expired and surplus ones, and returns
@@ -253,6 +275,8 @@ pub struct Context {
     /// Built on the first template request; proving a coinbase needs it.
     proving_key: Arc<tokio::sync::OnceCell<Arc<ProvingKey>>>,
     templates: Arc<Mutex<TemplateCache>>,
+    /// Bound concurrent coinbase proving and let queued requests share work.
+    preparation: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Context {
@@ -264,6 +288,7 @@ impl Context {
             params: network.params(),
             proving_key: Arc::new(tokio::sync::OnceCell::new()),
             templates: Arc::new(Mutex::new(TemplateCache::default())),
+            preparation: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -303,38 +328,64 @@ impl Context {
         }
     }
 
+    /// Revalidate after expensive preparation, including same-height reorgs.
+    async fn ensure_current(&self, parent: BlockHash) -> core::result::Result<(), RpcError> {
+        self.ready_to_mine().await?;
+        if self.tip().await?.1 != parent {
+            return Err(RpcError::new(REJECTED, "tip moved; ask again"));
+        }
+        Ok(())
+    }
+
     /// A template for `payout`: a fresh cached one, or one newly built
-    /// and proved on the blocking pool.
+    /// and proved on the blocking pool. Cache misses are serialized so
+    /// equivalent concurrent requests share the completed proof.
     async fn template_for(
         &self,
         payout: RhombusAddress,
     ) -> core::result::Result<(String, CachedTemplate), RpcError> {
         self.ready_to_mine().await?;
-        let (height, tip, ..) = self.tip().await?;
-        let at = now();
-        if let Some(found) = lock(&self.templates)?.find(&payout, tip, at) {
+        let (_, tip, ..) = self.tip().await?;
+        if let Some(found) = lock(&self.templates)?.find(&payout, tip, now()) {
             return Ok(found);
         }
-        let template = self.fetch_template().await?;
-        if template.parent.height != height {
+        let _preparing = self.preparation.lock().await;
+        self.ready_to_mine().await?;
+        let (_, tip, ..) = self.tip().await?;
+        if let Some(found) = lock(&self.templates)?.find(&payout, tip, now()) {
+            return Ok(found);
+        }
+        let mut template = self.fetch_template().await?;
+        if template.parent.hash() != tip {
             return Err(RpcError::new(REJECTED, "tip moved; ask again"));
         }
-        let pk = self.proving_key().await?;
-        let payout_clone = payout.clone();
-        let (header, transactions) = tokio::task::spawn_blocking(move || {
-            template.assemble(&payout_clone, pk.as_ref(), &mut rand::rngs::OsRng)
-        })
-        .await
-        .map_err(|_| Error::Stopped)??;
-        // Age a template from when it became usable: proving the coinbase
-        // can outlast the reuse window on a slow machine, which would make
-        // every template stale on arrival and every request re-prove.
+        let reusable = lock(&self.templates)?.compatible(&payout, &template, now());
+        let (mut header, transactions) = if let Some(cached) = reusable {
+            (cached.header, cached.transactions)
+        } else {
+            let pk = self.proving_key().await?;
+            let payout_clone = payout.clone();
+            let source = template.clone();
+            let (header, transactions) = tokio::task::spawn_blocking(move || {
+                source.assemble(&payout_clone, pk.as_ref(), &mut rand::rngs::OsRng)
+            })
+            .await
+            .map_err(|_| Error::Stopped)??;
+            (header, Arc::new(transactions))
+        };
+        // A proof can take longer than one block or a readiness transition.
+        // Never publish work merely because its height still matches.
+        self.ensure_current(header.prev_hash).await?;
+        header.timestamp = now().max(template.timestamp());
+        // Age from when the proof became usable, not before proving.
         let ready = now();
+        template.transactions = Vec::new();
         let cached = CachedTemplate {
             payout,
             header,
             transactions,
             created_at: ready,
+            source: Arc::new(template),
         };
         let id = lock(&self.templates)?.insert(cached.clone(), ready);
         Ok((id, cached))
@@ -709,7 +760,7 @@ async fn mining_methods(
                 header.timestamp = params.get(1, "timestamp")?;
                 header.nonce = parse_nonce(&params.get::<String>(2, "nonce")?)?;
                 header.solution = parse_solution(&params.get::<String>(3, "solution")?)?;
-                Block::new(header, cached.transactions)
+                Block::new(header, cached.transactions.as_ref().clone())
             } else {
                 let hex: String = params.get(0, "block")?;
                 Block::from_slice(&from_hex(&hex)?)?
@@ -1442,8 +1493,18 @@ mod tests {
         CachedTemplate {
             payout,
             header,
-            transactions: Vec::new(),
+            transactions: Arc::new(Vec::new()),
             created_at,
+            source: Arc::new(Template {
+                parent: chain::genesis::genesis(&ChainParams::test())
+                    .header()
+                    .clone(),
+                recent: Vec::new(),
+                tree: storage::tree::CommitmentTree::empty(),
+                transactions: Vec::new(),
+                params: ChainParams::test(),
+                now: created_at,
+            }),
         }
     }
 
@@ -1455,6 +1516,164 @@ mod tests {
             .unwrap()
             .default_address()
             .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preparation_rejects_tip_replacement_and_readiness_loss() {
+        let pk = Arc::new(
+            tokio::task::spawn_blocking(ProvingKey::build)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        for lose_readiness in [false, true] {
+            let (events, mut received) = mpsc::channel(4);
+            let context = Context::new(events, Network::Test);
+            assert!(context.proving_key.set(Arc::clone(&pk)).is_ok());
+            let params = ChainParams::test();
+            let (genesis, tree) = chain::genesis::genesis_with_tree(&params);
+            let parent = genesis.hash();
+            let source = Template {
+                parent: genesis.header().clone(),
+                recent: vec![genesis.header().clone()],
+                tree,
+                transactions: Vec::new(),
+                params,
+                now: now(),
+            };
+            let responder = tokio::spawn(async move {
+                let mut fetched = false;
+                while let Some(event) = received.recv().await {
+                    match event {
+                        Event::TemplateRequest(reply) => {
+                            fetched = true;
+                            reply.send(Ok(source.clone())).unwrap();
+                        }
+                        Event::Rpc {
+                            request: Request::MiningReadiness,
+                            reply,
+                        } => {
+                            let reason = (fetched && lose_readiness).then_some(NotReady::NoPeers);
+                            reply.send(Response::MiningReadiness(reason)).unwrap();
+                        }
+                        Event::Rpc {
+                            request: Request::Status,
+                            reply,
+                        } => {
+                            // Height stays unchanged: hash must be checked.
+                            let hash = if fetched {
+                                BlockHash::from_bytes([7; 32])
+                            } else {
+                                parent
+                            };
+                            reply
+                                .send(Response::Status {
+                                    height: 0,
+                                    hash,
+                                    peers: 1,
+                                    mempool: 0,
+                                    mined: 0,
+                                    mined_in_chain: 0,
+                                    syncing: false,
+                                })
+                                .unwrap();
+                        }
+                        other => panic!("unexpected mining request: {other:?}"),
+                    }
+                }
+            });
+            let error = context.template_for(payout(17)).await.unwrap_err();
+            assert_eq!(error.code, REJECTED);
+            if lose_readiness {
+                assert!(error.message.contains("peers"));
+            } else {
+                assert!(error.message.contains("tip moved"));
+            }
+            assert!(context.templates.lock().unwrap().entries.is_empty());
+            drop(context);
+            responder.await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_preparation_and_refresh_share_the_proved_body() {
+        let (events, mut received) = mpsc::channel(8);
+        let context = Context::new(events, Network::Test);
+        let params = ChainParams::test();
+        let (genesis, tree) = chain::genesis::genesis_with_tree(&params);
+        let parent = genesis.hash();
+        let source = Template {
+            parent: genesis.header().clone(),
+            recent: vec![genesis.header().clone()],
+            tree,
+            transactions: Vec::new(),
+            params,
+            now: now(),
+        };
+        let responder = tokio::spawn(async move {
+            while let Some(event) = received.recv().await {
+                match event {
+                    Event::TemplateRequest(reply) => {
+                        reply.send(Ok(source.clone())).unwrap();
+                    }
+                    Event::Rpc {
+                        request: Request::MiningReadiness,
+                        reply,
+                    } => {
+                        reply.send(Response::MiningReadiness(None)).unwrap();
+                    }
+                    Event::Rpc {
+                        request: Request::Status,
+                        reply,
+                    } => {
+                        reply
+                            .send(Response::Status {
+                                height: 0,
+                                hash: parent,
+                                peers: 1,
+                                mempool: 0,
+                                mined: 0,
+                                mined_in_chain: 0,
+                                syncing: false,
+                            })
+                            .unwrap();
+                    }
+                    other => panic!("unexpected mining request: {other:?}"),
+                }
+            }
+        });
+        let address = payout(47);
+        let (first, concurrent) = tokio::join!(
+            context.template_for(address.clone()),
+            context.template_for(address.clone()),
+        );
+        let (first_id, first) = first.unwrap();
+        let (concurrent_id, concurrent) = concurrent.unwrap();
+        assert_eq!(first_id, concurrent_id);
+        assert!(Arc::ptr_eq(&first.transactions, &concurrent.transactions));
+        // Expire response reuse without sleeping; the proved body is valid.
+        context
+            .templates
+            .lock()
+            .unwrap()
+            .entries
+            .get_mut(&first_id)
+            .unwrap()
+            .created_at = now().saturating_sub(TEMPLATE_REUSE_SECONDS);
+        let (new_id, refreshed) = context.template_for(address).await.unwrap();
+        assert_ne!(first_id, new_id);
+        assert!(Arc::ptr_eq(&first.transactions, &refreshed.transactions));
+        assert_eq!(first.header.tx_root, refreshed.header.tx_root);
+        assert_eq!(
+            first.header.commitment_root,
+            refreshed.header.commitment_root
+        );
+        assert!(
+            refreshed.source.transactions.is_empty(),
+            "cache avoids a second body copy"
+        );
+        drop(context);
+        responder.await.unwrap();
     }
 
     #[test]

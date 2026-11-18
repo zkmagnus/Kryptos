@@ -1749,10 +1749,10 @@ impl Node {
         let tip = self.chain.tip()?;
         let mut start = 0u32;
         for hash in locator {
-            let Some(block) = store.block(hash)? else {
+            let Some(header) = store.header(hash)? else {
                 continue;
             };
-            let height = block.header().height;
+            let height = header.height;
             if store.hash_at(height)? == Some(*hash) {
                 start = height.saturating_add(1);
                 break;
@@ -1764,10 +1764,13 @@ impl Node {
             let Some(hash) = store.hash_at(height)? else {
                 break;
             };
-            let Some(block) = store.block(&hash)? else {
+            let Some(header) = store.header(&hash)? else {
                 break;
             };
-            headers.push(block.header().clone());
+            if header.height != height {
+                return Err(chain::Error::InvalidBlock("height index mismatch").into());
+            }
+            headers.push(header);
             if hash == stop {
                 break;
             }
@@ -1782,7 +1785,7 @@ impl Node {
             return;
         }
         let store = self.chain.store();
-        let known = |hash: &BlockHash| store.block(hash).ok().flatten().is_some();
+        let known = |hash: &BlockHash| store.contains_block(hash).unwrap_or(false);
         let verified = if self.sync.expects_headers() {
             self.sync_headers.verify(&self.chain, headers, now())
         } else {
@@ -1950,7 +1953,7 @@ impl Node {
                 handle.peer.mark_known(*item);
             }
             let have = match item {
-                Inventory::Block(hash) => self.chain.store().block(hash)?.is_some(),
+                Inventory::Block(hash) => self.chain.store().contains_block(hash)?,
                 Inventory::Tx(txid) => self.mempool.contains(txid),
             };
             if !have && requested.insert(*item) {
@@ -2072,7 +2075,7 @@ impl Node {
                 handle.peer.mark_known(Inventory::Block(hash));
             }
         }
-        let already_known = self.chain.store().block(&hash)?.is_some();
+        let already_known = self.chain.store().contains_block(&hash)?;
         let started = std::time::Instant::now();
         if from.is_some() {
             self.block_telemetry.observe(hash, started);
@@ -2224,12 +2227,12 @@ impl Node {
             handle.peer.mark_known(Inventory::Block(hash));
         }
         let store = self.chain.store();
-        if store.block(&hash)?.is_some() || self.pending_blocks.contains_key(&hash) {
+        if store.contains_block(&hash)? || self.pending_blocks.contains_key(&hash) {
             return Ok(());
         }
         self.block_telemetry
             .observe(hash, std::time::Instant::now());
-        if store.block(&compact.header.prev_hash)?.is_none() {
+        if !store.contains_block(&compact.header.prev_hash)? {
             self.start_sync(id);
             return Ok(());
         }
@@ -2532,11 +2535,7 @@ impl Node {
     fn template(&mut self) -> Result<Template> {
         let tip = self.chain.tip()?;
         let store = self.chain.store();
-        let parent = store
-            .block(&tip.hash)?
-            .ok_or(Error::Stopped)?
-            .header()
-            .clone();
+        let parent = store.header(&tip.hash)?.ok_or(Error::Stopped)?;
         let recent = recent_headers(store, tip.height, header_lookback(&self.params))?;
         let tree = store.tree()?;
         let transactions = self.mempool.select(

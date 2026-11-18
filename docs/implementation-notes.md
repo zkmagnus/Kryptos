@@ -6,12 +6,12 @@ from node policy and from transport behavior.
 
 | File | Change and reason |
 | --- | --- |
-| `crates/chain/src/params.rs` | Set the latest requested mainnet interval to 300 seconds and explain the 100-block window duration. |
+| `crates/chain/src/params.rs` | Set the mainnet target to 120 seconds and explain the 100-block window duration. |
 | `crates/chain/src/target.rs` | Add checked `ChainWork(U256)` and explicit zero/max target boundaries; remove the redundant U512 accumulator. |
 | `crates/chain/src/validate.rs` | Return the DAA-validated target, enforce exact `nBits`, and reject cumulative overflow before body verification or storage. |
 | `crates/chain/src/chain.rs` | Define zero-work genesis and read persisted totals for fork choice, reopen, and reorganization recovery. |
 | `crates/chain/src/error.rs` | Give work overflow its own error. |
-| `crates/storage/src/store.rs` | Persist block bytes and cumulative work in one redb transaction; require layout version 2. |
+| `crates/storage/src/store.rs` | Persist block bytes and cumulative work in one redb transaction; require layout version 1 under the new chain store marker. |
 | `crates/p2p/src/sync.rs` | Gate body downloads by work, cap requests at two per peer, track actual-send deadlines with request generations, and reassign failed requests. |
 | `crates/p2p/Cargo.toml` and `Cargo.lock` | Use the existing chain crate for the shared work type. |
 | `crates/runtime/src/headers.rs` | Validate header rules and PoW/checkpoint ancestry; spool long candidates in a private temporary file without unbounded memory. |
@@ -20,7 +20,7 @@ from node policy and from transport behavior.
 | `crates/runtime/src/tor.rs` | Carry validated transport settings through `TorConfig`. |
 | `crates/runtime/src/cli.rs` | Expose fixed defaults and explicit timeout, circuit, and retry options. |
 | `crates/p2p/src/peer.rs` | Complete the shared Version handshake in one RTT; use configured idle and ping-response deadlines. |
-| `crates/p2p/src/message.rs` | Move to protocol 4 and encode the optional duplicate-connection binding message. |
+| `crates/p2p/src/message.rs` | Reset the P2P protocol to version 1 for the new genesis and encode the optional duplicate-connection binding message. |
 | `crates/p2p/src/address.rs` | Define deterministic onion ordering for the stable dial direction. |
 | `crates/p2p/src/addrbook.rs` | Apply configured backoff and exclude an already-connected onion across virtual ports. |
 | `crates/runtime/src/net.rs` | Separate connection/read/write deadlines and report request flush times and byte totals. |
@@ -42,9 +42,10 @@ validation, and cumulative overflow returns an error before a child block is
 stored. Equal-work forks keep the first successfully imported block; an
 unverified header or inventory announcement does not establish “first seen”.
 
-Storage layout version 2 requires the cumulative-work index. Opening an older
-database fails and asks for resynchronization rather than reconstructing work
-from untrusted header claims. The consensus revision is bumped accordingly.
+Storage layout version 1 under the new chain store marker requires the
+cumulative-work index. Opening an older database fails and asks for
+resynchronization rather than reconstructing work from untrusted header
+claims. Consensus revision 1 records the current rules.
 
 The maintained pool is fixed by configuration and contains authenticated
 reusable peers. A strict directed rule in which every pair always chooses the

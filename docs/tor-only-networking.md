@@ -34,7 +34,7 @@ invalid onion checksum/version and port zero are rejected. Names use the standar
 v3 encoding supplied by `tor_hscrypto::pk::HsId`. Peer tables and gossip exclude
 the local onion identity across all ports.
 
-The application protocol is version 4. The one-round-trip handshake verifies
+The application protocol is version 1. The one-round-trip handshake verifies
 version, genesis/network identity and anti-self nonce, and carries service flags
 plus a claimed onion endpoint. An inbound connection replies with its Version
 and immediately queues its first application messages; Version receipt completes
@@ -106,6 +106,10 @@ state alongside chain and peer data: losing the onion identity key changes the
 service address. Cache contents can be rebuilt. Each concurrent process needs a
 separate state directory. Tor security updates now require rebuilding and releasing
 the binary with updated vendored dependencies.
+
+The local peer address book, `peers.dat`, uses the `RHPA` prefix followed by
+snapshot version 1. Snapshots from earlier development builds are ignored, and
+the node rebuilds its address book from discovery.
 
 ## Service protection and limits
 

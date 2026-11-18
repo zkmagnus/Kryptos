@@ -184,7 +184,7 @@ pub(crate) mod tests {
         );
         let nullifier = coin.nullifier(fvk.nk()).unwrap();
         let cv = ValueCommitment::commit(0, &ValueCommitTrapdoor::random(rng));
-        let encrypted = encrypt_coin(&coin, address.kem_key(), None, &cv, rng).unwrap();
+        let encrypted = encrypt_coin(&coin, address.kem_key(), rng).unwrap();
         let rsk = RandomizedSigningKey::new(
             &SpendAuthorizingKey::derive(&sk).unwrap(),
             &SpendAuthRandomizer::random(rng),

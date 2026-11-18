@@ -37,8 +37,9 @@ Old records ending before that byte are legacy; other values are rejected.
 These are private wallet database records, not transaction encodings. The
 scanner retains which key succeeded so RPC reconstructs the actual receiving
 address even when legacy and new payments share a diversifier after recovery.
-JSON backups use format version 2 to identify the added metadata and coin-record
-suffix. There is still no JSON import command; preserve a stopped database copy.
+Version-1 plaintext JSON backups include this metadata and the extended coin
+records. `restorewallet` restores those exports to a new file, including
+allocation metadata; see [wallet backup and restoration](wallet-backup.md).
 
 Already shared legacy addresses remain linkable. Reissuing an address preserves
 its identity; this change does not conceal reuse of the same address. Recognize

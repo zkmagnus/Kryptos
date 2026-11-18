@@ -286,8 +286,8 @@ async fn two_ports_of_one_onion_identity_do_not_satisfy_two_peer_minimum() {
     let fixture = TorFixture::new();
     let identity = NetAddr::TorV3([220; 32]);
     let (_network, mut incoming) = test_support::network(identity, &[19000, 19001]);
-    // Two connections to different virtual ports still authenticate the
-    // same onion identity and must count as one mining peer.
+    // Different virtual ports authenticate the same onion identity. The dialer
+    // keeps one connection, which must not satisfy a two-identity minimum.
     let node = fixture
         .spawn(Config {
             offline: false,
@@ -298,27 +298,33 @@ async fn two_ports_of_one_onion_identity_do_not_satisfy_two_peer_minimum() {
             ..Config::test()
         })
         .await;
-    let mut remotes = Vec::new();
-    for _ in 0..2 {
-        let incoming = tokio::time::timeout(Duration::from_secs(10), incoming.recv())
-            .await
-            .expect("configured peer must connect")
-            .unwrap();
-        remotes.push(RemotePeer::handshake(incoming.stream, 0).await);
-    }
-    let started = Instant::now();
+    let first = tokio::time::timeout(Duration::from_secs(10), incoming.recv())
+        .await
+        .expect("configured peer must connect")
+        .unwrap();
+    let mut remote = RemotePeer::handshake(first.stream, 0).await;
+    remote.until_headers_request().await;
+    remote.send(Message::Headers(Vec::new())).await;
+    remote.send(Message::Ping(220)).await;
     loop {
-        let Response::Peers(peers) = node.request(Request::Peers).await.unwrap() else {
-            panic!("expected peer list");
-        };
-        if peers.iter().filter(|peer| peer.ready).count() == 2 {
+        if remote.next().await == Message::Pong(220) {
             break;
         }
-        assert!(started.elapsed() < Duration::from_secs(10));
-        sleep(Duration::from_millis(20)).await;
     }
+    // Cover a five-second connection-maintenance tick: the alternate port
+    // must not open a second connection after the first finishes syncing.
+    assert!(
+        tokio::time::timeout(Duration::from_secs(6), incoming.recv())
+            .await
+            .is_err()
+    );
+    let Response::Peers(peers) = node.request(Request::Peers).await.unwrap() else {
+        panic!("expected peer list");
+    };
+    assert_eq!(peers.len(), 1);
+    assert!(peers[0].ready);
     assert_eq!(readiness(&node).await, Some(NotReady::NoPeers));
-    drop(remotes);
+    drop(remote);
     node.shutdown().await;
 }
 
