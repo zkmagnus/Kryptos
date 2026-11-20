@@ -28,6 +28,20 @@ use rand_chacha::ChaCha20Rng;
 use storage::store::{SnapshotInstallMode, Store};
 use storage::tree::CommitmentTree;
 
+/// Exercise the reported mainnet coinbase path with an easy test PoW target.
+#[test]
+fn mainnet_mined_coinbase_proof_is_accepted() {
+    let params = ChainParams {
+        pow_limit: ChainParams::test().pow_limit,
+        ..ChainParams::mainnet()
+    };
+    let mut h = Harness::with_params(7306, params);
+    let block = h.extend(Vec::new());
+    assert_eq!(block.header().height, 1);
+    assert_eq!(h.chain.tip().unwrap().height, 1);
+    assert_eq!(h.miner.balance(), subsidy(1).raw());
+}
+
 #[test]
 fn mining_extends_the_chain_and_pays_the_miner() {
     let mut h = Harness::new(1);

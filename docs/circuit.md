@@ -18,7 +18,7 @@ The generator searches deterministic window constants; do not edit them by hand.
 `fixed_bases` checks every window against the native generator.
 
 After the domain update the verifying-key pin is
-`795317231dea0ea83c28af9ee83f2137e293d6b6ffe204321dcb2ed56d763ad4`.
+`c6c4a8a4fec27ed24f3ad709f2a9a1c4f118ce37efdfdafa98e3195fb00fe4b0`.
 The deterministic proof and transaction vectors also change because their
 witness points, commitments, and proof transcript depend on these domains.
 Update their pins only alongside verified generator/table changes, retaining
@@ -29,3 +29,21 @@ proofs, commitments, and addresses made under the previous domains are not
 converted by table regeneration. The chain rules digest includes the verifying
 key and refuses databases created under incompatible rules; this is a launch
 parameter change, not a scheduled migration of existing funds.
+
+## Mining proof regression (2026-11-20)
+
+A native/circuit generator mismatch was reproduced by
+`value_commit_v_tables_match_the_generator`: native value commitments used
+`kryptos:Generator`, while the committed value-base windows still described the
+previous generator. A prover can emit a proof from this inconsistent witness,
+but verification rejects it, including locally mined coinbases.
+
+Regenerating the tables changes only `VALUE_COMMIT_V_Z` and `VALUE_COMMIT_V_U`;
+SpendAuth and randomness tables remain unchanged. Proof and transaction vector
+pins are updated only after successful verification. The mainnet mining
+regression `mainnet_mined_coinbase_proof_is_accepted` uses an easy PoW target
+and imports a mined block through normal chain validation.
+
+Rebuild node binaries after this fix. The verifying key and chain rules digest
+change; retain existing databases rather than editing their rules metadata to
+bypass an incompatibility error.

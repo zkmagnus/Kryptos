@@ -507,12 +507,12 @@ mod tests {
         let digest = crypto::hash::blake2b_short(crypto::hash::PIN, &[&tx.to_vec()]);
         let digest = crypto::encoding::to_hex(&digest);
         eprintln!("transaction build vector: {digest}");
-        assert_eq!(
-            digest,
-            "06e989983a7b1b061b0e96863bd49e5e1d22fbc536bab27218a42d25afd2d409"
-        );
         assert_eq!(tx.actions().len(), 2);
         assert!(verify_regular(&tx, BRANCH, test_keys::verifying_key(), &mut rng).is_ok());
+        assert_eq!(
+            digest,
+            "7ab9ffa67cc1774fb346c455859474db783362a33c07b67ba42602e465abd22e"
+        );
         assert!(
             matches!(
                 verify_regular(&tx, BranchId::new(2), test_keys::verifying_key(), &mut rng),

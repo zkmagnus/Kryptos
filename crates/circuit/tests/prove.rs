@@ -97,10 +97,6 @@ fn two_action_proof_roundtrips_and_rejects_wrong_inputs() {
         crypto::hash::PIN,
         &[proof.as_bytes()],
     ));
-    assert_eq!(
-        proof_digest,
-        "a6ff94a6bb3938ff90c466670caf9774a49394184fbbbee53507f69de5f3cc2f"
-    );
     eprintln!("proof vector: {}", proof_digest);
     eprintln!(
         "prove 2 actions: {:?}, {} bytes",
@@ -110,6 +106,10 @@ fn two_action_proof_roundtrips_and_rejects_wrong_inputs() {
 
     let started = Instant::now();
     assert!(proof.verify(&vk, &[p1, p2]).is_ok());
+    assert_eq!(
+        proof_digest,
+        "12f8934b1853e45986335ca546262da261ac856e2cae7497f93e82d183e17e8d"
+    );
     eprintln!("verify: {:?}", started.elapsed());
     assert_eq!(proof_len(2), Some(proof.as_bytes().len()));
 
