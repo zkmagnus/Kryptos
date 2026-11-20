@@ -63,7 +63,7 @@ not protection against replaying an old but valid backup.
 
 ## The current discovery obstacle
 
-Rhombus currently derives a different ML-KEM key for each address. The scanner
+Kryptos currently derives a different ML-KEM key for each address. The scanner
 tries every configured address key against every output. A phrase determines
 keys but not how many address indices were previously reserved. The existing
 0..4095 bound makes a full-range recovery finite, but not fast: cost grows as

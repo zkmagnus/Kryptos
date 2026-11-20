@@ -1,6 +1,6 @@
 //! Selecting coins and building a payment.
 
-use protocol::address::RhombusAddress;
+use protocol::address::KryptosAddress;
 use protocol::amount::RawCoin;
 use protocol::builder::{Builder, OutputInfo, SpendInfo};
 use protocol::consensus::action_class_for;
@@ -95,7 +95,7 @@ fn plan_with_default_fee<'a>(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Payment {
     /// The recipient.
-    pub recipient: RhombusAddress,
+    pub recipient: KryptosAddress,
     /// The amount.
     pub amount: RawCoin,
 }

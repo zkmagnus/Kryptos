@@ -20,6 +20,8 @@ pub fn genesis_with_tree(params: &ChainParams) -> (Block, CommitmentTree) {
     header.timestamp = params.genesis_timestamp;
     header.target = params.pow_limit.to_compact();
     header.tx_root = tx_root(core::iter::empty());
+    header.body_root = protocol::body_tree::empty_body_root();
+    header.history_root = protocol::header_tree::empty_root();
     (Block::new(header, transactions), tree)
 }
 

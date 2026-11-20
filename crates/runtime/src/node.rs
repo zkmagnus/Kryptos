@@ -7,20 +7,26 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use chain::chain::{Chain, Import};
+use chain::chain::{AuthorizedBlock, Chain, Import};
 use chain::mempool::Mempool;
 use chain::params::ChainParams;
+use chain::snapshot::{verify_payload, SnapshotManifest, SnapshotPayload};
 use chain::target::{Target, U256};
 use chain::validate::{header_lookback, recent_headers};
+use crypto::hash::{blake2b_short, SNAPSHOT_ID};
 use p2p::addrbook::AddressBook;
 use p2p::address::{canonical_dialer, NetAddr, PeerKey};
 use p2p::dandelion::{Dandelion, Route};
 use p2p::message::{
-    CompactBlock, Inventory, Message, PeerAddr, VersionInfo, MAX_HEADERS, MAX_INVENTORY,
+    CompactBlock, Inventory, Message, PeerAddr, SnapshotManifestInfo, VersionInfo, MAX_HEADERS,
+    MAX_INVENTORY, MAX_SNAPSHOT_CHUNK_LEN, MAX_SNAPSHOT_TOTAL_LEN,
 };
 use p2p::peer::{version_info, Direction, Event as PeerEvent, Peer, SELF_CONNECTION};
+use p2p::snapshot::{
+    chunk_hash as snapshot_chunk_hash, payload_hash as snapshot_payload_hash, SnapshotAssembler,
+};
 use p2p::sync::{locator, BlockSync, MIN_CHAIN_WORK};
-use protocol::address::RhombusAddress;
+use protocol::address::KryptosAddress;
 use protocol::block::{Block, BlockHash, BlockHeader};
 use protocol::compact::CompactBlock as LightBlock;
 use protocol::consensus::{next_height, MAX_BLOCK_TRANSACTIONS};
@@ -136,6 +142,21 @@ pub enum Event {
         /// The message.
         message: Box<Message>,
     },
+    /// Stateless authorization of a downloaded body finished off-thread.
+    BlockAuthorized {
+        /// Source of the downloaded body.
+        from: PeerId,
+        /// Header hash captured before reading the quarantine file.
+        hash: BlockHash,
+        /// Decoded body, absent on local file/worker failure.
+        block: Option<Box<Block>>,
+        /// Opaque authorization token, or rejection reason.
+        authorization: core::result::Result<AuthorizedBlock, String>,
+        /// Local failures never count as peer misbehavior.
+        local_failure: bool,
+        /// Receipt time of the complete body.
+        started: std::time::Instant,
+    },
     /// A connection ended.
     Disconnected {
         /// Connection id.
@@ -199,6 +220,19 @@ pub enum Event {
     },
     /// Stop the loop.
     Shutdown,
+}
+
+/// Result of serialized consensus import after background authorization.
+#[derive(Clone, Debug)]
+pub enum BlockValidation {
+    /// The block passed validation and was applied/stored.
+    Valid(Import),
+    /// Its parent is not yet applied; retry after that parent arrives.
+    Orphan(String),
+    /// Full validation rejected the downloaded block.
+    Invalid(String),
+    /// A local storage/VM failure, unrelated to peer validity.
+    LocalFailure(String),
 }
 
 /// Local control requests.
@@ -451,7 +485,23 @@ impl PeerHandle {
 struct PendingBlock {
     header: BlockHeader,
     transactions: Vec<Option<Transaction>>,
+    /// A compact reconstruction had the right txids but not the committed
+    /// authorization/body bytes; a full-block request is already outstanding.
+    full_block_requested: bool,
     received_at: u64,
+}
+
+struct SnapshotDownload {
+    peer: Option<PeerId>,
+    info: SnapshotManifestInfo,
+    manifest: chain::snapshot::SnapshotManifest,
+    assembler: SnapshotAssembler,
+    deadline: std::time::Instant,
+}
+
+struct SnapshotServing {
+    info: SnapshotManifestInfo,
+    payload: Vec<u8>,
 }
 
 /// Endpoints found to be this node: seed names listing it, or addresses
@@ -482,6 +532,9 @@ pub struct Node {
     /// Expected orphan hashes waiting for their parent to be imported.
     /// Bodies are discarded and requested again, bounding this by the window.
     sync_deferred: HashMap<BlockHash, BlockHash>,
+    snapshot_download: Option<SnapshotDownload>,
+    snapshot_manifest_wait: Option<(PeerId, u32, std::time::Instant)>,
+    snapshot_serving: Option<SnapshotServing>,
     /// When the current sync last queued new work or imported a block.
     sync_progress_at: u64,
     /// The last reason miners were refused work, logged when it changes.
@@ -492,6 +545,8 @@ pub struct Node {
     mining_ready_delay: std::time::Duration,
     mining_ready_since: Option<std::time::Instant>,
     mining_allowed: watch::Sender<bool>,
+    miner_shutdown: Option<oneshot::Sender<()>>,
+    miner_stopped: Option<oneshot::Receiver<()>>,
     peers: HashMap<PeerId, PeerHandle>,
     dialing: HashMap<PeerId, String>,
     dial_tasks: HashMap<PeerId, JoinHandle<()>>,
@@ -518,6 +573,12 @@ pub struct Node {
     handshakes: HashMap<u64, PeerId>,
     rng: StdRng,
     events: mpsc::Sender<Event>,
+    validation: mpsc::Sender<crate::sync_bodies::DownloadedBody>,
+    downloaded_bodies: crate::sync_bodies::DownloadedBodies,
+    validation_hash: Option<BlockHash>,
+    validation_epoch: u64,
+    /// Downloaded body validations queued or running.
+    validation_pending: usize,
     genesis: BlockHash,
     ticks: u64,
     /// Height and hash of every block this node mined, oldest first.
@@ -634,6 +695,47 @@ async fn spawn_inner(
     let chain = open_chain(&config, params).await?;
     let genesis = chain.store().hash_at(0)?.ok_or(Error::Stopped)?;
     let (events, receiver) = mpsc::channel(4_096);
+    let (validation, mut validation_jobs) = mpsc::channel::<crate::sync_bodies::DownloadedBody>(1);
+    let validation_chain = chain.clone();
+    let validation_events = events.clone();
+    tasks.spawn(async move {
+        while let Some(mut job) = validation_jobs.recv().await {
+            let chain = validation_chain.clone();
+            let started = job.received;
+            let from = job.from;
+            let hash = job.hash;
+            let checked = tokio::task::spawn_blocking(move || {
+                let block = match job.read() {
+                    Ok(block) => block,
+                    Err(error) => return (None, Err(error.to_string()), true),
+                };
+                let mut rng = StdRng::from_entropy();
+                let result = chain
+                    .authorize_block(&block, now(), &mut rng)
+                    .map_err(|error| error.to_string());
+                (Some(Box::new(block)), result, false)
+            })
+            .await;
+            let (block, authorization, local_failure) = match checked {
+                Ok(result) => result,
+                Err(error) => (None, Err(error.to_string()), true),
+            };
+            if validation_events
+                .send(Event::BlockAuthorized {
+                    from,
+                    hash,
+                    block,
+                    authorization,
+                    local_failure,
+                    started,
+                })
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
     let tip = watch::Sender::new(chain.tip()?.hash);
     let mining_allowed = watch::Sender::new(false);
     let (peers_path, mut book) = saved_book(&config);
@@ -649,8 +751,8 @@ async fn spawn_inner(
         &events,
         &mut tasks,
     )?;
-    if let Some(payout) = config.mine_to.clone() {
-        spawn_miner(
+    let (miner_shutdown, miner_stopped) = if let Some(payout) = config.mine_to.clone() {
+        let (shutdown, stopped) = spawn_miner(
             &mut tasks,
             payout,
             &config,
@@ -659,7 +761,10 @@ async fn spawn_inner(
             tor.as_ref(),
             mining_allowed.subscribe(),
         );
-    }
+        (Some(shutdown), Some(stopped))
+    } else {
+        (None, None)
+    };
     let clock = events.clone();
     tasks.spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -686,6 +791,14 @@ async fn spawn_inner(
         sync_epoch: 0,
         sync_unavailable: HashSet::new(),
         sync_deferred: HashMap::new(),
+        validation,
+        downloaded_bodies: crate::sync_bodies::DownloadedBodies::new(config.datadir.clone()),
+        validation_hash: None,
+        validation_epoch: 0,
+        validation_pending: 0,
+        snapshot_download: None,
+        snapshot_manifest_wait: None,
+        snapshot_serving: None,
         sync_progress_at: 0,
         mining_blocked: None,
         mining_requires_tor: !config.offline || tor.is_some(),
@@ -698,6 +811,8 @@ async fn spawn_inner(
         }),
         mining_ready_since: None,
         mining_allowed,
+        miner_shutdown,
+        miner_stopped,
         peers: HashMap::new(),
         dialing: HashMap::new(),
         dial_tasks: HashMap::new(),
@@ -987,13 +1102,13 @@ fn dialed_key(target: &str) -> Option<PeerKey> {
 /// Starts the `--mine` miner as one of the node's tasks; it stops with them.
 fn spawn_miner(
     tasks: &mut JoinSet<()>,
-    payout: RhombusAddress,
+    payout: KryptosAddress,
     config: &Config,
     events: &mpsc::Sender<Event>,
     tip: &watch::Sender<BlockHash>,
     tor: Option<&Arc<TorNetwork>>,
     mining_allowed: watch::Receiver<bool>,
-) {
+) -> (oneshot::Sender<()>, oneshot::Receiver<()>) {
     let miner = crate::miner::start_for_node(
         payout,
         config.network.params(),
@@ -1003,11 +1118,29 @@ fn spawn_miner(
         tor.map(|network| network.status()),
         Some(mining_allowed),
     );
+    let stop = miner.stop_signal();
+    let (shutdown, shutdown_rx) = oneshot::channel();
+    let (stopped_tx, stopped_rx) = oneshot::channel();
     tasks.spawn(async move {
-        if let Err(error) = miner.wait().await {
-            logging::warn(&format!("miner stopped: {error}"));
+        let mut worker = tokio::spawn(miner.wait());
+        tokio::select! {
+            result = &mut worker => {
+                if let Ok(Err(error)) = result {
+                    logging::warn(&format!("miner stopped: {error}"));
+                }
+            }
+            _ = shutdown_rx => {
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                match worker.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => logging::warn(&format!("miner stopped: {error}")),
+                    Err(error) => logging::warn(&format!("miner worker failed: {error}")),
+                }
+            }
         }
+        let _ = stopped_tx.send(());
     });
+    (shutdown, stopped_rx)
 }
 
 /// The address book `config` starts from and where it is saved: the saved
@@ -1037,10 +1170,32 @@ impl Node {
                 logging::error(&format!("mining readiness error: {error}"));
             }
         }
+        // A blocking cryptographic check cannot be canceled by aborting its
+        // async wrapper. Let the current read-only check finish before dropping
+        // database/file handles; shutdown does not apply its result.
+        self.downloaded_bodies.clear();
+        while self.validation_hash.is_some() {
+            match receiver.recv().await {
+                Some(Event::BlockAuthorized { hash, .. }) if self.validation_hash == Some(hash) => {
+                    self.validation_hash = None;
+                    self.validation_pending = 0;
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        receiver.close();
+        drop(receiver);
         self.save_peers();
         for (_, task) in self.dial_tasks.drain() {
             task.abort();
             let _ = task.await;
+        }
+        if let Some(shutdown) = self.miner_shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(stopped) = self.miner_stopped.take() {
+            let _ = stopped.await;
         }
     }
 
@@ -1065,6 +1220,14 @@ impl Node {
                 connect_time,
             } => self.on_connected(id, direction, addr, target, outbox, connect_time),
             Event::Message { id, message } => self.on_message(id, *message),
+            Event::BlockAuthorized {
+                from,
+                hash,
+                block,
+                authorization,
+                local_failure,
+                started,
+            } => self.on_block_authorized(from, hash, block, authorization, local_failure, started),
             Event::Disconnected { id } => {
                 // A peer still here was not dropped by us: the other side
                 // closed, or the connection failed. Say so, since a peer
@@ -1335,6 +1498,18 @@ impl Node {
             self.sync = BlockSync::with_timeout(self.tor_settings.sync_response_timeout.as_secs());
             self.sync_headers = crate::headers::SyncHeaders::default();
             self.sync_deferred.clear();
+            self.downloaded_bodies.clear();
+            if self
+                .snapshot_manifest_wait
+                .is_some_and(|(peer, _, _)| peer == id)
+            {
+                self.snapshot_manifest_wait = None;
+            }
+            if let Some(download) = self.snapshot_download.as_mut() {
+                if download.peer == Some(id) {
+                    download.peer = None;
+                }
+            }
         }
     }
 
@@ -1580,6 +1755,32 @@ impl Node {
         match message {
             Message::ConnectionLink(nonce) => self.on_connection_link(id, nonce),
             Message::NotFound(items) => {
+                if items.is_empty() {
+                    let manifest_waiting = self
+                        .snapshot_manifest_wait
+                        .is_some_and(|(peer, _, _)| peer == id);
+                    let chunk_waiting = self
+                        .snapshot_download
+                        .as_ref()
+                        .is_some_and(|download| download.peer == Some(id));
+                    if manifest_waiting {
+                        self.snapshot_manifest_wait = None;
+                    }
+                    if chunk_waiting {
+                        if let Some(download) = self.snapshot_download.as_mut() {
+                            download.peer = None;
+                        }
+                    }
+                    if (manifest_waiting || chunk_waiting) && self.sync_peer == Some(id) {
+                        self.sync_peer = None;
+                        self.sync = BlockSync::with_timeout(
+                            self.tor_settings.sync_response_timeout.as_secs(),
+                        );
+                        self.sync_headers = crate::headers::SyncHeaders::default();
+                        self.sync_deferred.clear();
+                        self.downloaded_bodies.clear();
+                    }
+                }
                 let mut missing = false;
                 for item in items {
                     if let Inventory::Block(hash) = item {
@@ -1595,6 +1796,7 @@ impl Node {
                         );
                         self.sync_headers = crate::headers::SyncHeaders::default();
                         self.sync_deferred.clear();
+                        self.downloaded_bodies.clear();
                     } else {
                         self.sync_unavailable.insert(id);
                         if let Some(source) = self.sync_peer {
@@ -1612,7 +1814,7 @@ impl Node {
             Message::Inv(items) => self.on_inv(id, &items)?,
             Message::GetData(items) => self.on_get_data(id, &items)?,
             Message::Block(block) => {
-                self.on_block(Some(id), &block)?;
+                self.queue_block_validation(Some(id), *block)?;
             }
             Message::Tx(tx) => self.on_tx(Some(id), *tx, false),
             Message::StemTx(tx) => self.on_tx(Some(id), *tx, true),
@@ -1620,6 +1822,62 @@ impl Node {
             Message::GetBlockTxn { hash, indices } => self.on_get_block_txn(id, hash, &indices)?,
             Message::BlockTxn { hash, transactions } => {
                 self.on_block_txn(id, hash, transactions)?;
+            }
+            Message::GetSnapshotManifest { height } => self.on_get_snapshot_manifest(id, height)?,
+            Message::SnapshotManifest(info) => {
+                if self.on_snapshot_manifest(id, info).is_err() {
+                    self.misbehave(id, 20, "invalid snapshot manifest");
+                    self.snapshot_manifest_wait = None;
+                    if let Some(download) = self.snapshot_download.as_mut() {
+                        if download.peer == Some(id) {
+                            download.peer = None;
+                        }
+                    }
+                    if self.sync_peer == Some(id) {
+                        self.sync_peer = None;
+                        self.sync = BlockSync::with_timeout(
+                            self.tor_settings.sync_response_timeout.as_secs(),
+                        );
+                        self.sync_headers = crate::headers::SyncHeaders::default();
+                        self.sync_deferred.clear();
+                        self.downloaded_bodies.clear();
+                    }
+                }
+            }
+            Message::GetSnapshotChunk { snapshot_id, index } => {
+                self.on_get_snapshot_chunk(id, snapshot_id, index)?;
+            }
+            Message::SnapshotChunk {
+                snapshot_id,
+                index,
+                chunk_count,
+                chunk_hash,
+                bytes,
+            } => {
+                let chunk = p2p::message::SnapshotChunk {
+                    snapshot_id,
+                    index,
+                    chunk_count,
+                    chunk_hash,
+                    bytes,
+                };
+                if self.on_snapshot_chunk(id, chunk).is_err() {
+                    self.misbehave(id, 20, "invalid snapshot chunk");
+                    if let Some(download) = self.snapshot_download.as_mut() {
+                        if download.peer == Some(id) {
+                            download.peer = None;
+                        }
+                    }
+                    if self.sync_peer == Some(id) {
+                        self.sync_peer = None;
+                        self.sync = BlockSync::with_timeout(
+                            self.tor_settings.sync_response_timeout.as_secs(),
+                        );
+                        self.sync_headers = crate::headers::SyncHeaders::default();
+                        self.sync_deferred.clear();
+                        self.downloaded_bodies.clear();
+                    }
+                }
             }
             Message::Version(_) | Message::Verack | Message::Ping(_) | Message::Pong(_) => {}
         }
@@ -1705,6 +1963,8 @@ impl Node {
 
     fn is_syncing(&self) -> bool {
         self.sync_peer.is_some()
+            || self.validation_hash.is_some()
+            || !self.downloaded_bodies.is_empty()
             || self
                 .chain
                 .tip_chainwork()
@@ -1727,6 +1987,7 @@ impl Node {
         };
         self.sync_headers = headers;
         self.sync_deferred.clear();
+        self.downloaded_bodies.clear();
         self.sync_peer = Some(id);
         if let Some(peer) = self.peers.get_mut(&id) {
             peer.sync_attempted = true;
@@ -1734,14 +1995,289 @@ impl Node {
             peer.sync_checked = false;
         }
         self.sync_progress_at = now();
+        if let Some(checkpoint) = self.params.checkpoints.last() {
+            // Atomic snapshot install is bootstrap-only. An already-running
+            // chain follows ordinary header/block sync and is never replaced.
+            if checkpoint.height > tip.height && tip.height == 0 {
+                self.snapshot_manifest_wait = Some((
+                    id,
+                    checkpoint.height,
+                    std::time::Instant::now() + self.tor_settings.sync_response_timeout,
+                ));
+                self.send(
+                    id,
+                    Message::GetSnapshotManifest {
+                        height: checkpoint.height,
+                    },
+                );
+                return;
+            }
+        }
         log(&format!("syncing from peer {id} at height {}", tip.height));
+        if let Some(download) = self.snapshot_download.as_ref() {
+            self.snapshot_manifest_wait = Some((
+                id,
+                download.manifest.height,
+                std::time::Instant::now() + self.tor_settings.sync_response_timeout,
+            ));
+            self.send(
+                id,
+                Message::GetSnapshotManifest {
+                    height: download.manifest.height,
+                },
+            );
+        } else {
+            self.send(
+                id,
+                Message::GetHeaders {
+                    locator,
+                    stop: BlockHash::ZERO,
+                },
+            );
+        }
+    }
+
+    fn on_get_snapshot_manifest(&mut self, id: PeerId, height: u32) -> Result<()> {
+        let Some(checkpoint) = self.params.checkpoint_at(height) else {
+            self.misbehave(id, 5, "snapshot checkpoint unavailable");
+            return Ok(());
+        };
+        if self.chain.store().hash_at(height)? != Some(checkpoint.hash) {
+            self.misbehave(id, 5, "snapshot tip is not the requested checkpoint");
+            return Ok(());
+        }
+        if let Some(serving) = self
+            .snapshot_serving
+            .as_ref()
+            .filter(|serving| serving.info.height == height)
+        {
+            self.send(id, Message::SnapshotManifest(serving.info.clone()));
+            return Ok(());
+        }
+        let nf_count = self
+            .chain
+            .store()
+            .nullifier_count_at(&checkpoint.hash)?
+            .ok_or(chain::Error::InvalidBlock(
+                "snapshot nullifier count missing",
+            ))?;
+        if nf_count
+            .checked_mul(32)
+            .is_none_or(|bytes| bytes > MAX_SNAPSHOT_TOTAL_LEN)
+        {
+            self.send(id, Message::NotFound(Vec::new()));
+            return Ok(());
+        }
+        let payload = SnapshotPayload::from_store_at(
+            self.chain.store(),
+            &self.params,
+            self.chain.chain_id(),
+            height,
+        )
+        .map_err(|_| chain::Error::InvalidBlock("snapshot export failed"))?;
+        if payload.manifest.height != height {
+            return Err(chain::Error::InvalidBlock("snapshot height mismatch").into());
+        }
+        let manifest = payload.manifest.to_bytes();
+        let body = payload
+            .to_bytes()
+            .map_err(|_| chain::Error::InvalidBlock("snapshot payload encoding failed"))?;
+        if u64::try_from(body.len()).unwrap_or(u64::MAX) > MAX_SNAPSHOT_TOTAL_LEN {
+            self.snapshot_serving = None;
+            self.send(id, Message::NotFound(Vec::new()));
+            return Ok(());
+        }
+        let payload_hash = snapshot_payload_hash(&body);
+        let snapshot_id = blake2b_short(SNAPSHOT_ID, &[&manifest, &payload_hash]);
+        let chunk_size = u32::try_from(MAX_SNAPSHOT_CHUNK_LEN).unwrap_or(u32::MAX);
+        let chunk_count =
+            u32::try_from((body.len() + MAX_SNAPSHOT_CHUNK_LEN - 1) / MAX_SNAPSHOT_CHUNK_LEN)
+                .map_err(|_| chain::Error::InvalidBlock("snapshot chunk count overflow"))?;
+        let info = SnapshotManifestInfo {
+            snapshot_id,
+            height,
+            manifest,
+            total_len: u64::try_from(body.len())
+                .map_err(|_| chain::Error::InvalidBlock("snapshot length overflow"))?,
+            chunk_size,
+            chunk_count,
+            payload_hash,
+        };
+        info.validate()?;
+        self.snapshot_serving = Some(SnapshotServing {
+            info: info.clone(),
+            payload: body,
+        });
+        self.send(id, Message::SnapshotManifest(info));
+        Ok(())
+    }
+
+    fn on_get_snapshot_chunk(
+        &mut self,
+        id: PeerId,
+        snapshot_id: [u8; 32],
+        index: u32,
+    ) -> Result<()> {
+        let Some(snapshot) = self
+            .snapshot_serving
+            .as_ref()
+            .filter(|snapshot| snapshot.info.snapshot_id == snapshot_id)
+        else {
+            self.send(id, Message::NotFound(Vec::new()));
+            return Ok(());
+        };
+        if index >= snapshot.info.chunk_count {
+            self.misbehave(id, 5, "snapshot chunk index out of range");
+            return Ok(());
+        }
+        let chunk_size = usize::try_from(snapshot.info.chunk_size)
+            .map_err(|_| p2p::Error::BadSnapshot("chunk size"))?;
+        let start = usize::try_from(index)
+            .ok()
+            .and_then(|i| i.checked_mul(chunk_size))
+            .ok_or(p2p::Error::BadSnapshot("chunk offset"))?;
+        let end = start
+            .checked_add(chunk_size)
+            .unwrap_or(usize::MAX)
+            .min(snapshot.payload.len());
+        let bytes = snapshot
+            .payload
+            .get(start..end)
+            .ok_or(p2p::Error::BadSnapshot("chunk range"))?
+            .to_vec();
         self.send(
             id,
-            Message::GetHeaders {
-                locator,
-                stop: BlockHash::ZERO,
+            Message::SnapshotChunk {
+                snapshot_id,
+                index,
+                chunk_count: snapshot.info.chunk_count,
+                chunk_hash: snapshot_chunk_hash(
+                    &snapshot_id,
+                    index,
+                    snapshot.info.chunk_count,
+                    &bytes,
+                ),
+                bytes,
             },
         );
+        Ok(())
+    }
+
+    fn on_snapshot_manifest(&mut self, id: PeerId, info: SnapshotManifestInfo) -> Result<()> {
+        if self.sync_peer != Some(id) {
+            return Ok(());
+        }
+        if !self
+            .snapshot_manifest_wait
+            .is_some_and(|(peer, height, deadline)| {
+                peer == id && height == info.height && std::time::Instant::now() <= deadline
+            })
+        {
+            self.misbehave(id, 10, "unsolicited snapshot manifest");
+            return Ok(());
+        }
+        self.snapshot_manifest_wait = None;
+        info.validate()?;
+        let manifest = SnapshotManifest::from_bytes(&info.manifest)?;
+        let Some(checkpoint) = self.params.checkpoint_at(manifest.height) else {
+            return Err(p2p::Error::BadSnapshot("no configured checkpoint").into());
+        };
+        let expected_rules = chain::chain::rules_digest(&self.params, self.chain.verifying_key());
+        if info.height != manifest.height
+            || manifest.chain_id != *self.chain.chain_id()
+            || manifest.rules_digest != expected_rules
+            || manifest.block_hash != checkpoint.hash
+            || manifest.chainwork != checkpoint.work.to_be_bytes()
+            || manifest.roots.state_root != checkpoint.state_root
+            || manifest.payload_len != info.total_len
+            || blake2b_short(SNAPSHOT_ID, &[&info.manifest, &info.payload_hash]) != info.snapshot_id
+        {
+            return Err(p2p::Error::BadSnapshot("snapshot checkpoint mismatch").into());
+        }
+        if let Some(download) = self.snapshot_download.as_mut() {
+            if download.info != info {
+                return Err(p2p::Error::BadSnapshot("snapshot manifest changed").into());
+            }
+            download.peer = Some(id);
+            download.deadline = std::time::Instant::now() + self.tor_settings.sync_response_timeout;
+            let index = download.assembler.next_index();
+            let snapshot_id = download.info.snapshot_id;
+            self.send(id, Message::GetSnapshotChunk { snapshot_id, index });
+            return Ok(());
+        }
+        let assembler = SnapshotAssembler::after_checkpoint(info.clone())?;
+        self.snapshot_download = Some(SnapshotDownload {
+            peer: Some(id),
+            info,
+            manifest,
+            assembler,
+            deadline: std::time::Instant::now() + self.tor_settings.sync_response_timeout,
+        });
+        self.send(
+            id,
+            Message::GetSnapshotChunk {
+                snapshot_id: self.snapshot_download.as_ref().unwrap().info.snapshot_id,
+                index: 0,
+            },
+        );
+        Ok(())
+    }
+
+    fn on_snapshot_chunk(&mut self, id: PeerId, chunk: p2p::message::SnapshotChunk) -> Result<()> {
+        let next_request = {
+            let Some(download) = self.snapshot_download.as_mut() else {
+                self.misbehave(id, 10, "unsolicited snapshot chunk");
+                return Ok(());
+            };
+            if download.peer != Some(id) {
+                return Ok(());
+            }
+            download.assembler.push(chunk)?;
+            download.deadline = std::time::Instant::now() + self.tor_settings.sync_response_timeout;
+            (!download.assembler.is_complete()).then(|| Message::GetSnapshotChunk {
+                snapshot_id: download.info.snapshot_id,
+                index: download.assembler.next_index(),
+            })
+        };
+        if let Some(request) = next_request {
+            self.send(id, request);
+            return Ok(());
+        }
+        let download = self.snapshot_download.take().unwrap();
+        let bytes = download.assembler.finish()?;
+        let payload =
+            SnapshotPayload::from_bytes(download.manifest.clone(), &bytes, download.info.total_len)
+                .map_err(|_| p2p::Error::BadSnapshot("snapshot payload encoding"))?;
+        verify_payload(&payload, self.chain.chain_id())
+            .map_err(|_| p2p::Error::BadSnapshot("snapshot payload roots"))?;
+        let checkpoint = self
+            .params
+            .checkpoint_at(payload.manifest.height)
+            .ok_or(p2p::Error::BadSnapshot("checkpoint disappeared"))?;
+        let checkpoint_header = payload
+            .recent_headers
+            .last()
+            .ok_or(p2p::Error::BadSnapshot("snapshot header suffix"))?;
+        chain::snapshot::verify_snapshot(
+            &self.params,
+            &chain::chain::rules_digest(&self.params, self.chain.verifying_key()),
+            self.chain.chain_id(),
+            &checkpoint_header.header,
+            checkpoint.work,
+            &payload,
+        )
+        .map_err(|_| p2p::Error::BadSnapshot("snapshot checkpoint verification"))?;
+        let install = payload.to_storage_install()?;
+        self.chain.install_snapshot(&install)?;
+        self.tip.send_replace(payload.manifest.block_hash);
+        self.sync_peer = None;
+        self.sync = BlockSync::with_timeout(self.tor_settings.sync_response_timeout.as_secs());
+        self.sync_headers = crate::headers::SyncHeaders::default();
+        self.sync_deferred.clear();
+        self.downloaded_bodies.clear();
+        self.snapshot_serving = None;
+        self.start_sync(id);
+        Ok(())
     }
 
     fn on_get_headers(&mut self, id: PeerId, locator: &[BlockHash], stop: BlockHash) -> Result<()> {
@@ -1822,23 +2358,23 @@ impl Node {
             self.sync = BlockSync::with_timeout(self.tor_settings.sync_response_timeout.as_secs());
             self.sync_headers = crate::headers::SyncHeaders::default();
             self.sync_deferred.clear();
+            self.downloaded_bodies.clear();
             self.misbehave(id, 20, "bad headers");
         }
     }
 
-    /// Requests more headers if the queue has room for them, fills the
-    /// block request window, and ends the sync once nothing is left.
+    /// Completes the header scan, then fills the bounded body download window.
     fn continue_sync(&mut self, id: PeerId) {
+        if let Err(error) = self.dispatch_body_validation() {
+            logging::error(&format!("cannot dispatch downloaded body: {error}"));
+            let _ = self.events.try_send(Event::Shutdown);
+            return;
+        }
         let Ok(work) = self.chain.tip_chainwork() else {
             return;
         };
         self.sync.set_required_work(work.max(MIN_CHAIN_WORK));
-        if let Some(from) = ((!self.sync_headers.has_deferred() && self.sync.queued() == 0)
-            || !self.sync.meets_required_work()
-            || !self.sync_headers.authenticated())
-        .then(|| self.sync.next_headers_request())
-        .flatten()
-        {
+        if let Some(from) = self.sync.next_headers_request() {
             self.send(
                 id,
                 Message::GetHeaders {
@@ -1846,6 +2382,10 @@ impl Node {
                     stop: BlockHash::ZERO,
                 },
             );
+        }
+        // Complete the authenticated header scan before downloading bodies.
+        if !self.sync.exhausted() {
+            return;
         }
         if self.sync_headers.authenticated()
             && self.sync.meets_required_work()
@@ -1884,6 +2424,14 @@ impl Node {
             .collect();
         peers.sort_by_key(|(peer, priority)| (*priority, *peer));
         for (peer, _) in peers {
+            if self.validation_hash.is_some()
+                && (self.downloaded_bodies.len() >= p2p::sync::MAX_IN_FLIGHT
+                    || self.downloaded_bodies.bytes()
+                        > crate::sync_bodies::MAX_STAGED_BYTES
+                            .saturating_sub(p2p::message::MAX_MESSAGE_LEN))
+            {
+                break;
+            }
             let hashes = self.sync.next_requests_for(peer);
             if !hashes.is_empty() {
                 self.send(
@@ -1902,6 +2450,7 @@ impl Node {
             self.sync = BlockSync::with_timeout(self.tor_settings.sync_response_timeout.as_secs());
             self.sync_headers = crate::headers::SyncHeaders::default();
             self.sync_deferred.clear();
+            self.downloaded_bodies.clear();
             return;
         }
         self.finish_sync_if_done();
@@ -1909,6 +2458,8 @@ impl Node {
 
     fn finish_sync_if_done(&mut self) {
         if self.sync_headers.authenticated()
+            && self.validation_hash.is_none()
+            && self.downloaded_bodies.is_empty()
             && !self.sync_headers.has_deferred()
             && self.sync.is_idle()
             && self.sync.exhausted()
@@ -2068,6 +2619,11 @@ impl Node {
     /// Imports a block from a peer, the miner or a submission, applies
     /// its consequences, and says what became of it.
     fn on_block(&mut self, from: Option<PeerId>, block: &Block) -> Result<Submission> {
+        if self.validation_pending > 0 {
+            return Ok(Submission::Rejected(
+                "block validation is in progress".to_string(),
+            ));
+        }
         let hash = block.hash();
         self.pending_blocks.remove(&hash);
         if let Some(id) = from {
@@ -2080,13 +2636,218 @@ impl Node {
         if from.is_some() {
             self.block_telemetry.observe(hash, started);
         }
-        let outcome = self.chain.import(block, now(), &mut self.rng);
+        let result = match self.chain.import(block, now(), &mut self.rng) {
+            Ok(import) => BlockValidation::Valid(import),
+            Err(chain::Error::Orphan) => {
+                BlockValidation::Orphan("orphan block: parent unknown".to_string())
+            }
+            Err(error) => BlockValidation::Invalid(error.to_string()),
+        };
+        self.on_block_validation_result(from, block, result, already_known, started)
+    }
+
+    fn queue_block_validation(&mut self, from: Option<PeerId>, block: Block) -> Result<()> {
+        let Some(from) = from else {
+            return Err(Error::Stopped);
+        };
+        let hash = block.hash();
+        if self.validation_hash == Some(hash) || self.downloaded_bodies.contains(&hash) {
+            return Ok(());
+        }
+        if self.chain.store().contains_block(&hash)? {
+            self.sync.on_block(&hash);
+            if let Some(peer) = self.sync_peer {
+                self.continue_sync(peer);
+            }
+            return Ok(());
+        }
+        // Match a previously validated request, or validate the relay's header
+        // against its known parent before accepting body bytes into quarantine.
+        if let Some(expected) = self.sync.requested_header(&hash) {
+            if expected != block.header() {
+                self.misbehave(from, 100, "body does not match requested header");
+                return Ok(());
+            }
+        } else {
+            if !self
+                .chain
+                .store()
+                .contains_block(&block.header().prev_hash)?
+            {
+                self.start_sync(from);
+                return Ok(());
+            }
+            let mut candidate = crate::headers::SyncHeaders::default();
+            if let Err(error) =
+                candidate.verify(&self.chain, std::slice::from_ref(block.header()), now())
+            {
+                if matches!(
+                    &error,
+                    Error::Storage(_)
+                        | Error::Io(_)
+                        | Error::Chain(chain::Error::Storage(_) | chain::Error::RandomX(_))
+                ) {
+                    logging::error(&format!("local header check failed: {error}"));
+                    let _ = self.events.try_send(Event::Shutdown);
+                    return Err(error);
+                }
+                self.misbehave(from, 100, "invalid body header");
+                return Ok(());
+            }
+            if !candidate.authenticated() {
+                self.start_sync(from);
+                return Ok(());
+            }
+        }
+        let header = block.header().clone();
+        let mut incoming = block;
+        loop {
+            let inserted = match self.downloaded_bodies.insert(from, incoming) {
+                Ok(inserted) => inserted,
+                Err(error) => {
+                    if let Some(owner) = self.sync.owner(&hash) {
+                        self.sync.requeue_download(owner, &hash);
+                    }
+                    logging::error(&format!("local body quarantine failed: {error}"));
+                    let _ = self.events.try_send(Event::Shutdown);
+                    return Err(error);
+                }
+            };
+            match inserted {
+                crate::sync_bodies::Insert::Added => {
+                    self.pending_blocks.remove(&hash);
+                    self.sync.body_received(&header);
+                    self.sync_progress_at = now();
+                    self.block_telemetry
+                        .observe(hash, std::time::Instant::now());
+                    self.dispatch_body_validation()?;
+                    break;
+                }
+                crate::sync_bodies::Insert::Duplicate => break,
+                crate::sync_bodies::Insert::Full(block) => {
+                    // Keep room for an earlier missing parent instead of
+                    // deadlocking behind out-of-order descendant bodies.
+                    if let Some((_, evicted)) = self.downloaded_bodies.evict_above(header.height) {
+                        if let Some(owner) = self.sync.owner(&evicted) {
+                            self.sync.requeue_download(owner, &evicted);
+                        }
+                        incoming = *block;
+                    } else {
+                        if let Some(owner) = self.sync.owner(&hash) {
+                            self.sync.requeue_download(owner, &hash);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn dispatch_body_validation(&mut self) -> Result<()> {
+        if self.validation_hash.is_some() {
+            return Ok(());
+        }
+        let store = self.chain.store();
+        let mut read_error = None;
+        let body = self
+            .downloaded_bodies
+            .take_ready(|parent| match store.contains_block(parent) {
+                Ok(known) => known,
+                Err(error) => {
+                    read_error = Some(error);
+                    false
+                }
+            });
+        if let Some(error) = read_error {
+            return Err(error.into());
+        }
+        let Some(body) = body else { return Ok(()) };
+        let hash = body.hash;
+        if self.validation.try_send(body).is_err() {
+            let _ = self.events.try_send(Event::Shutdown);
+            return Err(Error::Stopped);
+        }
+        self.validation_hash = Some(hash);
+        self.validation_epoch = self.sync_epoch;
+        self.validation_pending = 1;
+        Ok(())
+    }
+
+    fn on_block_authorized(
+        &mut self,
+        from: PeerId,
+        hash: BlockHash,
+        block: Option<Box<Block>>,
+        authorization: core::result::Result<AuthorizedBlock, String>,
+        local_failure: bool,
+        started: std::time::Instant,
+    ) -> Result<()> {
+        if self.validation_hash != Some(hash) {
+            return Ok(());
+        }
+        self.validation_hash = None;
+        self.validation_pending = 0;
+        if local_failure {
+            logging::error(&format!(
+                "local body authorization failed for {hash}: {authorization:?}"
+            ));
+            if let Some(owner) = self.sync.owner(&hash) {
+                self.sync.requeue_download(owner, &hash);
+            }
+        } else if let Some(block) = block {
+            let already_known = self.chain.store().contains_block(&hash)?;
+            let outcome = match authorization {
+                Ok(token) => match self
+                    .chain
+                    .import_authorized(&block, token, now(), &mut self.rng)
+                {
+                    Ok(import) => BlockValidation::Valid(import),
+                    Err(chain::Error::Orphan) => {
+                        BlockValidation::Orphan("parent is not applied".into())
+                    }
+                    Err(error @ (chain::Error::Storage(_) | chain::Error::RandomX(_))) => {
+                        BlockValidation::LocalFailure(error.to_string())
+                    }
+                    Err(error) => BlockValidation::Invalid(error.to_string()),
+                },
+                Err(reason) => BlockValidation::Invalid(reason),
+            };
+            let _ = self.on_block_validation_result(
+                Some(from),
+                &block,
+                outcome,
+                already_known,
+                started,
+            )?;
+        }
+        self.sync_progress_at = now();
+        self.dispatch_body_validation()?;
+        if let Some(peer) = self.sync_peer {
+            self.continue_sync(peer);
+        }
+        Ok(())
+    }
+
+    fn on_block_validation_result(
+        &mut self,
+        from: Option<PeerId>,
+        block: &Block,
+        result: BlockValidation,
+        already_known: bool,
+        started: std::time::Instant,
+    ) -> Result<Submission> {
+        let hash = block.hash();
+        self.pending_blocks.remove(&hash);
+        let outcome = result;
         let valid_new = !already_known
             && matches!(
                 &outcome,
-                Ok(Import::Extended | Import::Reorganized { .. } | Import::SideChain)
+                BlockValidation::Valid(
+                    Import::Extended | Import::Reorganized { .. } | Import::SideChain
+                )
             );
-        if !matches!(&outcome, Err(chain::Error::Orphan)) {
+        if !matches!(outcome, BlockValidation::Orphan(_)) {
             self.block_telemetry.imported(
                 hash,
                 from.is_some(),
@@ -2098,18 +2859,22 @@ impl Node {
         if from.is_none() {
             if valid_new {
                 self.record_mined(block);
-            } else if outcome.is_err() {
+            } else if matches!(&outcome, BlockValidation::Invalid(_)) {
                 self.mined_rejected = self.mined_rejected.saturating_add(1);
             }
         }
         let submission = match &outcome {
-            Ok(Import::Extended | Import::Reorganized { .. }) => Submission::Accepted,
-            Ok(Import::AlreadyKnown) => Submission::Duplicate,
-            Ok(Import::SideChain) => Submission::Stale,
-            Err(error) => Submission::Rejected(error.to_string()),
+            BlockValidation::Valid(Import::Extended | Import::Reorganized { .. }) => {
+                Submission::Accepted
+            }
+            BlockValidation::Valid(Import::AlreadyKnown) => Submission::Duplicate,
+            BlockValidation::Valid(Import::SideChain) => Submission::Stale,
+            BlockValidation::Orphan(error)
+            | BlockValidation::Invalid(error)
+            | BlockValidation::LocalFailure(error) => Submission::Rejected(error.clone()),
         };
         match outcome {
-            Ok(Import::Extended) => {
+            BlockValidation::Valid(Import::Extended) => {
                 self.mempool
                     .on_block_applied(block, self.chain.store(), &self.params)?;
                 log(&format!(
@@ -2126,7 +2891,7 @@ impl Node {
                 self.announce_block(block, from);
                 self.tip_moved(hash);
             }
-            Ok(Import::Reorganized { reverted, applied }) => {
+            BlockValidation::Valid(Import::Reorganized { reverted, applied }) => {
                 logging::warn(&format!(
                     "reorganized: reverted {}, applied {applied}",
                     reverted.len()
@@ -2137,8 +2902,8 @@ impl Node {
                 self.announce_block(block, from);
                 self.tip_moved(hash);
             }
-            Ok(Import::SideChain | Import::AlreadyKnown) => {}
-            Err(chain::Error::Orphan) => {
+            BlockValidation::Valid(Import::SideChain | Import::AlreadyKnown) => {}
+            BlockValidation::Orphan(_) => {
                 if self.sync.expects(&hash) && self.sync_peer.is_some() {
                     // Receipt resolved the old response deadline. The parent has
                     // its own deadline; a later retry gets a fresh write ticket.
@@ -2151,11 +2916,26 @@ impl Node {
                     self.start_sync(id);
                 }
             }
-            Err(error) => {
+            BlockValidation::Invalid(error) => {
                 logging::warn(&format!("invalid block {hash}: {error}"));
                 if let Some(id) = from {
+                    if self.validation_epoch == self.sync_epoch && self.sync.expects(&hash) {
+                        if let Some(source) = self.sync_peer.take() {
+                            self.settle_claim(source);
+                        }
+                        self.sync = BlockSync::with_timeout(
+                            self.tor_settings.sync_response_timeout.as_secs(),
+                        );
+                        self.sync_headers = crate::headers::SyncHeaders::default();
+                        self.sync_deferred.clear();
+                        self.downloaded_bodies.clear();
+                    }
                     self.misbehave(id, 100, "invalid block");
                 }
+            }
+            BlockValidation::LocalFailure(error) => {
+                logging::error(&format!("local block import failed: {error}"));
+                let _ = self.events.try_send(Event::Shutdown);
             }
         }
         if !matches!(submission, Submission::Rejected(_)) {
@@ -2274,11 +3054,16 @@ impl Node {
         let pending = PendingBlock {
             header: compact.header,
             transactions,
+            full_block_requested: false,
             received_at: now(),
         };
         if missing.is_empty() {
             let block = assemble(&pending)?;
-            self.on_block(Some(id), &block)?;
+            if block.check_body_root().is_err() {
+                self.request_full_block_fallback(id, hash, pending);
+                return Ok(());
+            }
+            self.queue_block_validation(Some(id), block)?;
             return Ok(());
         }
         if self.pending_blocks.len() >= MAX_PENDING_BLOCKS {
@@ -2322,19 +3107,49 @@ impl Node {
         let Some(pending) = self.pending_blocks.get_mut(&hash) else {
             return Ok(());
         };
+        if pending.full_block_requested {
+            return Ok(());
+        }
         let mut supplied = transactions.into_iter();
         for slot in pending.transactions.iter_mut().filter(|s| s.is_none()) {
             *slot = supplied.next();
         }
         if pending.transactions.iter().all(Option::is_some) {
-            let block = assemble(pending)?;
-            self.pending_blocks.remove(&hash);
-            self.on_block(Some(id), &block)?;
+            let pending = self
+                .pending_blocks
+                .remove(&hash)
+                .ok_or(Error::Argument("pending compact block disappeared".into()))?;
+            let block = assemble(&pending)?;
+            if block.check_body_root().is_err() {
+                self.request_full_block_fallback(id, hash, pending);
+                return Ok(());
+            }
+            self.queue_block_validation(Some(id), block)?;
             return Ok(());
         }
         self.pending_blocks.remove(&hash);
         self.misbehave(id, 20, "incomplete block transactions");
         Ok(())
+    }
+
+    /// A txid commits effecting fields, but intentionally omits authorization
+    /// proofs and signatures. If pool substitution therefore fails the v1
+    /// body commitment, request the canonical full body instead of treating
+    /// a legitimate compact relay as invalid.
+    fn request_full_block_fallback(
+        &mut self,
+        id: PeerId,
+        hash: BlockHash,
+        mut pending: PendingBlock,
+    ) {
+        if self.pending_blocks.len() >= MAX_PENDING_BLOCKS {
+            return;
+        }
+        pending.full_block_requested = true;
+        pending.transactions.clear();
+        pending.received_at = now();
+        self.pending_blocks.insert(hash, pending);
+        self.send(id, Message::GetData(vec![Inventory::Block(hash)]));
     }
 
     /// Drops mempool entries mined in the last `count` main-chain blocks.
@@ -2420,7 +3235,7 @@ impl Node {
         Ok(mining_blocker(
             false,
             0,
-            self.sync_peer.is_some(),
+            self.is_syncing(),
             self.chain.tip()?.height,
             self.claims().map(|(_, height)| height),
         ))
@@ -2547,6 +3362,8 @@ impl Node {
             parent,
             recent,
             tree,
+            nullifier_store: Some(store.clone()),
+            chain_id: *self.chain.chain_id(),
             transactions,
             params: self.params,
             now: now(),
@@ -2635,9 +3452,47 @@ impl Node {
     // ---- clock ------------------------------------------------------
 
     fn on_tick(&mut self) {
+        if let Err(error) = self.dispatch_body_validation() {
+            logging::error(&format!("cannot dispatch quarantined body: {error}"));
+            let _ = self.events.try_send(Event::Shutdown);
+        }
         self.dial_tasks.retain(|_, task| !task.is_finished());
         self.ticks = self.ticks.saturating_add(1);
         let now = now();
+        if self
+            .snapshot_download
+            .as_ref()
+            .is_some_and(|download| std::time::Instant::now() > download.deadline)
+        {
+            if let Some(download) = self.snapshot_download.take() {
+                if let Some(peer) = download.peer {
+                    self.misbehave(peer, 10, "snapshot transfer timeout");
+                }
+                self.snapshot_download = Some(SnapshotDownload {
+                    peer: None,
+                    ..download
+                });
+                self.sync_peer = None;
+                self.sync =
+                    BlockSync::with_timeout(self.tor_settings.sync_response_timeout.as_secs());
+                self.sync_headers = crate::headers::SyncHeaders::default();
+                self.sync_deferred.clear();
+                self.downloaded_bodies.clear();
+            }
+        }
+        if self
+            .snapshot_manifest_wait
+            .is_some_and(|(_, _, deadline)| std::time::Instant::now() > deadline)
+        {
+            if let Some((peer, _, _)) = self.snapshot_manifest_wait.take() {
+                self.misbehave(peer, 5, "snapshot manifest timeout");
+            }
+            self.sync_peer = None;
+            self.sync = BlockSync::with_timeout(self.tor_settings.sync_response_timeout.as_secs());
+            self.sync_headers = crate::headers::SyncHeaders::default();
+            self.sync_deferred.clear();
+            self.downloaded_bodies.clear();
+        }
         let ids: Vec<PeerId> = self.peers.keys().copied().collect();
         for id in ids {
             if self.peers.get(&id).is_some_and(|h| {
@@ -2669,6 +3524,7 @@ impl Node {
             self.sync = BlockSync::with_timeout(self.tor_settings.sync_response_timeout.as_secs());
             self.sync_headers = crate::headers::SyncHeaders::default();
             self.sync_deferred.clear();
+            self.downloaded_bodies.clear();
         } else {
             for peer in stalled {
                 self.sync_unavailable.insert(peer);
@@ -2689,7 +3545,10 @@ impl Node {
                 .new_epoch(now, &inbound, &outbound, &mut self.rng);
         }
         if let Some(id) = self.sync_peer {
-            if now.saturating_sub(self.sync_progress_at) >= SYNC_STALL_SECONDS {
+            if self.validation_hash.is_none()
+                && self.downloaded_bodies.is_empty()
+                && now.saturating_sub(self.sync_progress_at) >= SYNC_STALL_SECONDS
+            {
                 logging::warn(&format!("sync with peer {id} stalled, trying another peer"));
                 self.settle_claim(id);
                 self.sync_peer = None;
@@ -2697,6 +3556,7 @@ impl Node {
                     BlockSync::with_timeout(self.tor_settings.sync_response_timeout.as_secs());
                 self.sync_headers = crate::headers::SyncHeaders::default();
                 self.sync_deferred.clear();
+                self.downloaded_bodies.clear();
             }
         }
         if self.sync_peer.is_none() {

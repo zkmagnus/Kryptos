@@ -93,13 +93,13 @@ graph without changing the generator version or native ABI.
 
 Keep reddsa 0.5.2 and select `alloc` and `zeroize` explicitly instead of its
 default `std` feature. `alloc` keeps the existing batch verification and
-multiscalar multiplication paths. `zeroize` remains enabled. Rhombus uses its
+multiscalar multiplication paths. `zeroize` remains enabled. Kryptos uses its
 own canonical signature/key bytes and maps RedDSA errors into its own error
 type; it does not need RedDSA's serde derives or `std::error::Error` implementation.
 
 In reddsa 0.5.2, `std` enables `serde`, whose weak optional FROST feature edge
 retains frost-core, postcard, heapless 0.7 and atomic-polyfill in the lockfile.
-Those FROST dependencies were not in Rhombus's active target build graph.
+Those FROST dependencies were not in Kryptos's active target build graph.
 Removing unused serde/std integration removes that dormant path and
 `RUSTSEC-2023-0089`. No signing or verification source is patched, and no package
 version is upgraded. The account/key derivation and network activation rules

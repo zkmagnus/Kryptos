@@ -33,4 +33,16 @@ pub enum Error {
     /// The tree cannot take more commitments.
     #[error("commitment tree is full")]
     TreeFull,
+    /// A nullifier was already present in the parent's spent set.
+    #[error("nullifier already spent")]
+    NullifierAlreadySpent,
+    /// A block attempted to insert more nullifiers than protocol limits allow.
+    #[error("nullifier batch exceeds block limits")]
+    NullifierBatchTooLarge,
+    /// A snapshot manifest, state root, checkpoint, or payload is inconsistent.
+    #[error("snapshot verification failed: {0}")]
+    Snapshot(&'static str),
+    /// Snapshot installation was not authorized for this database state.
+    #[error("snapshot install mode does not permit replacing this store")]
+    SnapshotInstallMode,
 }

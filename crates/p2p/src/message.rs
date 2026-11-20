@@ -23,6 +23,14 @@ pub const MAX_HEADERS: usize = 2_000;
 pub const MAX_LOCATOR: usize = 64;
 /// Most addresses in one message.
 pub const MAX_ADDRESSES: usize = 1_000;
+/// Maximum encoded snapshot manifest attached to one response.
+pub const MAX_SNAPSHOT_MANIFEST_LEN: usize = 64 * 1024;
+/// Maximum payload bytes in one snapshot chunk.
+pub const MAX_SNAPSHOT_CHUNK_LEN: usize = 256 * 1024;
+/// Maximum encoded snapshot payload a peer may advertise.
+pub const MAX_SNAPSHOT_TOTAL_LEN: u64 = 256 * 1024 * 1024;
+/// Maximum number of chunks in one snapshot transfer.
+pub const MAX_SNAPSHOT_CHUNKS: u32 = 1_024;
 
 /// What a node announces about itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,6 +61,70 @@ pub struct PeerAddr {
     pub port: u16,
     /// When the address was last seen alive, seconds since the epoch.
     pub last_seen: u64,
+}
+
+/// Bounded transfer metadata for an opaque, checkpoint-bound snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotManifestInfo {
+    /// Identifier chosen as a commitment to this exact manifest and payload.
+    pub snapshot_id: [u8; 32],
+    /// Height requested by the receiver and stated by the manifest.
+    pub height: u32,
+    /// Canonically encoded chain snapshot manifest.
+    pub manifest: Vec<u8>,
+    /// Total encoded payload bytes, excluding this manifest.
+    pub total_len: u64,
+    /// Fixed payload bytes per chunk, except possibly the final chunk.
+    pub chunk_size: u32,
+    /// Exact number of chunks needed to carry `total_len` bytes.
+    pub chunk_count: u32,
+    /// Hash of the complete payload, verified after chunk assembly.
+    pub payload_hash: [u8; 32],
+}
+
+impl SnapshotManifestInfo {
+    /// Checks wire limits and consistency before a receiver allocates payload storage.
+    pub fn validate(&self) -> Result<()> {
+        let manifest_len = self.manifest.len();
+        if manifest_len == 0 || manifest_len > MAX_SNAPSHOT_MANIFEST_LEN {
+            return Err(Error::BadSnapshot("manifest length"));
+        }
+        if self.total_len == 0 || self.total_len > MAX_SNAPSHOT_TOTAL_LEN {
+            return Err(Error::BadSnapshot("payload length"));
+        }
+        if self.chunk_size == 0
+            || usize::try_from(self.chunk_size).unwrap_or(usize::MAX) > MAX_SNAPSHOT_CHUNK_LEN
+        {
+            return Err(Error::BadSnapshot("chunk size"));
+        }
+        let expected = self
+            .total_len
+            .checked_add(u64::from(self.chunk_size) - 1)
+            .ok_or(Error::BadSnapshot("chunk count overflow"))?
+            / u64::from(self.chunk_size);
+        if expected != u64::from(self.chunk_count)
+            || self.chunk_count == 0
+            || self.chunk_count > MAX_SNAPSHOT_CHUNKS
+        {
+            return Err(Error::BadSnapshot("chunk count"));
+        }
+        Ok(())
+    }
+}
+
+/// One snapshot payload chunk after decoding a `Message::SnapshotChunk`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotChunk {
+    /// Identifier returned by `SnapshotManifest`.
+    pub snapshot_id: [u8; 32],
+    /// Zero-based chunk index.
+    pub index: u32,
+    /// Total chunks announced by the manifest.
+    pub chunk_count: u32,
+    /// Hash of these exact chunk bytes.
+    pub chunk_hash: [u8; 32],
+    /// Chunk bytes, bounded by [`MAX_SNAPSHOT_CHUNK_LEN`].
+    pub bytes: Vec<u8>,
 }
 
 impl PeerAddr {
@@ -151,6 +223,33 @@ pub enum Message {
         /// The transactions.
         transactions: Vec<Transaction>,
     },
+    /// Request checkpoint-bound snapshot metadata at one exact height.
+    GetSnapshotManifest {
+        /// Height selected by the local checkpoint policy.
+        height: u32,
+    },
+    /// Snapshot metadata; the receiver validates it against its checkpoint before allocation.
+    SnapshotManifest(SnapshotManifestInfo),
+    /// Request one zero-based snapshot payload chunk.
+    GetSnapshotChunk {
+        /// Identifier returned by `SnapshotManifest`.
+        snapshot_id: [u8; 32],
+        /// Zero-based chunk index.
+        index: u32,
+    },
+    /// One independently hashed payload chunk.
+    SnapshotChunk {
+        /// Identifier returned by `SnapshotManifest`.
+        snapshot_id: [u8; 32],
+        /// Zero-based chunk index.
+        index: u32,
+        /// Total chunks announced by the manifest.
+        chunk_count: u32,
+        /// Hash of these exact chunk bytes.
+        chunk_hash: [u8; 32],
+        /// Chunk bytes, bounded by [`MAX_SNAPSHOT_CHUNK_LEN`].
+        bytes: Vec<u8>,
+    },
 }
 
 /// A block with the transactions the receiver likely has left out.
@@ -205,6 +304,10 @@ mod tag {
     pub const GET_BLOCK_TXN: u8 = 16;
     pub const BLOCK_TXN: u8 = 17;
     pub const CONNECTION_LINK: u8 = 18;
+    pub const GET_SNAPSHOT_MANIFEST: u8 = 19;
+    pub const SNAPSHOT_MANIFEST: u8 = 20;
+    pub const GET_SNAPSHOT_CHUNK: u8 = 21;
+    pub const SNAPSHOT_CHUNK: u8 = 22;
 }
 
 impl Message {
@@ -229,6 +332,10 @@ impl Message {
             Self::CompactBlock(_) => tag::COMPACT_BLOCK,
             Self::GetBlockTxn { .. } => tag::GET_BLOCK_TXN,
             Self::BlockTxn { .. } => tag::BLOCK_TXN,
+            Self::GetSnapshotManifest { .. } => tag::GET_SNAPSHOT_MANIFEST,
+            Self::SnapshotManifest(_) => tag::SNAPSHOT_MANIFEST,
+            Self::GetSnapshotChunk { .. } => tag::GET_SNAPSHOT_CHUNK,
+            Self::SnapshotChunk { .. } => tag::SNAPSHOT_CHUNK,
         }
     }
 
@@ -308,6 +415,35 @@ impl Message {
                 for t in transactions {
                     t.write(&mut w);
                 }
+            }
+            Self::GetSnapshotManifest { height } => {
+                w.put(&height.to_le_bytes());
+            }
+            Self::SnapshotManifest(info) => {
+                w.put(&info.snapshot_id).put(&info.height.to_le_bytes());
+                put_count(&mut w, info.manifest.len());
+                w.put(&info.manifest)
+                    .put(&info.total_len.to_le_bytes())
+                    .put(&info.chunk_size.to_le_bytes())
+                    .put(&info.chunk_count.to_le_bytes())
+                    .put(&info.payload_hash);
+            }
+            Self::GetSnapshotChunk { snapshot_id, index } => {
+                w.put(snapshot_id).put(&index.to_le_bytes());
+            }
+            Self::SnapshotChunk {
+                snapshot_id,
+                index,
+                chunk_count,
+                chunk_hash,
+                bytes,
+            } => {
+                w.put(snapshot_id)
+                    .put(&index.to_le_bytes())
+                    .put(&chunk_count.to_le_bytes())
+                    .put(chunk_hash);
+                put_count(&mut w, bytes.len());
+                w.put(bytes);
             }
         }
         w.into_bytes()
@@ -406,6 +542,56 @@ impl Message {
                     .collect::<Result<Vec<_>>>()?;
                 Self::BlockTxn { hash, transactions }
             }
+            tag::GET_SNAPSHOT_MANIFEST => Self::GetSnapshotManifest {
+                height: u32::from_le_bytes(r.take_array()?),
+            },
+            tag::SNAPSHOT_MANIFEST => {
+                let snapshot_id = r.take_array()?;
+                let height = u32::from_le_bytes(r.take_array()?);
+                let manifest_len =
+                    take_count(&mut r, MAX_SNAPSHOT_MANIFEST_LEN, "snapshot manifest")?;
+                let manifest = r.take(manifest_len)?.to_vec();
+                let info = SnapshotManifestInfo {
+                    snapshot_id,
+                    height,
+                    manifest,
+                    total_len: r.take_u64_le()?,
+                    chunk_size: u32::from_le_bytes(r.take_array()?),
+                    chunk_count: u32::from_le_bytes(r.take_array()?),
+                    payload_hash: r.take_array()?,
+                };
+                info.validate()?;
+                Self::SnapshotManifest(info)
+            }
+            tag::GET_SNAPSHOT_CHUNK => {
+                let snapshot_id = r.take_array()?;
+                let index = u32::from_le_bytes(r.take_array()?);
+                if index >= MAX_SNAPSHOT_CHUNKS {
+                    return Err(Error::BadSnapshot("chunk index"));
+                }
+                Self::GetSnapshotChunk { snapshot_id, index }
+            }
+            tag::SNAPSHOT_CHUNK => {
+                let snapshot_id = r.take_array()?;
+                let index = u32::from_le_bytes(r.take_array()?);
+                let chunk_count = u32::from_le_bytes(r.take_array()?);
+                let chunk_hash = r.take_array()?;
+                let len = take_count(&mut r, MAX_SNAPSHOT_CHUNK_LEN, "snapshot chunk")?;
+                if chunk_count == 0 || chunk_count > MAX_SNAPSHOT_CHUNKS || index >= chunk_count {
+                    return Err(Error::BadSnapshot("chunk index or count"));
+                }
+                if len == 0 {
+                    return Err(Error::BadSnapshot("empty chunk"));
+                }
+                let bytes = r.take(len)?.to_vec();
+                Self::SnapshotChunk {
+                    snapshot_id,
+                    index,
+                    chunk_count,
+                    chunk_hash,
+                    bytes,
+                }
+            }
             other => return Err(Error::UnknownTag(other)),
         };
         r.finish()?;
@@ -451,6 +637,11 @@ mod tests {
             BlockHash::from_bytes([1; 32]),
             Anchor::from_base(pallas::Base::from(2u64)),
         );
+        let genesis = empty_header(
+            0,
+            BlockHash::ZERO,
+            Anchor::from_base(pallas::Base::from(3u64)),
+        );
         vec![
             Message::Version(VersionInfo {
                 version: PROTOCOL_VERSION,
@@ -471,7 +662,7 @@ mod tests {
                 locator: vec![BlockHash::from_bytes([3; 32])],
                 stop: BlockHash::ZERO,
             },
-            Message::Headers(vec![header.clone(), header.clone()]),
+            Message::Headers(vec![genesis, header.clone(), header.clone()]),
             Message::Inv(vec![
                 Inventory::Block(BlockHash::ZERO),
                 Inventory::Tx(TxId::from_bytes([8; 32])),
@@ -486,6 +677,27 @@ mod tests {
             Message::BlockTxn {
                 hash: BlockHash::ZERO,
                 transactions: vec![],
+            },
+            Message::GetSnapshotManifest { height: 525_600 },
+            Message::SnapshotManifest(SnapshotManifestInfo {
+                snapshot_id: [9; 32],
+                height: 525_600,
+                manifest: vec![1, 2, 3],
+                total_len: 600_000,
+                chunk_size: 256 * 1024,
+                chunk_count: 3,
+                payload_hash: [7; 32],
+            }),
+            Message::GetSnapshotChunk {
+                snapshot_id: [9; 32],
+                index: 2,
+            },
+            Message::SnapshotChunk {
+                snapshot_id: [9; 32],
+                index: 2,
+                chunk_count: 3,
+                chunk_hash: [8; 32],
+                bytes: vec![4, 5, 6],
             },
         ]
     }
@@ -561,5 +773,85 @@ mod tests {
         let addr = NetAddr::TorV3([1; 32]);
         let a = PeerAddr::new(addr, 1, 0);
         assert_eq!(a.key(), (addr, 1));
+    }
+
+    #[test]
+    fn snapshot_manifest_rejects_inconsistent_or_oversized_transfer_metadata() {
+        let good = SnapshotManifestInfo {
+            snapshot_id: [1; 32],
+            height: 12,
+            manifest: vec![1],
+            total_len: 10,
+            chunk_size: 4,
+            chunk_count: 3,
+            payload_hash: [2; 32],
+        };
+        assert!(good.validate().is_ok());
+
+        let mut bad = good.clone();
+        bad.chunk_count = 2;
+        assert!(bad.validate().is_err());
+        bad = good.clone();
+        bad.total_len = MAX_SNAPSHOT_TOTAL_LEN + 1;
+        assert!(bad.validate().is_err());
+        bad = good.clone();
+        bad.chunk_size = (MAX_SNAPSHOT_CHUNK_LEN as u32) + 1;
+        assert!(bad.validate().is_err());
+        bad = good;
+        bad.manifest.resize(MAX_SNAPSHOT_MANIFEST_LEN + 1, 0);
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn snapshot_chunk_decoder_rejects_bad_index_count_and_length() {
+        let mut bad_index = vec![tag::SNAPSHOT_CHUNK];
+        bad_index.extend_from_slice(&[1; 32]);
+        bad_index.extend_from_slice(&3u32.to_le_bytes());
+        bad_index.extend_from_slice(&3u32.to_le_bytes());
+        bad_index.extend_from_slice(&[2; 32]);
+        put_count_for_test(&mut bad_index, 1);
+        bad_index.push(9);
+        assert!(matches!(
+            Message::decode(&bad_index),
+            Err(Error::BadSnapshot("chunk index or count"))
+        ));
+
+        let mut empty = vec![tag::SNAPSHOT_CHUNK];
+        empty.extend_from_slice(&[1; 32]);
+        empty.extend_from_slice(&0u32.to_le_bytes());
+        empty.extend_from_slice(&1u32.to_le_bytes());
+        empty.extend_from_slice(&[2; 32]);
+        put_count_for_test(&mut empty, 0);
+        assert!(matches!(
+            Message::decode(&empty),
+            Err(Error::BadSnapshot("empty chunk"))
+        ));
+
+        let mut oversize = vec![tag::SNAPSHOT_CHUNK];
+        oversize.extend_from_slice(&[1; 32]);
+        oversize.extend_from_slice(&0u32.to_le_bytes());
+        oversize.extend_from_slice(&1u32.to_le_bytes());
+        oversize.extend_from_slice(&[2; 32]);
+        put_count_for_test(&mut oversize, MAX_SNAPSHOT_CHUNK_LEN + 1);
+        assert!(matches!(
+            Message::decode(&oversize),
+            Err(Error::ListTooLong("snapshot chunk"))
+        ));
+    }
+
+    #[test]
+    fn snapshot_manifest_decoder_bounds_manifest_before_copying() {
+        let mut bytes = vec![tag::SNAPSHOT_MANIFEST];
+        bytes.extend_from_slice(&[1; 32]);
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        put_count_for_test(&mut bytes, MAX_SNAPSHOT_MANIFEST_LEN + 1);
+        assert!(matches!(
+            Message::decode(&bytes),
+            Err(Error::ListTooLong("snapshot manifest"))
+        ));
+    }
+
+    fn put_count_for_test(bytes: &mut Vec<u8>, count: usize) {
+        bytes.extend_from_slice(&u32::try_from(count).unwrap().to_le_bytes());
     }
 }

@@ -17,9 +17,9 @@ use crate::encoding::{base_from_bytes, point_from_bytes};
 use crate::hash::WIDE_OUTPUT_LEN;
 
 /// Hash-to-curve domain prefix shared by every generator in the system.
-const GENERATOR_DOMAIN: &str = "rhombus:Generator";
+const GENERATOR_DOMAIN: &str = "kryptos:Generator";
 /// Hash-to-curve domain for diversified bases `g_d`.
-const DIVERSIFIED_BASE_DOMAIN: &str = "rhombus:DiversifiedBase";
+const DIVERSIFIED_BASE_DOMAIN: &str = "kryptos:DiversifiedBase";
 
 /// Names of the fixed generators. Each maps to an independent point.
 ///

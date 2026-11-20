@@ -1,5 +1,5 @@
 services:
-  rhombus:
+  kryptos:
     build: .
     command: ["run", "--datadir", "/data", "--network", "test"]
     volumes:

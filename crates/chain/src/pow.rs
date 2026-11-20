@@ -212,7 +212,7 @@ mod tests {
 
     #[test]
     fn caches_only_successful_exact_header_checks_across_pow_forks() {
-        let pow = RandomXPow::new(b"Rhombus PoW cache test key").unwrap();
+        let pow = RandomXPow::new(b"Kryptos PoW cache test key").unwrap();
         let fork = pow.fork().unwrap();
         let mut header = easy_header();
         let mut found = false;
@@ -288,7 +288,7 @@ mod tests {
     fn native_bindings_match_the_published_randomx_vectors() {
         // RandomX upstream vectors test_a/test_b in the vendored
         // randomx/src/tests/tests.cpp. These exercise the generated FFI and
-        // native library together, independently of Rhombus header encoding.
+        // native library together, independently of Kryptos header encoding.
         let pow = RandomXPow::new(b"test key 000").unwrap();
         for (input, expected) in [
             (

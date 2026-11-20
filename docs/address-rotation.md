@@ -32,7 +32,7 @@ explicitly requests a fresh address with `getnewaddress`.
 
 Disabling rotation reduces address-index consumption and scan growth. Anyone
 you give the reused address to can recognize that same address in their own
-payment requests; Rhombus's shielded block data does not publish which wallet
+payment requests; Kryptos's shielded block data does not publish which wallet
 address received an output.
 
 Receipt detection is tied to the current address being used, not to an exact
@@ -81,9 +81,9 @@ published before the reorganization.
 | `getwalletinfo` | Adds `receive_address`, `receive_address_index`, `address_rotation_exhausted` and `auto_receive_rotation`; the existing `next_address_index` includes any allocation performed by this call. |
 | `setreceiveaddressrotation` | Takes a required boolean `enabled`, persists the per-wallet receipt-rotation preference, and returns `{ "auto_receive_rotation": <bool> }`. |
 | `getnewaddress` | Existing `{ "index", "address", "label" }` result; always requests a fresh allocation and makes it current. |
-| `rhombus address --network <network> --wallet <path>` | Prints the current receive address and persists a fresh selection if needed; returns an explicit error at exhaustion. |
-| `rhombus set-receive-rotation --network <network> --wallet <path> --enabled <bool>` | Sets the same persisted preference from the CLI. With a running wallet daemon, use the RPC method instead. |
-| `rhombus create` | Prints `address_index` and `address` when available. A restore that reserves the entire range still succeeds and reports `address_rotation_exhausted: true`. |
+| `Kryptos address --network <network> --wallet <path>` | Prints the current receive address and persists a fresh selection if needed; returns an explicit error at exhaustion. |
+| `Kryptos set-receive-rotation --network <network> --wallet <path> --enabled <bool>` | Sets the same persisted preference from the CLI. With a running wallet daemon, use the RPC method instead. |
+| `Kryptos create` | Prints `address_index` and `address` when available. A restore that reserves the entire range still succeeds and reports `address_rotation_exhausted: true`. |
 
 `keygen` has no wallet database or allocation state and still prints the historical
 index-zero address. Low-level `WalletKeys::default_address()` also remains index
@@ -125,7 +125,9 @@ can omit change keys or reuse an index. A stopped wallet-database backup preserv
 the allocation/current-address metadata directly. Use a new account or wallet
 for future allocation when the current account reaches its bound.
 
-Scanning tries the legacy key plus each allocated separate ML-KEM key. Automatic
+Legacy shared-key address recovery and scanning are no longer supported. Wallets
+with legacy address metadata are rejected. Scanning tries each allocated
+per-diversifier ML-KEM key. Automatic
 rotation therefore increases scan cost as the allocated range grows. It does not
 provide unbounded address issuance or hide reuse of already shared addresses.
 See [operations](operations.md) for recovery bounds and backup commands.
@@ -172,10 +174,10 @@ enabled.
 Wallet/runtime library Clippy passed with their existing warnings; formatting
 and whitespace checks passed.
 
-Local result logs are `/tmp/rhombus-rotation-wallet-tests.log`,
-`/tmp/rhombus-rotation-runtime-tests.log`,
-`/tmp/rhombus-address-walletd-tests.log`,
-`/tmp/rhombus-address-walletd-integration.log`,
-`/tmp/rhombus-rotation-workspace-check.log` and
-`/tmp/rhombus-rotation-clippy.log`. Prior embedded-network test counts describe
+Local result logs are `/tmp/Kryptos-rotation-wallet-tests.log`,
+`/tmp/Kryptos-rotation-runtime-tests.log`,
+`/tmp/Kryptos-address-walletd-tests.log`,
+`/tmp/Kryptos-address-walletd-integration.log`,
+`/tmp/Kryptos-rotation-workspace-check.log` and
+`/tmp/Kryptos-rotation-clippy.log`. Prior embedded-network test counts describe
 a separate change and must not be added to these results.

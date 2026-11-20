@@ -2,7 +2,7 @@
 //! got, and which coins it has set aside for it. An operation survives a
 //! restart and is rebuilt if its transaction fails to be mined.
 
-use protocol::address::RhombusAddress;
+use protocol::address::KryptosAddress;
 use protocol::amount::RawCoin;
 use protocol::bytes::{Encodable, Reader, Writer};
 use protocol::transaction::TxId;
@@ -168,7 +168,7 @@ impl Encodable for Payment {
 
     fn read(r: &mut Reader<'_>) -> protocol::Result<Self> {
         Ok(Self {
-            recipient: RhombusAddress::read(r)?,
+            recipient: KryptosAddress::read(r)?,
             amount: RawCoin::from_raw(r.take_u64_le()?)?,
         })
     }

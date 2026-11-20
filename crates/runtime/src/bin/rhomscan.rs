@@ -1,4 +1,4 @@
-//! Scan a local Rhombus chain into a wallet.
+//! Scan a local Kryptos chain into a wallet.
 
 use std::path::PathBuf;
 
@@ -13,16 +13,16 @@ use wallet::wallet::Wallet;
 #[command(
     name = "rhomscan",
     version,
-    about = "Scan a local Rhombus chain into a wallet"
+    about = "Scan a local Kryptos chain into a wallet"
 )]
 struct Args {
     /// Chain network.
     #[arg(long, default_value = "main")]
     network: Network,
-    /// Chain database; defaults to rhombus-data/<network>/chain/chain.redb.
+    /// Chain database; defaults to kryptos-data/<network>/chain/chain.redb.
     #[arg(long)]
     chain: Option<PathBuf>,
-    /// Wallet database; defaults to rhombus-data/<network>/wallet.redb.
+    /// Wallet database; defaults to kryptos-data/<network>/wallet.redb.
     #[arg(long)]
     wallet: Option<PathBuf>,
     #[arg(long)]
@@ -43,7 +43,7 @@ fn run(args: Args) -> runtime::Result<()> {
     let network_dir = match (args.chain.as_ref(), args.wallet.as_ref()) {
         (None, None) => paths::default_network_dir(args.network)?,
         _ => std::env::current_dir()?
-            .join("rhombus-data")
+            .join("kryptos-data")
             .join(args.network.to_string()),
     };
     let chain_path = args

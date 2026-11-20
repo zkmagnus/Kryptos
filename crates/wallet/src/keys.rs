@@ -1,25 +1,24 @@
 //! A wallet's key material, derived from its spending key.
 
 use crypto::diversifier::DiversifierIndex;
-use crypto::encryption::{ReceiverKey, TransmissionKey};
+use crypto::encryption::ReceiverKey;
 use crypto::hash::{blake2b_short, PIN};
 use crypto::keys::{Diversifier, FullViewingKey, IncomingViewingKey, NullifierKey, SpendingKey};
-use protocol::address::RhombusAddress;
+use protocol::address::KryptosAddress;
 use protocol::coin::Coin;
 
 use crate::{Error, Result};
 
-/// Maximum number of per-address keys in one wallet scan context. The legacy
-/// key is additional. Oversized ranges are rejected, never truncated.
+/// Maximum number of per-address keys in one wallet scan context.
+/// Oversized ranges are rejected, never truncated.
 pub const MAX_SCAN_ADDRESSES: u64 = 4096;
 
 struct ScanCandidate {
     receiver_key: ReceiverKey,
-    diversifier: Option<Diversifier>,
+    diversifier: Diversifier,
 }
 
-/// Receiver keys for an explicit half-open range of new address indices,
-/// together with the legacy key that receives all old diversified addresses.
+/// Receiver keys for an explicit half-open range of address indices.
 /// Construct once and reuse across blocks; every action tries every key.
 pub struct ScanKeys {
     candidates: Vec<ScanCandidate>,
@@ -29,8 +28,7 @@ pub struct ScanKeys {
 }
 
 impl ScanKeys {
-    /// Derives the legacy key and every per-address key in `start..end`.
-    /// An empty range still scans all legacy addresses.
+    /// Derives every per-address key in `start..end`.
     ///
     /// # Errors
     /// Rejects reversed ranges or more than [`MAX_SCAN_ADDRESSES`] new keys,
@@ -42,17 +40,13 @@ impl ScanKeys {
             .ok_or(crypto::Error::InvalidDerivation(
                 "scan range must be ascending and contain at most 4096 addresses",
             ))?;
-        let mut candidates = Vec::with_capacity(count as usize + 1);
-        candidates.push(ScanCandidate {
-            receiver_key: keys.fvk.receiver_key().0,
-            diversifier: None,
-        });
+        let mut candidates = Vec::with_capacity(count as usize);
         let dk = keys.fvk.diversifier_key();
         for index in start..end {
             let diversifier = dk.diversifier(DiversifierIndex::from(index))?;
             candidates.push(ScanCandidate {
                 receiver_key: keys.fvk.receiver_key_for_diversifier(&diversifier).0,
-                diversifier: Some(diversifier),
+                diversifier,
             });
         }
         Ok(Self {
@@ -73,7 +67,7 @@ impl ScanKeys {
         self.end
     }
 
-    /// Number of attempted keys per output, including the legacy key.
+    /// Number of attempted keys per output, within the configured range.
     pub fn candidate_count(&self) -> usize {
         self.candidates.len()
     }
@@ -96,12 +90,8 @@ impl ScanKeys {
         for candidate in &self.candidates {
             let decrypted = decrypt(&candidate.receiver_key);
             if let Ok(coin) = decrypted {
-                if candidate
-                    .diversifier
-                    .as_ref()
-                    .is_none_or(|expected| expected == coin.diversifier())
-                {
-                    found = Some((coin, candidate.diversifier.is_none()));
+                if &candidate.diversifier == coin.diversifier() {
+                    found = Some((coin, false));
                 }
             }
         }
@@ -120,9 +110,6 @@ pub struct WalletKeys {
     spending: SpendingKey,
     fvk: FullViewingKey,
     ivk: IncomingViewingKey,
-    receiver_key: ReceiverKey,
-    transmission_key: TransmissionKey,
-    legacy_default: bool,
 }
 
 impl WalletKeys {
@@ -133,14 +120,10 @@ impl WalletKeys {
     pub fn from_spending_key(sk: SpendingKey) -> Result<Self> {
         let fvk = FullViewingKey::derive(&sk)?;
         let ivk = fvk.incoming_viewing_key()?;
-        let (receiver_key, transmission_key) = fvk.receiver_key();
         Ok(Self {
             spending: sk,
             fvk,
             ivk,
-            receiver_key,
-            transmission_key,
-            legacy_default: false,
         })
     }
 
@@ -164,36 +147,12 @@ impl WalletKeys {
         &self.ivk
     }
 
-    /// Legacy ML-KEM decapsulation key for old addresses. Use [`ScanKeys`]
-    /// to include new per-address receiver keys.
-    pub fn receiver_key(&self) -> &ReceiverKey {
-        &self.receiver_key
-    }
-
-    /// Legacy public ML-KEM key shared by this wallet's old addresses.
-    pub fn transmission_key(&self) -> &TransmissionKey {
-        &self.transmission_key
-    }
-
     /// The address at a diversifier index.
     ///
     /// # Errors
     /// Fails if the index yields an invalid diversifier.
-    pub fn address(&self, index: DiversifierIndex) -> Result<RhombusAddress> {
-        Ok(RhombusAddress::from_index(&self.fvk, index)?)
-    }
-
-    /// Reconstructs an old address with the shared ML-KEM key. New issuance
-    /// should use [`Self::address`]; this method preserves existing addresses.
-    ///
-    /// # Errors
-    /// Fails if the index yields an invalid diversifier.
-    pub fn legacy_address(&self, index: DiversifierIndex) -> Result<RhombusAddress> {
-        Ok(RhombusAddress::from_index_with_kem(
-            &self.fvk,
-            index,
-            &self.transmission_key,
-        )?)
+    pub fn address(&self, index: DiversifierIndex) -> Result<KryptosAddress> {
+        Ok(KryptosAddress::from_index(&self.fvk, index)?)
     }
 
     /// Reconstructs the actual address that received a coin, using the scheme
@@ -201,12 +160,11 @@ impl WalletKeys {
     ///
     /// # Errors
     /// Rejects a coin whose recipient transmission key does not match ours.
-    pub fn address_for_coin(&self, coin: &Coin, legacy: bool) -> Result<RhombusAddress> {
-        let address = if legacy {
-            RhombusAddress::legacy_derive(&self.fvk, *coin.diversifier())?
-        } else {
-            RhombusAddress::derive(&self.fvk, *coin.diversifier())?
-        };
+    pub fn address_for_coin(&self, coin: &Coin, legacy: bool) -> Result<KryptosAddress> {
+        if legacy {
+            return Err(Error::Corrupt("unsupported legacy address scheme"));
+        }
+        let address = KryptosAddress::derive(&self.fvk, *coin.diversifier())?;
         if address.pk_d() != coin.pk_d() {
             return Err(Error::WrongWallet);
         }
@@ -217,32 +175,18 @@ impl WalletKeys {
     ///
     /// # Errors
     /// See [`Self::address`].
-    pub fn default_address(&self) -> Result<RhombusAddress> {
-        if self.legacy_default {
-            self.legacy_address(DiversifierIndex::ZERO)
-        } else {
-            self.address(DiversifierIndex::ZERO)
-        }
-    }
-
-    /// Retains the previously issued default/change address after migration.
-    pub(crate) fn set_legacy_default(&mut self) {
-        self.legacy_default = true;
+    pub fn default_address(&self) -> Result<KryptosAddress> {
+        self.address(DiversifierIndex::ZERO)
     }
 
     /// The diversifier index `address` was derived from, if it is one
     /// of ours.
-    pub fn index_of(&self, address: &RhombusAddress) -> Option<DiversifierIndex> {
+    pub fn index_of(&self, address: &KryptosAddress) -> Option<DiversifierIndex> {
         self.fvk
             .diversifier_key()
             .index(address.diversifier())
             .ok()
-            .filter(|index| {
-                self.address(*index).is_ok_and(|ours| &ours == address)
-                    || self
-                        .legacy_address(*index)
-                        .is_ok_and(|ours| &ours == address)
-            })
+            .filter(|index| self.address(*index).is_ok_and(|ours| &ours == address))
     }
 }
 
@@ -289,32 +233,7 @@ mod tests {
                 .unwrap();
         let index = DiversifierIndex::from(42);
         assert_eq!(keys.index_of(&keys.address(index).unwrap()), Some(index));
-        assert_eq!(
-            keys.index_of(&keys.legacy_address(index).unwrap()),
-            Some(index)
-        );
         assert_eq!(keys.index_of(&other.default_address().unwrap()), None);
-        let ours = keys.address(index).unwrap();
-        let swapped_key = RhombusAddress::from_parts(
-            *ours.diversifier(),
-            *ours.pk_d(),
-            other.default_address().unwrap().kem_key().clone(),
-        );
-        assert_eq!(keys.index_of(&swapped_key), None);
-    }
-
-    #[test]
-    fn migration_preserves_default_but_new_addresses_use_separate_keys() {
-        let mut keys = WalletKeys::from_spending_key(SpendingKey::from_bytes([83; 32])).unwrap();
-        let legacy = keys.legacy_address(DiversifierIndex::ZERO).unwrap();
-        assert_ne!(keys.default_address().unwrap(), legacy);
-        keys.set_legacy_default();
-        assert_eq!(keys.default_address().unwrap(), legacy);
-        assert_ne!(keys.address(DiversifierIndex::ZERO).unwrap(), legacy);
-        assert_ne!(
-            keys.address(DiversifierIndex::from(1)).unwrap().kem_key(),
-            legacy.kem_key()
-        );
     }
 
     #[test]
@@ -324,12 +243,12 @@ mod tests {
         assert!(ScanKeys::new(&keys, 2, 1).is_err());
         assert!(ScanKeys::new(&keys, 0, MAX_SCAN_ADDRESSES + 1).is_err());
         assert!(ScanKeys::new(&keys, 0, u64::MAX).is_err());
-        let legacy_only = ScanKeys::new(&keys, u64::MAX, u64::MAX).unwrap();
-        assert_eq!(legacy_only.candidate_count(), 1);
+        let empty = ScanKeys::new(&keys, u64::MAX, u64::MAX).unwrap();
+        assert_eq!(empty.candidate_count(), 0);
         let scan = ScanKeys::new(&keys, 42, 44).unwrap();
         assert_eq!(
             (scan.start(), scan.end(), scan.candidate_count()),
-            (42, 44, 3)
+            (42, 44, 2)
         );
         assert!(scan.check_wallet(&keys).is_ok());
         assert!(matches!(scan.check_wallet(&other), Err(Error::WrongWallet)));

@@ -286,7 +286,7 @@ impl Encodable for Coin {
 
 #[cfg(test)]
 mod tests {
-    use crate::address::RhombusAddress as Address;
+    use crate::address::KryptosAddress as Address;
     use crate::amount::RawCoin;
     use crypto::keys::{Diversifier, FullViewingKey, SpendingKey};
     use rand::SeedableRng;

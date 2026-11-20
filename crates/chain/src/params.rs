@@ -1,10 +1,11 @@
 //! Chain parameters: everything a network fixes at launch.
 
-use protocol::address::AddressPrefix;
+use protocol::address::Network;
 use protocol::block::BlockHash;
 use protocol::consensus::BranchId;
+use protocol::transaction::Anchor;
 
-use crate::target::Target;
+use crate::target::{ChainWork, Target};
 
 /// A block every node must agree on: no chain that disagrees with it is
 /// accepted, and no reorganization may revert it.
@@ -14,7 +15,33 @@ pub struct Checkpoint {
     pub height: u32,
     /// Hash of the block at that height.
     pub hash: BlockHash,
+    /// Cumulative validated work at the checkpoint.
+    pub work: crate::target::ChainWork,
+    /// Canonical state root committed by the checkpoint header.
+    pub state_root: Anchor,
 }
+
+impl Checkpoint {
+    /// Whether a header and validated work match this network trust anchor.
+    pub fn matches(&self, header: &protocol::block::BlockHeader, work: ChainWork) -> bool {
+        self.height == header.height
+            && self.hash == header.hash()
+            && self.work == work
+            && self.state_root == header.state_root
+    }
+}
+
+// Generated from deterministic testnet genesis by the checkpoint generator.
+const TESTNET_CHECKPOINTS: [Checkpoint; 1] = [Checkpoint {
+    height: 0,
+    hash: BlockHash::from_bytes([
+        0xc7, 0x97, 0xb0, 0x03, 0x16, 0x7b, 0x16, 0xca, 0xba, 0x24, 0x2e, 0x3d, 0x1c, 0x33, 0x20,
+        0x9b, 0x01, 0x03, 0xdb, 0xef, 0xe2, 0xbf, 0xa7, 0xcc, 0x7b, 0x82, 0x03, 0x3c, 0x8f, 0x21,
+        0x4a, 0x06,
+    ]),
+    work: crate::target::ChainWork::ZERO,
+    state_root: Anchor::from_base(crypto::pallas::Base::zero()),
+}];
 
 /// A scheduled change of consensus rules: from `height` on, blocks are
 /// validated under `branch`. Rule changes in code are gated on
@@ -63,7 +90,7 @@ pub struct ChainParams {
     /// Known-good blocks, ascending by height.
     pub checkpoints: &'static [Checkpoint],
     /// How addresses for this network are written.
-    pub address_prefix: AddressPrefix,
+    pub address_network: Network,
     /// The consensus branch from genesis until the first upgrade. Differs
     /// per network so a transaction for one is never valid on another.
     pub genesis_branch: BranchId,
@@ -136,7 +163,7 @@ impl ChainParams {
     #[allow(clippy::expect_used)]
     pub fn mainnet() -> Self {
         Self {
-            randomx_key: b"Rhombus Mainnet RandomX v1",
+            randomx_key: b"Kryptos Mainnet RandomX v1",
             pow_limit: Target::from_compact(0x207f_ffff).expect("valid compact target"),
             pow_limit_change: None,
             block_interval: 120,
@@ -149,7 +176,7 @@ impl ChainParams {
             max_future_seconds: 2 * 60 * 60,
             max_reorg_depth: 50,
             checkpoints: &[],
-            address_prefix: AddressPrefix::Main,
+            address_network: Network::Main,
             genesis_branch: BranchId::new(0x4d41_494e),
             upgrades: &MAIN_EMISSION_UPGRADES,
         }
@@ -162,7 +189,7 @@ impl ChainParams {
     #[allow(clippy::expect_used)]
     pub fn test() -> Self {
         Self {
-            randomx_key: b"Rhombus Testnet RandomX v1",
+            randomx_key: b"Kryptos Testnet RandomX v1",
             pow_limit: Target::from_compact(0x207f_ffff).expect("valid compact target"),
             pow_limit_change: None,
             // Long enough that the difficulty rule demands several nonces
@@ -175,8 +202,8 @@ impl ChainParams {
             anchor_max_age: 100,
             max_future_seconds: 2 * 60 * 60,
             max_reorg_depth: 50,
-            checkpoints: &[],
-            address_prefix: AddressPrefix::Test,
+            checkpoints: &TESTNET_CHECKPOINTS,
+            address_network: Network::Test,
             genesis_branch: BranchId::new(0x5445_5354),
             upgrades: &TEST_EMISSION_UPGRADES,
         }
@@ -274,8 +301,8 @@ mod tests {
     #[test]
     fn networks_write_addresses_differently() {
         assert_ne!(
-            ChainParams::mainnet().address_prefix,
-            ChainParams::test().address_prefix
+            ChainParams::mainnet().address_network,
+            ChainParams::test().address_network
         );
     }
 
@@ -314,14 +341,18 @@ mod tests {
             Checkpoint {
                 height: 5,
                 hash: BlockHash::ZERO,
+                work: crate::target::ChainWork::ZERO,
+                state_root: Anchor::from_base(crypto::pallas::Base::zero()),
             },
             Checkpoint {
                 height: 9,
                 hash: BlockHash::ZERO,
+                work: crate::target::ChainWork::ZERO,
+                state_root: Anchor::from_base(crypto::pallas::Base::zero()),
             },
         ];
         let params = ChainParams::test();
-        assert_eq!(params.checkpoint_at(0), None);
+        assert_eq!(params.checkpoint_at(0).map(|c| c.height), Some(0));
         assert_eq!(params.last_checkpoint_height(), 0);
         let with = ChainParams {
             checkpoints: &POINTS,
@@ -329,6 +360,15 @@ mod tests {
         };
         assert_eq!(with.checkpoint_at(9).map(|c| c.height), Some(9));
         assert_eq!(with.last_checkpoint_height(), 9);
+    }
+
+    #[test]
+    fn mainnet_checkpoint_list_is_empty_and_testnet_genesis_checkpoint_is_exact() {
+        assert!(ChainParams::mainnet().checkpoints.is_empty());
+        let params = ChainParams::test();
+        let checkpoint = params.checkpoint_at(0).unwrap();
+        let genesis = crate::genesis::genesis(&params);
+        assert!(checkpoint.matches(genesis.header(), ChainWork::ZERO));
     }
 
     #[test]

@@ -87,7 +87,7 @@ impl Wallet {
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         let temporary = tempfile::Builder::new()
-            .prefix(".rhombus-wallet-restore-")
+            .prefix(".kryptos-wallet-restore-")
             .tempfile_in(parent)?;
         {
             let db = Database::builder().create_file(temporary.reopen()?)?;
@@ -278,9 +278,7 @@ impl Wallet {
             let address = self
                 .keys
                 .address_for_coin(&coin.coin, coin.legacy_address)?;
-            // The legacy receiver key scans every diversifier, including the
-            // portion of its 88-bit index space beyond the local u64 allocator.
-            if !coin.legacy_address && !self.scans_address(&address)? {
+            if !self.scans_address(&address)? {
                 return Err(Error::Corrupt("wallet backup coin outside address range"));
             }
             if coin.spent_at.is_none() {
@@ -359,11 +357,10 @@ impl Wallet {
 #[cfg(test)]
 mod tests {
     use crate::keys::WalletKeys;
-    use crate::wallet::AddressScanRange;
     use crypto::commitment::ValueCommitment;
     use crypto::keys::SpendingKey;
     use crypto::pallas;
-    use protocol::address::RhombusAddress;
+    use protocol::address::KryptosAddress;
     use protocol::amount::RawCoin;
     use protocol::coin::{Coin, RandomSeed, Rho};
     use protocol::compact::CompactAction;
@@ -376,7 +373,7 @@ mod tests {
     use super::*;
 
     fn action(
-        address: &RhombusAddress,
+        address: &KryptosAddress,
         value: u64,
         nullifier: Nullifier,
         rng: &mut ChaCha20Rng,
@@ -542,7 +539,7 @@ mod tests {
             .unwrap()
             .file_name()
             .to_string_lossy()
-            .starts_with(".rhombus-wallet-restore-")));
+            .starts_with(".kryptos-wallet-restore-")));
     }
 
     #[test]
@@ -591,80 +588,6 @@ mod tests {
         restored.rollback_to(0).unwrap();
         assert_eq!(restored.balance().unwrap(), 42);
         for coin in restored.unspent().unwrap() {
-            let (path, anchor) = restored.witness(coin.position).unwrap();
-            assert_eq!(
-                Anchor::from_base(path.root(coin.coin.cmx().unwrap().inner())),
-                anchor
-            );
-        }
-    }
-
-    #[test]
-    fn backup_restores_legacy_coins_beyond_the_local_address_index_space() {
-        use crypto::diversifier::DiversifierIndex;
-
-        let directory = tempfile::tempdir().unwrap();
-        let mut rng = ChaCha20Rng::seed_from_u64(8803);
-        let source = Wallet::create(
-            directory.path().join("source.redb"),
-            &SpendingKey::random(&mut rng),
-            BlockHash::ZERO,
-            &mut rng,
-        )
-        .unwrap();
-        let mut index = [0; crypto::keys::DIVERSIFIER_LEN];
-        index[8] = 1; // 2^64: valid in the 88-bit legacy diversifier space.
-        let recipient = source
-            .keys()
-            .legacy_address(DiversifierIndex::from_bytes(index))
-            .unwrap();
-        source
-            .scan_compact(&CompactBlock {
-                height: 0,
-                hash: BlockHash::ZERO,
-                actions: [19, 23]
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, value)| {
-                        action(
-                            &recipient,
-                            value,
-                            Nullifier::from_base(&pallas::Base::from(index as u64 + 1)),
-                            &mut rng,
-                        )
-                    })
-                    .collect(),
-            })
-            .unwrap();
-        let coins = source.coins().unwrap();
-        assert!(coins.iter().all(|coin| coin.legacy_address));
-        let foreign = WalletKeys::from_spending_key(SpendingKey::random(&mut rng)).unwrap();
-        source
-            .scan_compact(&CompactBlock {
-                height: 1,
-                hash: BlockHash::from_bytes([4; 32]),
-                actions: vec![action(
-                    &foreign.default_address().unwrap(),
-                    7,
-                    coins[0].nullifier,
-                    &mut rng,
-                )],
-            })
-            .unwrap();
-        let bytes = source.backup_json().unwrap();
-        let destination = directory.path().join("restored.redb");
-        Wallet::restore_backup_json(&destination, &bytes, BlockHash::ZERO).unwrap();
-        let restored = Wallet::open(destination, BlockHash::ZERO).unwrap();
-        assert_eq!(restored.backup_json().unwrap(), bytes);
-        assert_eq!(restored.balance().unwrap(), 23);
-        restored.witness(coins[1].position).unwrap();
-        restored.rollback_to(0).unwrap();
-        assert_eq!(restored.balance().unwrap(), 42);
-        for coin in restored.unspent().unwrap() {
-            assert_eq!(
-                restored.keys().address_for_coin(&coin.coin, true).unwrap(),
-                recipient
-            );
             let (path, anchor) = restored.witness(coin.position).unwrap();
             assert_eq!(
                 Anchor::from_base(path.root(coin.coin.cmx().unwrap().inner())),
@@ -878,7 +801,7 @@ mod tests {
         changed["version"] = 2.into();
         invalid.push(changed);
         let mut changed = valid.clone();
-        changed["format"] = "rhombus-wallet-backup".into();
+        changed["format"] = "kryptos-wallet-backup".into();
         invalid.push(changed);
         let mut changed = valid.clone();
         changed["tables"]["meta"]
@@ -965,7 +888,7 @@ mod tests {
     }
 
     #[test]
-    fn backup_round_trip_accepts_empty_and_migrated_legacy_wallets() {
+    fn backup_round_trip_accepts_current_wallets_and_rejects_legacy_scheme() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("source.redb");
         let mut rng = ChaCha20Rng::seed_from_u64(8803);
@@ -1023,22 +946,6 @@ mod tests {
         }
         tx.commit().unwrap();
         drop(source);
-        let source = Wallet::open(&path, BlockHash::ZERO).unwrap();
-        let legacy = source.backup_json().unwrap();
-        let destination = directory.path().join("legacy.redb");
-        Wallet::restore_backup_json(&destination, &legacy, BlockHash::ZERO).unwrap();
-        let restored = Wallet::open(&destination, BlockHash::ZERO).unwrap();
-        assert_eq!(restored.backup_json().unwrap(), legacy);
-        assert_eq!(
-            restored.keys().default_address().unwrap(),
-            source.keys().default_address().unwrap()
-        );
-        assert_eq!(
-            restored.address_scan_range().unwrap(),
-            AddressScanRange {
-                start: 5001,
-                end: 5001
-            }
-        );
+        assert!(Wallet::open(&path, BlockHash::ZERO).is_err());
     }
 }

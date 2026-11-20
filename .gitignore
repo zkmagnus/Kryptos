@@ -6,4 +6,4 @@
 *.vk
 Cargo.lock.bak
 /local-test/
-/rhombus-data/
+/kryptos-data/

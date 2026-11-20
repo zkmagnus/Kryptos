@@ -28,9 +28,7 @@ use crate::encoding::{
     base_from_bytes, base_to_bytes, point_from_bytes, point_to_bytes, Encoded, ENCODED_LEN,
 };
 use crate::encryption::{ReceiverKey, TransmissionKey, KEM_SEED_LEN};
-use crate::hash::{
-    blake2b_short, prf_expand, wide_to_base, wide_to_scalar, DK, KEM_ADDRESS_SEED, KEM_SEED,
-};
+use crate::hash::{blake2b_short, prf_expand, wide_to_base, wide_to_scalar, DK, KEM_ADDRESS_SEED};
 use crate::poseidon::ivk as poseidon_ivk;
 use crate::secret::{SecretBase, SecretScalar};
 use crate::{Error, Result};
@@ -335,21 +333,6 @@ impl FullViewingKey {
         &self.rivk
     }
 
-    /// The legacy ML-KEM key pair derived from this full viewing key.
-    ///
-    /// The decapsulation key can detect incoming coins but cannot spend.
-    /// One encapsulation key is shared across all legacy diversified addresses.
-    /// New addresses use [`Self::receiver_key_for_diversifier`] instead.
-    pub fn receiver_key(&self) -> (ReceiverKey, TransmissionKey) {
-        let [rivk, ak, nk] = self.viewing_key_material();
-        let mut key = blake2b_short(KEM_SEED, &[&rivk, &ak, &nk]);
-        let mut seed = prf_expand(&key, &[KEM_TAG]);
-        let pair = ReceiverKey::from_seed(&seed);
-        key.zeroize();
-        seed.zeroize();
-        pair
-    }
-
     /// The ML-KEM key pair for one address diversifier.
     ///
     /// Different diversifiers use separate encapsulation keys, so the public
@@ -639,22 +622,6 @@ mod tests {
     }
 
     #[test]
-    fn receiver_key_is_deterministic_and_key_dependent() {
-        let a = FullViewingKey::derive(&sk(20)).unwrap().receiver_key().1;
-        let b = FullViewingKey::derive(&sk(20)).unwrap().receiver_key().1;
-        let c = FullViewingKey::derive(&sk(21)).unwrap().receiver_key().1;
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-    }
-
-    #[test]
-    fn receiver_key_survives_a_full_viewing_key_export() {
-        let fvk = FullViewingKey::derive(&sk(22)).unwrap();
-        let again = FullViewingKey::from_bytes(&fvk.to_bytes()).unwrap();
-        assert_eq!(fvk.receiver_key().1, again.receiver_key().1);
-    }
-
-    #[test]
     fn diversified_receiver_keys_are_distinct_and_survive_viewing_key_export() {
         let fvk = FullViewingKey::derive(&sk(23)).unwrap();
         let again = FullViewingKey::from_bytes(&fvk.to_bytes()).unwrap();
@@ -665,7 +632,6 @@ mod tests {
         assert_eq!(a, again.receiver_key_for_diversifier(&d0).1);
         assert_ne!(a, fvk.receiver_key_for_diversifier(&d1).1);
         assert_ne!(a, other.receiver_key_for_diversifier(&d0).1);
-        assert_ne!(a, fvk.receiver_key().1);
     }
 
     #[test]
@@ -675,7 +641,6 @@ mod tests {
         let d1 = Diversifier::from_bytes([1; DIVERSIFIER_LEN]);
         let (receiver, public) = fvk.receiver_key_for_diversifier(&d0);
         let (other, _) = fvk.receiver_key_for_diversifier(&d1);
-        let (legacy, _) = fvk.receiver_key();
         let (ciphertext, shared) = public
             .encapsulate(&mut ChaCha20Rng::seed_from_u64(25))
             .unwrap();
@@ -685,10 +650,6 @@ mod tests {
         );
         assert_ne!(
             other.decapsulate(&ciphertext).unwrap().as_bytes(),
-            shared.as_bytes()
-        );
-        assert_ne!(
-            legacy.decapsulate(&ciphertext).unwrap().as_bytes(),
             shared.as_bytes()
         );
     }

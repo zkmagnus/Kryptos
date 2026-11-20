@@ -1,4 +1,4 @@
-//! The `rhombus` binary.
+//! The `kryptos` binary.
 
 use clap::Parser;
 

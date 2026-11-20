@@ -1,6 +1,6 @@
 # Validated work and fork choice
 
-Rhombus represents cumulative proof of work as `chain::target::ChainWork(U256)`.
+Kryptos represents cumulative proof of work as `chain::target::ChainWork(U256)`.
 All consensus arithmetic uses integers. For a validated nonzero target `t`, a
 block contributes `floor(2^256 / (t + 1))`, evaluated as
 `(!t / (t + 1)) + 1`. The maximum target contributes exactly one; it is handled

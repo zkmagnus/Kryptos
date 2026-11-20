@@ -41,7 +41,7 @@ pub struct Anchor(pallas::Base);
 
 impl Anchor {
     /// Wraps a tree root.
-    pub fn from_base(root: pallas::Base) -> Self {
+    pub const fn from_base(root: pallas::Base) -> Self {
         Self(root)
     }
 

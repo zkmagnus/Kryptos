@@ -1,9 +1,9 @@
-//! Working-directory storage locations shared by `rhombus`,
-//! `rhombus-wallet-rpc`, and the desktop app, so all three find the same chain
+//! Working-directory storage locations shared by `kryptos`,
+//! `wallet`, and the desktop app, so all three find the same chain
 //! and wallet without being told where to look.
 //!
 //! ```text
-//! <working directory>/rhombus-data/ see [`user_data_dir`]
+//! <working directory>/kryptos-data/ see [`user_data_dir`]
 //!   <network>/                 see [`network_dir`]
 //!     chain/chain.redb         the node's datadir, see [`chain_dir`]
 //!     chain/rpc.token          the node's control token
@@ -12,7 +12,7 @@
 //!     wallet-rpc.token         wallet RPC token
 //! ```
 //!
-//! Each database is locked while open, so a `rhombus` and a desktop app
+//! Each database is locked while open, so a `kryptos` and a desktop app
 //! using the same network directory cannot run at the same time.
 
 use std::fs::{self, File, OpenOptions};
@@ -85,13 +85,13 @@ pub const CHAIN_DIR: &str = "chain";
 /// Default wallet file name inside a network directory.
 pub const WALLET_FILE: &str = "wallet.redb";
 
-/// The default Rhombus data directory under the process's current working
-/// directory: `./rhombus-data`.
+/// The default Kryptos data directory under the process's current working
+/// directory: `./kryptos-data`.
 ///
 /// # Errors
 /// Returns an I/O error if the current working directory cannot be determined.
 pub fn user_data_dir() -> Result<PathBuf> {
-    Ok(std::env::current_dir()?.join("rhombus-data"))
+    Ok(std::env::current_dir()?.join("kryptos-data"))
 }
 
 /// The directory holding one network's chain and wallet.
@@ -164,7 +164,7 @@ mod tests {
     fn default_storage_uses_the_working_directory() {
         assert_eq!(
             user_data_dir().unwrap(),
-            std::env::current_dir().unwrap().join("rhombus-data")
+            std::env::current_dir().unwrap().join("kryptos-data")
         );
     }
 

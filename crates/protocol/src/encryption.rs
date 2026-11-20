@@ -259,7 +259,7 @@ fn fixed<const N: usize>(bytes: Vec<u8>) -> Result<[u8; N]> {
 
 #[cfg(test)]
 mod tests {
-    use crate::address::RhombusAddress as Address;
+    use crate::address::KryptosAddress as Address;
     use crate::amount::RawCoin;
     use crypto::encryption::ReceiverKey;
     use crypto::keys::{FullViewingKey, SpendingKey};
@@ -400,7 +400,7 @@ mod tests {
         let stranger = party(&mut s.rng);
         let (stranger_receiver, _) = FullViewingKey::derive(&SpendingKey::random(&mut s.rng))
             .unwrap()
-            .receiver_key();
+            .receiver_key_for_diversifier(s.coin.diversifier());
         let ivk_result = decrypt_coin_with_ivk(
             &stranger.ivk,
             &stranger_receiver,

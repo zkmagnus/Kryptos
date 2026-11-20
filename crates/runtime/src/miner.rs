@@ -5,12 +5,13 @@ use chain::params::ChainParams;
 use chain::pow::RandomXPow;
 use chain::target::Target;
 use p2p::transport::TorStatus;
-use protocol::address::RhombusAddress;
+use protocol::address::KryptosAddress;
 use protocol::amount::RawCoin;
 use protocol::block::{empty_header, tx_root, Block, BlockHash, BlockHeader, PowSolution};
 use protocol::builder::{Builder, OutputInfo};
 use protocol::consensus::{next_height, BLOCK_VERSION};
 use protocol::fee::block_mint;
+use protocol::header_tree::HeaderFrontier;
 use protocol::transaction::Transaction;
 use protocol::tree_order::tree_transactions;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,6 +20,7 @@ use std::time::{Duration, Instant};
 use transaction_proof::ProvingKey;
 
 use rand_core::{CryptoRng, RngCore};
+use storage::store::Store;
 use storage::tree::CommitmentTree;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -43,6 +45,11 @@ pub struct Template {
     pub recent: Vec<BlockHeader>,
     /// The tree after the parent.
     pub tree: CommitmentTree,
+    /// Authenticated nullifier-state reader for this parent. `None` is only
+    /// used by isolated genesis-only fixtures.
+    pub nullifier_store: Option<Store>,
+    /// Fixed network genesis hash used by the composite state commitment.
+    pub chain_id: [u8; 32],
     /// Transactions to include after the coinbase.
     pub transactions: Vec<Transaction>,
     /// Network parameters.
@@ -64,6 +71,7 @@ impl Template {
         self.parent == other.parent
             && self.recent == other.recent
             && self.tree == other.tree
+            && self.chain_id == other.chain_id
             && self.params == other.params
     }
 
@@ -79,7 +87,7 @@ impl Template {
     /// Fails on a building or proving error.
     pub fn assemble(
         &self,
-        miner: &RhombusAddress,
+        miner: &KryptosAddress,
         pk: &ProvingKey,
         rng: &mut (impl RngCore + CryptoRng),
     ) -> Result<(BlockHeader, Vec<Transaction>)> {
@@ -104,13 +112,53 @@ impl Template {
             }
         }
         let transactions = draft.transactions().to_vec();
+        let nullifiers = transactions
+            .iter()
+            .flat_map(Transaction::nullifiers)
+            .copied()
+            .collect::<Vec<_>>();
+        let (nullifier_root, nullifier_count) = if let Some(store) = &self.nullifier_store {
+            let transition = store.preview_nullifier_transition(self.parent.hash(), &nullifiers)?;
+            (transition.root(), transition.count())
+        } else {
+            let root = storage::nullifier::root_from_set(&self.chain_id, &nullifiers)?;
+            (root, u64::try_from(nullifiers.len()).unwrap_or(u64::MAX))
+        };
+        let state_root = chain::state::state_root(
+            &self.chain_id,
+            height,
+            tree.root(),
+            tree.size(),
+            nullifier_root,
+            nullifier_count,
+        );
+        let history = if let Some(store) = &self.nullifier_store {
+            store
+                .header_frontier(&self.parent.hash())?
+                .ok_or(chain::Error::InvalidBlock("parent header frontier missing"))?
+        } else if self.parent.height == 0 {
+            // Isolated genesis fixtures have no storage reader. Later heights
+            // must obtain their complete prefix from branch-specific storage.
+            let mut history = HeaderFrontier::empty();
+            history.append(&self.parent)?;
+            history
+        } else {
+            return Err(chain::Error::InvalidBlock("parent header frontier unavailable").into());
+        };
+        if history.count() != u64::from(height) || history.tip_hash() != Some(self.parent.hash()) {
+            return Err(chain::Error::InvalidBlock("parent header frontier mismatch").into());
+        }
         let header = BlockHeader {
             version: BLOCK_VERSION,
             prev_hash: self.parent.hash(),
             height,
             timestamp: self.timestamp(),
             commitment_root: tree.root(),
+            nullifier_root,
+            state_root,
             tx_root: tx_root(transactions.iter().map(Transaction::txid)),
+            body_root: protocol::body_tree::body_root(&transactions)?,
+            history_root: history.root(),
             target: self.next_target()?.to_compact(),
             nonce: [0; 32],
             solution: PowSolution::empty(),
@@ -156,7 +204,7 @@ impl Template {
     /// Fails on a building or proving error.
     pub fn mine(
         &self,
-        miner: &RhombusAddress,
+        miner: &KryptosAddress,
         pk: &ProvingKey,
         pow: &RandomXPow,
         rng: &mut (impl RngCore + CryptoRng),
@@ -212,12 +260,18 @@ pub struct Miner {
     stop: Arc<AtomicBool>,
     task: JoinHandle<Result<()>>,
     /// Where coinbase rewards go.
-    pub payout: RhombusAddress,
+    pub payout: KryptosAddress,
     /// Worker threads.
     pub threads: usize,
 }
 
 impl Miner {
+    /// Shared cooperative stop flag for supervisors that also wait for the
+    /// worker task to finish before releasing chain storage.
+    pub(crate) fn stop_signal(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.stop)
+    }
+
     /// Stops the workers and waits for them.
     ///
     /// # Errors
@@ -243,7 +297,7 @@ impl Miner {
 /// template and mines from a random nonce, so workers explore disjoint
 /// nonce ranges with overwhelming probability and their throughput adds up.
 pub fn start(
-    payout: RhombusAddress,
+    payout: KryptosAddress,
     params: ChainParams,
     threads: usize,
     events: mpsc::Sender<Event>,
@@ -255,7 +309,7 @@ pub fn start(
 /// Starts workers that cancel work when transport, peers or sync lose readiness.
 /// Offline nodes pass no Tor status.
 pub(crate) fn start_for_node(
-    payout: RhombusAddress,
+    payout: KryptosAddress,
     params: ChainParams,
     threads: usize,
     events: mpsc::Sender<Event>,
@@ -322,7 +376,7 @@ fn policy_allows_mining(allowed: Option<&watch::Receiver<bool>>) -> bool {
 
 /// What one worker needs.
 struct Worker {
-    payout: RhombusAddress,
+    payout: KryptosAddress,
     pow: RandomXPow,
     pk: Arc<ProvingKey>,
     stop: Arc<AtomicBool>,
@@ -427,7 +481,7 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
 
-    fn fixture() -> (Template, RhombusAddress) {
+    fn fixture() -> (Template, KryptosAddress) {
         let params = ChainParams::test();
         let (block, tree) = chain::genesis::genesis_with_tree(&params);
         let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(972);
@@ -440,6 +494,11 @@ mod tests {
                 parent: block.header().clone(),
                 recent: vec![block.header().clone()],
                 tree,
+                nullifier_store: None,
+                chain_id: chain::genesis::genesis(&params)
+                    .hash()
+                    .as_bytes()
+                    .to_owned(),
                 transactions: Vec::new(),
                 params,
                 now: crate::now(),
@@ -464,6 +523,8 @@ mod tests {
         };
         let original = work.transactions.clone();
         let original_root = work.header.tx_root;
+        let original_body_root = work.header.body_root;
+        let original_history_root = work.header.history_root;
         let mut refreshed = source.clone();
         refreshed.now += 5;
         let started = Instant::now();
@@ -477,6 +538,12 @@ mod tests {
             "coinbase proof/body remain identical"
         );
         assert_eq!(work.header.tx_root, original_root);
+        assert_eq!(work.header.body_root, original_body_root);
+        assert_eq!(work.header.history_root, original_history_root);
+        assert_eq!(
+            work.header.body_root,
+            protocol::body_tree::body_root(&original).unwrap()
+        );
         assert_eq!(work.header.timestamp, refreshed.timestamp());
 
         // Comparing full transactions also catches changed authorization/proof

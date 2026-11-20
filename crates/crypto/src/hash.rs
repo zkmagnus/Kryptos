@@ -60,8 +60,26 @@ pub const PIN: Domain = Domain(b"ArtifactPin_____");
 /// Block identifier over the header bytes.
 pub const BLOCK_HASH: Domain = Domain(b"BlockHash_______");
 
+/// Commitment to the consensus transition fields, excluding the PoW nonce and solution.
+pub const BLOCK_TRANSITION: Domain = Domain(b"BlockTransHash__");
+
 /// Commitment to the transactions of a block.
 pub const TX_ROOT: Domain = Domain(b"TxRoot__________");
+
+/// Merkle commitment to complete block-body bytes, including authorization.
+pub const BLOCK_BODY: Domain = Domain(b"BlockBodyTree___");
+
+/// Append-only Merkle commitment to height-indexed block headers.
+pub const HEADER_TREE: Domain = Domain(b"HeaderTree______");
+
+/// Hash of one checkpoint-bound snapshot payload chunk.
+pub const SNAPSHOT_CHUNK: Domain = Domain(b"SnapChunkHash___");
+
+/// Hash of the complete checkpoint-bound snapshot payload.
+pub const SNAPSHOT_PAYLOAD: Domain = Domain(b"SnapPayloadHash_");
+
+/// Identifier binding a snapshot manifest to its complete payload hash.
+pub const SNAPSHOT_ID: Domain = Domain(b"SnapshotIdHash__");
 
 /// Digest of the consensus rules a chain database was built under.
 pub const RULES: Domain = Domain(b"RulesDigest_____");

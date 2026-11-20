@@ -55,6 +55,18 @@ pub(crate) fn frontier_retention(params: &ChainParams) -> u32 {
     params.max_reorg_depth.saturating_add(params.anchor_max_age)
 }
 
+/// Header/frontier ranges that must remain available to export configured
+/// checkpoint snapshots after the canonical tip advances.
+pub(crate) fn pinned_checkpoint_ranges(params: &ChainParams) -> Vec<(u32, u32)> {
+    let history =
+        frontier_retention(params).max(u32::try_from(header_lookback(params)).unwrap_or(u32::MAX));
+    params
+        .checkpoints
+        .iter()
+        .map(|checkpoint| (checkpoint.height.saturating_sub(history), checkpoint.height))
+        .collect()
+}
+
 /// What the validator needs besides the block.
 pub struct Validator<'a> {
     /// Network parameters.
@@ -63,6 +75,8 @@ pub struct Validator<'a> {
     pub pow: &'a RandomXPow,
     /// The circuit verifying key.
     pub vk: &'a VerifyingKey,
+    /// Network identifier used to bind v2 state roots.
+    pub chain_id: &'a [u8; 32],
     /// Local wall-clock time in seconds, for the future-timestamp rule.
     pub now: u64,
 }
@@ -79,6 +93,27 @@ impl Validator<'_> {
         block: &Block,
         rng: &mut (impl RngCore + CryptoRng),
     ) -> Result<CommitmentTree> {
+        self.validate_and_apply_inner(store, block, rng, false)
+    }
+
+    /// Applies a block whose exact authorization bytes were checked by the
+    /// chain's private authorization token. State and header checks still run.
+    pub(crate) fn validate_authorized_and_apply(
+        &self,
+        store: &Store,
+        block: &Block,
+        rng: &mut (impl RngCore + CryptoRng),
+    ) -> Result<CommitmentTree> {
+        self.validate_and_apply_inner(store, block, rng, true)
+    }
+
+    fn validate_and_apply_inner(
+        &self,
+        store: &Store,
+        block: &Block,
+        rng: &mut (impl RngCore + CryptoRng),
+        authorization_checked: bool,
+    ) -> Result<CommitmentTree> {
         let tip = store.tip()?.ok_or(Error::InvalidBlock("no genesis"))?;
         let header = block.header();
         if header.prev_hash != tip.hash || header.height != next_height(tip.height)? {
@@ -88,16 +123,45 @@ impl Validator<'_> {
         let recent = recent_headers(store, tip.height, self.window())?;
         let target = self.check_header(header, &recent)?;
         let work = child_chainwork(store, header, target)?;
+        self.check_checkpoint_work(header, work)?;
+        store.check_header_history(header)?;
         block.check_tx_root()?;
+        block.check_body_root()?;
 
-        let tree = self.check_transactions(store, block, rng)?;
+        let tree = self.check_transactions(store, block, rng, authorization_checked)?;
         if tree.root() != header.commitment_root {
             return Err(Error::InvalidHeader("commitment root mismatch"));
         }
-        store.apply(block, &tree, &work.to_be_bytes())?;
-        if let Some(prune_below) = header.height.checked_sub(frontier_retention(self.params)) {
-            store.prune_frontiers_below(prune_below)?;
+        let nullifiers = block
+            .transactions()
+            .iter()
+            .flat_map(Transaction::nullifiers)
+            .copied()
+            .collect::<Vec<_>>();
+        let transition = store.preview_nullifier_transition(header.prev_hash, &nullifiers)?;
+        if transition.root() != header.nullifier_root {
+            return Err(Error::InvalidHeader("nullifier root mismatch"));
         }
+        let expected_state_root = crate::state::state_root(
+            self.chain_id,
+            header.height,
+            tree.root(),
+            tree.size(),
+            transition.root(),
+            transition.count(),
+        );
+        if expected_state_root != header.state_root {
+            return Err(Error::InvalidHeader("state root mismatch"));
+        }
+        store.apply_with_nullifier_transition(block, &tree, &work.to_be_bytes(), &transition)?;
+        let frontier_floor = header
+            .height
+            .saturating_sub(frontier_retention(self.params));
+        store.prune_branch_state(
+            self.params.max_reorg_depth,
+            frontier_floor,
+            &pinned_checkpoint_ranges(self.params),
+        )?;
         Ok(tree)
     }
 
@@ -115,6 +179,27 @@ impl Validator<'_> {
         block: &Block,
         rng: &mut (impl RngCore + CryptoRng),
     ) -> Result<()> {
+        self.check_side_chain_block_inner(store, block, rng, false)
+    }
+
+    /// Stores a side block after its exact authorization bytes were checked
+    /// off-thread. Parent, branch state, roots and all header rules still run.
+    pub(crate) fn check_authorized_side_chain_block(
+        &self,
+        store: &Store,
+        block: &Block,
+        rng: &mut (impl RngCore + CryptoRng),
+    ) -> Result<()> {
+        self.check_side_chain_block_inner(store, block, rng, true)
+    }
+
+    fn check_side_chain_block_inner(
+        &self,
+        store: &Store,
+        block: &Block,
+        rng: &mut (impl RngCore + CryptoRng),
+        authorization_checked: bool,
+    ) -> Result<()> {
         let header = block.header();
         let parent = store.header(&header.prev_hash)?.ok_or(Error::Orphan)?;
         if header.height != next_height(parent.height)? {
@@ -124,9 +209,55 @@ impl Validator<'_> {
         let recent = branch_headers(store, &parent, self.window())?;
         let target = self.check_header(header, &recent)?;
         let work = child_chainwork(store, header, target)?;
+        self.check_checkpoint_work(header, work)?;
+        store.check_header_history(header)?;
         block.check_tx_root()?;
-        self.check_authorization(block, rng)?;
-        store.put_block(block, &work.to_be_bytes())?;
+        block.check_body_root()?;
+        if authorization_checked {
+            // Recheck encoding/structure and branch-dependent statements; only
+            // the signature and proof batch verification has been completed.
+            self.queue_block(block)?;
+        } else {
+            self.check_authorization(block, rng)?;
+        }
+        let mut tree = store
+            .commitment_tree_at(&header.prev_hash)?
+            .ok_or(Error::InvalidBlock("parent commitment tree missing"))?;
+        for tx in tree_transactions(block)? {
+            for action in tx.actions() {
+                tree.append(action.body().cmx())?;
+            }
+        }
+        if tree.root() != header.commitment_root {
+            return Err(Error::InvalidHeader("commitment root mismatch"));
+        }
+        let nullifiers = block
+            .transactions()
+            .iter()
+            .flat_map(Transaction::nullifiers)
+            .copied()
+            .collect::<Vec<_>>();
+        let transition = store.preview_nullifier_transition(header.prev_hash, &nullifiers)?;
+        if transition.root() != header.nullifier_root {
+            return Err(Error::InvalidHeader("nullifier root mismatch"));
+        }
+        let expected_state_root = crate::state::state_root(
+            self.chain_id,
+            header.height,
+            tree.root(),
+            tree.size(),
+            transition.root(),
+            transition.count(),
+        );
+        if expected_state_root != header.state_root {
+            return Err(Error::InvalidHeader("state root mismatch"));
+        }
+        store.put_block_with_nullifier_transition(
+            block,
+            &tree,
+            &work.to_be_bytes(),
+            &transition,
+        )?;
         Ok(())
     }
 
@@ -139,7 +270,18 @@ impl Validator<'_> {
         if self
             .params
             .checkpoint_at(block.header().height)
-            .is_some_and(|c| c.hash != block.hash())
+            .is_some_and(|c| c.hash != block.hash() || c.state_root != block.header().state_root)
+        {
+            return Err(Error::InvalidHeader("conflicts with a checkpoint"));
+        }
+        Ok(())
+    }
+
+    fn check_checkpoint_work(&self, header: &BlockHeader, work: ChainWork) -> Result<()> {
+        if self
+            .params
+            .checkpoint_at(header.height)
+            .is_some_and(|checkpoint| checkpoint.work != work)
         {
             return Err(Error::InvalidHeader("conflicts with a checkpoint"));
         }
@@ -237,6 +379,7 @@ impl Validator<'_> {
         store: &Store,
         block: &Block,
         rng: &mut (impl RngCore + CryptoRng),
+        authorization_checked: bool,
     ) -> Result<CommitmentTree> {
         let batch = self.queue_block(block)?;
         let anchors: Vec<_> = block
@@ -259,7 +402,9 @@ impl Validator<'_> {
             }
             None => {}
         }
-        batch.verify(self.vk, rng)?;
+        if !authorization_checked {
+            batch.verify(self.vk, rng)?;
+        }
         let mut tree = store.tree()?;
         for tx in tree_transactions(block)? {
             for action in tx.actions() {

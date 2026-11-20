@@ -38,7 +38,7 @@ const SERVICE_STARTUP_TIMEOUT: Duration = Duration::from_mins(20);
 const INCOMING_CAPACITY: usize = 32;
 const MAX_RENDEZVOUS: usize = 32;
 const MAX_ACCEPTING: usize = 8;
-const SERVICE_NICKNAME: &str = "rhombus";
+const SERVICE_NICKNAME: &str = "kryptos";
 
 /// Fixed node settings for Tor and the application stream. No setting changes
 /// path length or permits non-anonymous onion services.

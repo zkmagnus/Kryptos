@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate a Rhombus relay experiment without presenting a Poisson model as orphan rate.
+"""Evaluate a Kryptos relay experiment without presenting a Poisson model as orphan rate.
 
 Input is the JSON report produced by tests/propagation.rs. The input reports elapsed
 monotonic time from source submission (before validation) to a follower's accepted tip.

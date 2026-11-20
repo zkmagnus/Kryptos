@@ -1,6 +1,6 @@
 # Mining readiness
 
-An online Rhombus node mines only after its embedded Tor client and onion
+An online Kryptos node mines only after its embedded Tor client and onion
 service are ready. Tor readiness is a transport condition; it does not prove
 that the node is on the current chain.
 

@@ -1,6 +1,6 @@
 # Embedded Tor networking
 
-Rhombus uses `arti-client = 0.48.0` and `tor-hsservice = 0.48.0` in the
+Kryptos uses `arti-client = 0.48.0` and `tor-hsservice = 0.48.0` in the
 application process. Peer and remote RPC destinations must be valid Tor v3 onion
 endpoints. There is no external Tor daemon, SOCKS proxy, process supervision,
 torrc generation, hostname-file lookup, direct transport, or local DNS fallback.
@@ -62,7 +62,7 @@ service's status API. Advertisement requires client readiness and Arti
 means Arti believes the service is reachable despite reduced introduction-point
 coverage or partial descriptor-upload failures. `Bootstrapping`, `Recovering`,
 `DegradedUnreachable`, `Broken` and `Shutdown` remain blocked. The advertised identity comes from `RunningOnionService::onion_address`
-with fixed nickname `rhombus`; no file is used as a readiness or identity source.
+with fixed nickname `kryptos`; no file is used as a readiness or identity source.
 Lost readiness cancels/suspends dialing. Bootstrap/service failure retries with
 backoff; it does not select another backend.
 
@@ -117,7 +117,7 @@ The build enables Arti server vanguards and explicitly selects **Full** mode.
 Merely enabling the feature does not automatically choose Full when a service
 starts. Server PoW exists behind `hs-pow-full`, but that feature is experimental,
 its runtime setting defaults off, and upstream documents LGPL dependencies.
-This build does **not** enable it. Rhombus therefore applies conservative admission
+This build does **not** enable it. Kryptos therefore applies conservative admission
 limits in addition to its existing peer and queue bounds.
 
 | Limit | Value |
@@ -227,8 +227,8 @@ whitespace checks passed. Final metadata verification still resolved all 589
 packages from this repository with offline Cargo configuration.
 
 The authoritative local logs are
-`/tmp/rhombus-embedded-workspace-tests-final.log` and
-`/tmp/rhombus-embedded-clippy-verified.log`. Earlier interrupted or failed runs do
+`/tmp/kryptos-embedded-workspace-tests-final.log` and
+`/tmp/kryptos-embedded-clippy-verified.log`. Earlier interrupted or failed runs do
 not supersede these results. These 545 passing tests describe the original mock/local
 migration run; the later public-Tor successes and their separate regression
 checks are described below. No Docker
@@ -261,8 +261,8 @@ Both tests remain `#[ignore]` in the default suite and were explicitly run on
 | `two_embedded_nodes_connect_using_addnode_over_real_tor` | One passed, zero failed; **410.81 seconds**. Two actual nodes used an onion `addnode` endpoint and completed the application handshake at height zero. |
 
 Authoritative success logs are
-`/tmp/rhombus-public-tor-transport-reachable.log` and
-`/tmp/rhombus-public-tor-nodes-reachable.log`. These verify public-Tor stream and
+`/tmp/kryptos-public-tor-transport-reachable.log` and
+`/tmp/kryptos-public-tor-nodes-reachable.log`. These verify public-Tor stream and
 peer-handshake operation. They do not measure mining, block synchronization,
 large-block throughput or production restart/state-flush durability. Both temporary
 fixtures emitted an Arti state-flush error during teardown; their successful
@@ -279,7 +279,7 @@ reports it as fully reachable.
 After these fixes, **63 P2P regression tests passed** (61 unit tests and two
 decoder tests), and **11 runtime network regressions passed**. The latter cover
 unavailable-Tor gating, destination rejection, connection cancellation and queue
-bounds (`/tmp/rhombus-onion-runtime-regressions.log`). Workspace Clippy, formatting,
+bounds (`/tmp/kryptos-onion-runtime-regressions.log`). Workspace Clippy, formatting,
 the network source guard, whitespace
 checks and offline production runtime/binary compilation also passed. Existing
 legacy Clippy warnings remain. No new complete workspace test run is claimed for
@@ -292,9 +292,9 @@ Seven saved descriptors passed Arti's outer syntax, signing-certificate signatur
 descriptor signature and expiration checks. That validation did not decrypt inner
 layers or test C Tor's acceptance policy, so it does not establish the cause of the
 rejections. Upstream issue 2760 describes a matching symptom; this is not proof of
-an identical root cause. Full output is in `/tmp/rhombus-hsdesc-validation.log`.
+an identical root cause. Full output is in `/tmp/kryptos-hsdesc-validation.log`.
 Independent single-service and production-wrapper probes also succeeded, but the
-repository tests above provide the direct evidence for Rhombus transport and node
+repository tests above provide the direct evidence for Kryptos transport and node
 handshake behavior.
 
 Actual seed identities remain operator-provided. Later RPC and block-relay

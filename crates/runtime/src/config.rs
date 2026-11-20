@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use chain::genesis::genesis;
 use chain::params::ChainParams;
-use protocol::address::{AddressPrefix, RhombusAddress};
+use protocol::address::{self, KryptosAddress};
 use protocol::block::BlockHash;
 
 use crate::rpc::Token;
@@ -49,8 +49,8 @@ impl Network {
     }
 
     /// How this network's addresses are written.
-    pub fn address_prefix(self) -> AddressPrefix {
-        self.params().address_prefix
+    pub fn address_network(self) -> address::Network {
+        self.params().address_network
     }
 
     /// The network whose genesis block has `hash`, so a command talking
@@ -61,7 +61,7 @@ impl Network {
             .find(|network| genesis(&network.params()).hash() == *hash)
     }
 
-    /// Built-in onion bootstrap peers. Rhombus has none configured;
+    /// Built-in onion bootstrap peers. Kryptos has none configured;
     /// pass `--seed`, `--addnode` or `--connect` to use a custom peer.
     pub fn seeds(self) -> &'static [&'static str] {
         &[]
@@ -114,7 +114,7 @@ pub struct Config {
     /// Embedded Tor onion-service configuration.
     pub tor: TorConfig,
     /// Mine to this address, or `None` to not mine.
-    pub mine_to: Option<RhombusAddress>,
+    pub mine_to: Option<KryptosAddress>,
     /// Miner worker threads when mining. At least one.
     pub mining_threads: usize,
     /// Allow the first node to mine without peers; still requires Tor and known sync.
@@ -185,7 +185,7 @@ impl Config {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT_TEST_DATADIR: AtomicU64 = AtomicU64::new(0);
         let datadir = std::env::temp_dir().join(format!(
-            "rhombus-node-test-{}-{}",
+            "kryptos-node-test-{}-{}",
             std::process::id(),
             NEXT_TEST_DATADIR.fetch_add(1, Ordering::Relaxed)
         ));

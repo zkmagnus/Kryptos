@@ -1,12 +1,4 @@
-# Rhombus
-
-# $BUS
-
-**RHOMBUS — Randomized Hidden-Output Monetary Blockchain Using Shielded-transfers.**
-
-***EXPERIMENTAL***
-
-Rhombus implements shielded coin transfers with Halo2 proofs and ML-KEM coin
+Kryptos implements shielded coin transfers with Halo2 proofs and ML-KEM coin
 payload encryption. ML-KEM does not make the proof system or spending
 authorization fully post-quantum. Network parameters are provisional and no
 public bootstrap peers are built in.

@@ -67,7 +67,11 @@ fn header_from(template: &Value) -> BlockHeader {
         height: u32::try_from(template["height"].as_u64().unwrap()).unwrap(),
         timestamp: template["timestamp"].as_u64().unwrap(),
         commitment_root: Anchor::from_slice(&hex("commitment_root")).unwrap(),
+        nullifier_root: Anchor::from_slice(&hex("nullifier_root")).unwrap(),
+        state_root: Anchor::from_slice(&hex("state_root")).unwrap(),
         tx_root: hex("tx_root").try_into().unwrap(),
+        body_root: hex("body_root").try_into().unwrap(),
+        history_root: hex("history_root").try_into().unwrap(),
         target: u32::from_str_radix(template["target"].as_str().unwrap(), 16).unwrap(),
         nonce: [0; 32],
         solution: PowSolution::empty(),
@@ -99,7 +103,7 @@ async fn a_pool_mines_through_templates_and_submissions() {
     let payout = keys
         .default_address()
         .unwrap()
-        .encode(Network::Test.address_prefix());
+        .encode(Network::Test.address_network());
     let token = Token::new("pool").unwrap();
     let node = spawn(Config {
         rpc_http: Some("127.0.0.1:0".parse().unwrap()),
@@ -115,7 +119,14 @@ async fn a_pool_mines_through_templates_and_submissions() {
     assert_eq!(info["height"], 0);
     assert_eq!(info["syncing"], false);
     assert_eq!(info["next_height"], 1);
-    assert_eq!(info["subsidy"], "5000000000", "50 rawcoin initial emission");
+    assert_eq!(info["subsidy"], "2500000000", "25 BUS initial emission");
+    let chain_info = call(addr, t, "getblockchaininfo", json!([])).await;
+    assert_eq!(chain_info["amount"], "100000000");
+    assert_eq!(chain_info["emission"]["decimals"], 8);
+    assert_eq!(chain_info["emission"]["initial"], "2500000000");
+    assert_eq!(chain_info["emission"]["tail"], "25000000");
+    assert_eq!(chain_info["emission"]["tail_height"], 525600);
+    assert_eq!(chain_info["emission"]["target_mined"], "1314000000000000");
     assert_eq!(info["pow"]["algorithm"], "RandomX");
     assert_eq!(info["next_target"].as_str().unwrap().len(), 8);
 
@@ -234,7 +245,7 @@ async fn a_mainnet_node_hands_out_work_without_a_peer() {
     let payout = keys
         .default_address()
         .unwrap()
-        .encode(Network::Main.address_prefix());
+        .encode(Network::Main.address_network());
     let token = Token::new("pool").unwrap();
     let node = spawn(Config {
         network: Network::Main,

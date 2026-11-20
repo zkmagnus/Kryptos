@@ -11,7 +11,7 @@ use p2p::transport::{
     split, ConnectionReader, ConnectionWriter, Stream, TorNetwork, TorSettings, TorStatus,
 };
 use protocol::action::{Action, ACTION_LEN};
-use protocol::block::{Block, BlockHeader, HEADER_LEN};
+use protocol::block::{Block, BlockHeader};
 use protocol::consensus::MAX_BLOCK_TRANSACTIONS;
 use protocol::transaction::Transaction;
 use tokio::sync::{mpsc, watch};
@@ -266,7 +266,11 @@ fn message_charge(message: &Message) -> Option<usize> {
             locator.capacity().checked_mul(32)?,
         ),
         Message::Headers(items) => (
-            4usize.checked_add(items.len().checked_mul(HEADER_LEN)?)?,
+            4usize.checked_add(
+                items
+                    .iter()
+                    .try_fold(0usize, |sum, header| sum.checked_add(header.encoded_len()))?,
+            )?,
             items.capacity().checked_mul(size_of::<BlockHeader>())?,
         ),
         Message::Inv(items) | Message::GetData(items) | Message::NotFound(items) => (
@@ -278,7 +282,7 @@ fn message_charge(message: &Message) -> Option<usize> {
         Message::Block(block) => {
             let (wire, heap) = transactions_usage(block.transactions())?;
             (
-                (HEADER_LEN + 4).checked_add(wire)?,
+                (block.header().encoded_len() + 4).checked_add(wire)?,
                 size_of::<Block>().checked_add(heap)?,
             )
         }
@@ -289,7 +293,7 @@ fn message_charge(message: &Message) -> Option<usize> {
         Message::CompactBlock(block) => {
             let (wire, heap) = transaction_usage(&block.coinbase)?;
             (
-                (HEADER_LEN + 4)
+                (block.header.encoded_len() + 4)
                     .checked_add(wire)?
                     .checked_add(block.txids.len().checked_mul(32)?)?,
                 size_of::<p2p::message::CompactBlock>()
@@ -311,6 +315,21 @@ fn message_charge(message: &Message) -> Option<usize> {
                 heap.checked_add(spare.checked_mul(size_of::<Transaction>())?)?,
             )
         }
+        Message::GetSnapshotManifest { .. } => (4, 0),
+        Message::SnapshotManifest(info) => (
+            32usize
+                .checked_add(4 + 4)?
+                .checked_add(info.manifest.len())?
+                .checked_add(8 + 4 + 4 + 32)?,
+            info.manifest.capacity(),
+        ),
+        Message::GetSnapshotChunk { .. } => (36, 0),
+        Message::SnapshotChunk { bytes, .. } => (
+            32usize
+                .checked_add(4 + 4 + 32 + 4)?
+                .checked_add(bytes.len())?,
+            bytes.capacity(),
+        ),
     };
     charge(
         payload.checked_add(1)?,

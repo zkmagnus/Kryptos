@@ -1,6 +1,6 @@
 //! Circuit interface used by native shielded transaction validation.
 //!
-//! This first adapter exposes Rhombus's existing Halo2 transfer relation
+//! This first adapter exposes Kryptos's existing Halo2 transfer relation
 //! through a circuit API boundary. The circuit implementation
 //! still lives in `circuit`; this crate creates the place to evolve the
 //! transfer statement independently without changing transaction callers.

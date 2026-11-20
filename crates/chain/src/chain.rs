@@ -5,14 +5,15 @@ use crypto::hash::{blake2b_short, RULES};
 use protocol::block::{Block, BlockHash};
 use protocol::bytes::Writer;
 use rand_core::{CryptoRng, RngCore};
-use storage::store::{Store, Tip};
+use std::sync::{Arc, Mutex, MutexGuard};
+use storage::store::{SnapshotInstall, SnapshotInstallMode, Store, Tip};
 use transaction_proof::VerifyingKey;
 
 use crate::genesis::genesis_with_tree;
 use crate::params::ChainParams;
 use crate::pow::RandomXPow;
 use crate::target::ChainWork;
-use crate::validate::{frontier_retention, Validator};
+use crate::validate::{frontier_retention, pinned_checkpoint_ranges, Validator};
 use crate::{Error, Result};
 
 /// What importing a block did.
@@ -34,12 +35,32 @@ pub enum Import {
     },
 }
 
+/// A completed authorization check for one exact block and consensus profile.
+///
+/// Only [`Chain::authorize_block`] can construct this token. It certifies the
+/// transaction signatures and action proofs, not header rules, chain state,
+/// PoW, ancestry or fork choice. Import consumes it and checks its binding
+/// before touching chain state.
+#[derive(Debug)]
+pub struct AuthorizedBlock {
+    block_hash: BlockHash,
+    body_root: [u8; 32],
+    chain_id: [u8; 32],
+    rules_digest: [u8; 32],
+}
+
 /// A chain over a store.
+#[derive(Clone)]
 pub struct Chain {
     store: Store,
+    /// Serializes complete imports, reorg recovery and snapshot installation
+    /// across every clone, beyond individual database transactions.
+    write_lock: Arc<Mutex<()>>,
     params: ChainParams,
     pow: RandomXPow,
-    vk: VerifyingKey,
+    vk: Arc<VerifyingKey>,
+    chain_id: [u8; 32],
+    rules_digest: [u8; 32],
 }
 
 impl Chain {
@@ -50,42 +71,94 @@ impl Chain {
     /// holding a different genesis.
     pub fn new(store: Store, params: ChainParams, vk: VerifyingKey) -> Result<Self> {
         let (expected, tree) = genesis_with_tree(&params);
-        match store.hash_at(0)? {
-            None => store.apply(&expected, &tree, &ChainWork::ZERO.to_be_bytes())?,
-            Some(hash) if hash == expected.hash() => {}
-            Some(_) => return Err(Error::InvalidBlock("store belongs to another network")),
-        }
-        // Genesis does not change at an upgrade, so blocks applied by a
-        // binary with another schedule or circuit would pass unnoticed;
-        // the digest refuses such a store instead of trusting it.
         let digest = rules_digest(&params, &vk);
-        match store.rules_digest()? {
-            // Only a store holding nothing but genesis may be stamped: any
-            // history without a digest was validated by a binary that did
-            // not record its rules, so it cannot be trusted.
-            None if store.tip()?.is_some_and(|t| t.height > 0) => return Err(Error::RulesMismatch),
-            None => store.set_rules_digest(&digest)?,
-            Some(recorded) if recorded == digest => {}
+        let snapshot_tip = store.snapshot_base()?;
+        let has_rules_digest = match store.rules_digest()? {
+            // A populated chain without its validating rules cannot be trusted.
+            None if store.tip()?.is_some_and(|tip| tip.height > 0) => {
+                return Err(Error::RulesMismatch);
+            }
+            None => false,
+            Some(recorded) if recorded == digest => true,
             Some(_) => return Err(Error::RulesMismatch),
+        };
+        store.set_chain_id(expected.hash().as_bytes())?;
+        if snapshot_tip.is_none() {
+            match store.hash_at(0)? {
+                None => store.apply(&expected, &tree, &ChainWork::ZERO.to_be_bytes())?,
+                Some(hash) if hash == expected.hash() => {}
+                Some(_) => return Err(Error::InvalidBlock("store belongs to another network")),
+            }
+        } else if store.chain_id()? != *expected.hash().as_bytes() {
+            return Err(Error::InvalidBlock("snapshot belongs to another network"));
+        }
+        let tip_height = store
+            .tip()?
+            .ok_or(Error::InvalidBlock("no genesis"))?
+            .height;
+        let checkpoint_floor = if let Some(base_hash) = snapshot_tip {
+            let base_header = store
+                .header(&base_hash)?
+                .ok_or(Error::InvalidBlock("snapshot base header missing"))?;
+            let base_work = store
+                .chainwork(&base_hash)?
+                .map(ChainWork::from_be_bytes)
+                .ok_or(Error::InvalidBlock("snapshot base work missing"))?;
+            if !params
+                .checkpoint_at(base_header.height)
+                .is_some_and(|checkpoint| checkpoint.matches(&base_header, base_work))
+            {
+                return Err(Error::InvalidBlock(
+                    "snapshot base conflicts with configured checkpoint",
+                ));
+            }
+            base_header.height
+        } else {
+            0
+        };
+        for checkpoint in params
+            .checkpoints
+            .iter()
+            .filter(|cp| cp.height >= checkpoint_floor && cp.height <= tip_height)
+        {
+            let header = store
+                .header(&checkpoint.hash)?
+                .ok_or(Error::InvalidBlock("configured checkpoint block missing"))?;
+            let work = store
+                .chainwork(&checkpoint.hash)?
+                .map(ChainWork::from_be_bytes)
+                .ok_or(Error::InvalidBlock("configured checkpoint work missing"))?;
+            if !checkpoint.matches(&header, work) {
+                return Err(Error::InvalidBlock("store conflicts with a checkpoint"));
+            }
+        }
+        if !has_rules_digest {
+            store.set_rules_digest(&digest)?;
         }
         let chain = Self {
             store,
+            write_lock: Arc::new(Mutex::new(())),
             params,
             pow: RandomXPow::new(params.randomx_key)?,
-            vk,
+            vk: Arc::new(vk),
+            chain_id: *expected.hash().as_bytes(),
+            rules_digest: digest,
         };
-        if chain.chainwork(&expected.hash())? != ChainWork::ZERO {
+        if snapshot_tip.is_none() && chain.chainwork(&expected.hash())? != ChainWork::ZERO {
             return Err(Error::InvalidBlock("genesis chain work must be zero"));
         }
-        chain.recover_reorg()?;
+        {
+            let _write = chain.lock_writes();
+            chain.recover_reorg()?;
+        }
         // Header-only hot paths do not inspect bodies. Retain the full tip
         // decoding check when opening a database so existing body corruption
         // is surfaced before the node starts serving its chain.
         let tip = chain.tip()?;
-        chain
-            .store
-            .block(&tip.hash)?
-            .ok_or(Error::InvalidBlock("tip block missing"))?;
+        if chain.store.block(&tip.hash)?.is_none() && chain.store.snapshot_base()? != Some(tip.hash)
+        {
+            return Err(Error::InvalidBlock("tip block missing"));
+        }
         chain.tip_chainwork()?;
         Ok(chain)
     }
@@ -100,6 +173,11 @@ impl Chain {
         &self.params
     }
 
+    /// The fixed genesis hash used as this network's state-root identifier.
+    pub fn chain_id(&self) -> &[u8; 32] {
+        &self.chain_id
+    }
+
     /// The proof of work.
     pub fn pow(&self) -> &RandomXPow {
         &self.pow
@@ -107,7 +185,7 @@ impl Chain {
 
     /// The circuit verifying key.
     pub fn verifying_key(&self) -> &VerifyingKey {
-        &self.vk
+        self.vk.as_ref()
     }
 
     /// The current tip.
@@ -138,6 +216,119 @@ impl Chain {
         self.chainwork(&self.tip()?.hash)
     }
 
+    /// Installs a snapshot bound to this chain's configured checkpoint and
+    /// validating rules, under the same lock used by complete block imports.
+    ///
+    /// Only an empty or exact genesis-only store can be replaced. Storage
+    /// rechecks the payload roots, header links and metadata atomically.
+    ///
+    /// # Errors
+    /// Rejects another network, rules profile or checkpoint, an ineligible
+    /// store, or invalid snapshot contents. Propagates recovery/storage errors.
+    pub fn install_snapshot(&self, snapshot: &SnapshotInstall) -> Result<()> {
+        let _write = self.lock_writes();
+        self.recover_reorg()?;
+        if snapshot.chain_id != self.chain_id || self.store.chain_id()? != self.chain_id {
+            return Err(Error::InvalidBlock("snapshot belongs to another network"));
+        }
+        if snapshot.rules_digest != self.rules_digest
+            || self.store.rules_digest()? != Some(self.rules_digest)
+        {
+            return Err(Error::RulesMismatch);
+        }
+        let checkpoint = self
+            .params
+            .checkpoint_at(snapshot.checkpoint.height)
+            .ok_or(Error::InvalidBlock("snapshot has no configured checkpoint"))?;
+        let tip = snapshot
+            .headers
+            .last()
+            .ok_or(Error::InvalidBlock("snapshot header suffix empty"))?;
+        let work = ChainWork::from_be_bytes(snapshot.checkpoint.work);
+        if snapshot.checkpoint.hash != checkpoint.hash
+            || snapshot.checkpoint.state_root != checkpoint.state_root
+            || !checkpoint.matches(&tip.header, work)
+        {
+            return Err(Error::InvalidBlock(
+                "snapshot base conflicts with configured checkpoint",
+            ));
+        }
+        self.store
+            .install_snapshot(snapshot, SnapshotInstallMode::EmptyOnly)?;
+        Ok(())
+    }
+
+    // A panic can leave a multi-transaction reorg journal unfinished. Retain
+    // exclusive access even after poison; callers recover that journal before
+    // inspecting or mutating chain state, without reacquiring this mutex.
+    fn lock_writes(&self) -> MutexGuard<'_, ()> {
+        match self.write_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Checks a downloaded block's complete authorization without reading or
+    /// mutating its parent state. Suitable for a bounded background worker.
+    ///
+    /// The transaction and body roots must match the header. Header validity,
+    /// anchors, nullifier freshness and state transitions are checked later by
+    /// [`Self::import_authorized`] on the serialized chain-import path.
+    ///
+    /// # Errors
+    /// Returns the first encoding, transaction, signature or proof failure.
+    pub fn authorize_block(
+        &self,
+        block: &Block,
+        now: u64,
+        rng: &mut (impl RngCore + CryptoRng),
+    ) -> Result<AuthorizedBlock> {
+        if block.header().version != protocol::consensus::BLOCK_VERSION {
+            return Err(Error::InvalidHeader("unknown version"));
+        }
+        block.check_tx_root()?;
+        block.check_body_root()?;
+        self.validator(now).check_authorization(block, rng)?;
+        Ok(AuthorizedBlock {
+            block_hash: block.hash(),
+            body_root: block.header().body_root,
+            chain_id: self.chain_id,
+            rules_digest: self.rules_digest,
+        })
+    }
+
+    /// Imports one exact block after its stateless authorization was checked
+    /// by [`Self::authorize_block`]. All header and state rules still run at
+    /// import time, including the current parent, roots, PoW and fork choice.
+    ///
+    /// # Errors
+    /// Rejects a token from another block/network/profile or changed body
+    /// bytes, then propagates the ordinary import and state-validation errors.
+    pub fn import_authorized(
+        &self,
+        block: &Block,
+        authorization: AuthorizedBlock,
+        now: u64,
+        rng: &mut (impl RngCore + CryptoRng),
+    ) -> Result<Import> {
+        let _write = self.lock_writes();
+        self.recover_reorg()?;
+        if authorization.block_hash != block.hash()
+            || authorization.body_root != block.header().body_root
+            || authorization.chain_id != self.chain_id
+            || authorization.rules_digest != self.rules_digest
+        {
+            return Err(Error::InvalidBlock(
+                "authorization token does not match block or rules",
+            ));
+        }
+        // Txids omit authorization bytes. Recompute the complete body root so
+        // changing proof/signature bytes cannot reuse a previously valid token.
+        block.check_tx_root()?;
+        block.check_body_root()?;
+        self.import_inner(block, now, rng, true)
+    }
+
     /// Imports a block: extends the tip, stores a side-chain block, or
     /// reorganizes when the side chain has more work.
     ///
@@ -150,14 +341,29 @@ impl Chain {
         now: u64,
         rng: &mut (impl RngCore + CryptoRng),
     ) -> Result<Import> {
+        let _write = self.lock_writes();
         self.recover_reorg()?;
+        self.import_inner(block, now, rng, false)
+    }
+
+    fn import_inner(
+        &self,
+        block: &Block,
+        now: u64,
+        rng: &mut (impl RngCore + CryptoRng),
+        authorization_checked: bool,
+    ) -> Result<Import> {
         if self.store.hash_at(block.header().height)? == Some(block.hash()) {
             return Ok(Import::AlreadyKnown);
         }
         let tip = self.tip()?;
         if block.header().prev_hash == tip.hash {
-            self.validator(now)
-                .validate_and_apply(&self.store, block, rng)?;
+            let validator = self.validator(now);
+            if authorization_checked {
+                validator.validate_authorized_and_apply(&self.store, block, rng)?;
+            } else {
+                validator.validate_and_apply(&self.store, block, rng)?;
+            }
             return Ok(Import::Extended);
         }
         let (fork_height, branch_hashes) = self.branch_to_main_chain(block, tip)?;
@@ -168,11 +374,20 @@ impl Chain {
         // signatures and proofs, or a peer could store an unverifiable
         // body under the valid header hash and the real body would then
         // be refused as already known.
-        self.validator(now)
-            .check_side_chain_block(&self.store, block, rng)?;
+        let validator = self.validator(now);
+        if authorization_checked {
+            validator.check_authorized_side_chain_block(&self.store, block, rng)?;
+        } else {
+            validator.check_side_chain_block(&self.store, block, rng)?;
+        }
         // Keep the first accepted tip on equal work; block hashes never
         // influence the tie. Every indexed value came from a validated target.
         if self.chainwork(&block.hash())? <= self.chainwork(&tip.hash)? {
+            self.store.prune_branch_state(
+                self.params.max_reorg_depth,
+                tip.height.saturating_sub(frontier_retention(&self.params)),
+                &pinned_checkpoint_ranges(&self.params),
+            )?;
             return Ok(Import::SideChain);
         }
         let mut branch = branch_hashes
@@ -180,7 +395,8 @@ impl Chain {
             .map(|hash| self.store.block(hash)?.ok_or(Error::Orphan))
             .collect::<Result<Vec<_>>>()?;
         branch.push(block.clone());
-        self.reorganize(fork_height, &branch, now, rng)
+        let authorized_hash = authorization_checked.then(|| block.hash());
+        self.reorganize(fork_height, &branch, now, rng, authorized_hash)
     }
 
     fn validator(&self, now: u64) -> Validator<'_> {
@@ -188,6 +404,7 @@ impl Chain {
             params: &self.params,
             pow: &self.pow,
             vk: &self.vk,
+            chain_id: &self.chain_id,
             now,
         }
     }
@@ -197,7 +414,16 @@ impl Chain {
     /// walk stops at the oldest permissible fork. Retain hashes, not bodies;
     /// only a branch that wins on work needs its transactions loaded.
     fn branch_to_main_chain(&self, block: &Block, tip: Tip) -> Result<(u32, Vec<BlockHash>)> {
-        let checkpoint_floor = self.params.last_checkpoint_height().min(tip.height);
+        let snapshot_floor = self
+            .store
+            .snapshot_base()?
+            .and_then(|hash| self.store.header(&hash).ok().flatten())
+            .map_or(0, |header| header.height);
+        let checkpoint_floor = self
+            .params
+            .last_checkpoint_height()
+            .max(snapshot_floor)
+            .min(tip.height);
         let depth_floor = tip.height.saturating_sub(self.params.max_reorg_depth);
         let mut ancestors = Vec::new();
         let mut header = block.header().clone();
@@ -227,11 +453,11 @@ impl Chain {
         let Some((original, fork)) = self.store.pending_reorg()? else {
             return Ok(());
         };
-        let fork_block = self
+        let fork_header = self
             .store
-            .block(&fork)?
-            .ok_or(Error::InvalidBlock("reorg fork missing"))?;
-        let fork_height = fork_block.header().height;
+            .header(&fork)?
+            .ok_or(Error::InvalidBlock("reorg fork header missing"))?;
+        let fork_height = fork_header.height;
         let mut old = Vec::new();
         let mut hash = original;
         while hash != fork {
@@ -255,13 +481,45 @@ impl Chain {
                     tree.append(action.body().cmx())?;
                 }
             }
-            if tree.root() != block.header().commitment_root {
+            let header = block.header();
+            if tree.root() != header.commitment_root {
                 return Err(Error::InvalidBlock("recovery commitment root mismatch"));
             }
-            self.store
-                .apply(block, &tree, &self.chainwork(&block.hash())?.to_be_bytes())?;
+            let nullifiers = block
+                .transactions()
+                .iter()
+                .flat_map(protocol::transaction::Transaction::nullifiers)
+                .copied()
+                .collect::<Vec<_>>();
+            let transition = self
+                .store
+                .preview_nullifier_transition(header.prev_hash, &nullifiers)?;
+            if transition.root() != header.nullifier_root
+                || crate::state::state_root(
+                    &self.chain_id,
+                    header.height,
+                    tree.root(),
+                    tree.size(),
+                    transition.root(),
+                    transition.count(),
+                ) != header.state_root
+            {
+                return Err(Error::InvalidBlock("recovery state root mismatch"));
+            }
+            self.store.apply_with_nullifier_transition(
+                block,
+                &tree,
+                &self.chainwork(&block.hash())?.to_be_bytes(),
+                &transition,
+            )?;
         }
         self.store.finish_reorg()?;
+        let tip_height = self.tip()?.height;
+        self.store.prune_branch_state(
+            self.params.max_reorg_depth,
+            tip_height.saturating_sub(frontier_retention(&self.params)),
+            &pinned_checkpoint_ranges(&self.params),
+        )?;
         Ok(())
     }
 
@@ -273,6 +531,7 @@ impl Chain {
         branch: &[Block],
         now: u64,
         rng: &mut (impl RngCore + CryptoRng),
+        authorized_hash: Option<BlockHash>,
     ) -> Result<Import> {
         let fork = self.store.hash_at(fork_height)?.ok_or(Error::Orphan)?;
         self.store.begin_reorg(self.tip()?.hash, fork)?;
@@ -283,25 +542,29 @@ impl Chain {
         let validator = self.validator(now);
         let mut applied = 0u32;
         for block in branch {
-            if let Err(error) = validator.validate_and_apply(&self.store, block, rng) {
+            let checked = if authorized_hash == Some(block.hash()) {
+                validator.validate_authorized_and_apply(&self.store, block, rng)
+            } else {
+                validator.validate_and_apply(&self.store, block, rng)
+            };
+            if let Err(error) = checked {
                 self.recover_reorg()?;
                 return Err(error);
             }
             applied = applied.saturating_add(1);
         }
         self.store.finish_reorg()?;
-        if let Some(floor) = self
-            .tip()?
-            .height
-            .checked_sub(frontier_retention(&self.params))
-        {
-            self.store.prune_frontiers_below(floor)?;
-        }
+        let tip_height = self.tip()?.height;
+        self.store.prune_branch_state(
+            self.params.max_reorg_depth,
+            tip_height.saturating_sub(frontier_retention(&self.params)),
+            &pinned_checkpoint_ranges(&self.params),
+        )?;
         Ok(Import::Reorganized { reverted, applied })
     }
 }
 
-/// Initial revision for the recipient-only chain.
+/// Consensus rules revision for the unified v1 header format.
 pub const CONSENSUS_REVISION: u32 = 1;
 
 /// Digest of everything that decides whether an applied block was valid:
@@ -310,7 +573,20 @@ pub const CONSENSUS_REVISION: u32 = 1;
 pub fn rules_digest(params: &ChainParams, vk: &VerifyingKey) -> [u8; 32] {
     let mut w = Writer::default();
     w.put(&CONSENSUS_REVISION.to_le_bytes());
-    w.put(b"rhombus-randomx-v1-native-transfer-public-byte-fee-per-tx-binding-50-coin-halving-recipient-only");
+    w.put(b"kryptos-header-v1-state-roots-tx-merkle-body-merkle-parent-header-mmr");
+    w.put(&[protocol::body_tree::BODY_TREE_VERSION]);
+    w.put(&[protocol::header_tree::HEADER_TREE_COMMITMENT_VERSION]);
+    w.put(&protocol::state::STATE_COMMITMENT_VERSION.to_le_bytes());
+    w.put(
+        &u64::try_from(protocol::body_tree::BODY_CHUNK_SIZE)
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    );
+    w.put(
+        &u32::try_from(protocol::header_tree::HEADER_TREE_DEPTH)
+            .unwrap_or(u32::MAX)
+            .to_le_bytes(),
+    );
     w.put(&protocol::consensus::TX_VERSION.to_le_bytes());
     w.put(&[
         protocol::consensus::TRANSFER_KIND,
@@ -319,10 +595,12 @@ pub fn rules_digest(params: &ChainParams, vk: &VerifyingKey) -> [u8; 32] {
     w.put(&[protocol::consensus::BLOCK_VERSION]);
     w.put(&[protocol::encryption::ENCRYPTED_COIN_VERSION]);
     w.put(protocol::transaction::ACTION_PROOF_MAGIC);
-    w.put(&protocol::consensus::BLOCK_EMISSION_START.to_le_bytes());
-    w.put(&protocol::consensus::TAIL_BLOCK_EMISSION.to_le_bytes());
-    w.put(&protocol::consensus::EMISSION_INTERVAL.to_le_bytes());
-    w.put(&protocol::consensus::EMISSION_HALVINGS_TO_TAIL.to_le_bytes());
+    w.put(&protocol::amount::DECIMAL.to_le_bytes());
+    w.put(&protocol::amount::RAWCOIN.to_le_bytes());
+    w.put(&protocol::consensus::INITIAL_EMISSION.to_le_bytes());
+    w.put(&protocol::consensus::TAIL_EMISSION.to_le_bytes());
+    w.put(&protocol::consensus::TAIL_HEIGHT.to_le_bytes());
+    w.put(&protocol::consensus::TARGET_MINED.to_le_bytes());
     w.put(
         &u64::try_from(params.randomx_key.len())
             .unwrap_or(u64::MAX)
@@ -354,6 +632,8 @@ pub fn rules_digest(params: &ChainParams, vk: &VerifyingKey) -> [u8; 32] {
     for checkpoint in params.checkpoints {
         w.put(&checkpoint.height.to_le_bytes());
         w.put(checkpoint.hash.as_bytes());
+        w.put(&checkpoint.work.to_be_bytes());
+        w.put(&checkpoint.state_root.to_bytes());
     }
     blake2b_short(
         RULES,
@@ -371,6 +651,25 @@ pub fn hash_at(chain: &Chain, height: u32) -> Result<Option<BlockHash>> {
 
 #[cfg(test)]
 mod tests {
+    fn empty_state_block(chain: &Chain, parent: BlockHash, height: u32) -> Block {
+        let tree = chain.store.commitment_tree_at(&parent).unwrap().unwrap();
+        let transition = chain
+            .store
+            .preview_nullifier_transition(parent, &[])
+            .unwrap();
+        let mut header = protocol::block::empty_header(height, parent, tree.root());
+        header.nullifier_root = transition.root();
+        header.state_root = crate::state::state_root(
+            chain.chain_id(),
+            height,
+            tree.root(),
+            tree.size(),
+            transition.root(),
+            transition.count(),
+        );
+        Block::new(header, Vec::new())
+    }
+
     #[test]
     fn reopening_recovers_every_interrupted_reorg_phase() {
         // Model durable boundaries without proof generation: these empty blocks
@@ -387,12 +686,9 @@ mod tests {
             .unwrap();
             let fork = chain.tip().unwrap().hash;
             let tree = chain.store.tree().unwrap();
-            let first = Block::new(protocol::block::empty_header(1, fork, tree.root()), vec![]);
+            let first = empty_state_block(&chain, fork, 1);
             chain.store.apply(&first, &tree, &[1; 32]).unwrap();
-            let second = Block::new(
-                protocol::block::empty_header(2, first.hash(), tree.root()),
-                vec![],
-            );
+            let second = empty_state_block(&chain, first.hash(), 2);
             chain.store.apply(&second, &tree, &[2; 32]).unwrap();
             chain.store.begin_reorg(second.hash(), fork).unwrap();
             if phase >= 1 {
@@ -421,6 +717,18 @@ mod tests {
             assert_eq!(recovered.tip().unwrap().hash, second.hash());
             assert_eq!(recovered.store.hash_at(1).unwrap(), Some(first.hash()));
             assert_eq!(recovered.store.tree().unwrap().root(), tree.root());
+            assert_eq!(
+                recovered.store.nullifier_root().unwrap(),
+                second.header().nullifier_root
+            );
+            assert_eq!(
+                recovered.store.nullifier_count_at(&second.hash()).unwrap(),
+                Some(0)
+            );
+            assert_eq!(
+                recovered.store.commitment_count_at(&second.hash()).unwrap(),
+                Some(tree.size())
+            );
             assert!(recovered.store.pending_reorg().unwrap().is_none());
             drop(recovered);
             let again = Chain::new(
@@ -510,6 +818,8 @@ mod tests {
         chain.params.checkpoints = Box::leak(Box::new([crate::params::Checkpoint {
             height: 1,
             hash: first.hash(),
+            work: ChainWork::ZERO,
+            state_root: first.header().state_root,
         }]));
         let mut header = first.header().clone();
         header.timestamp = 1;

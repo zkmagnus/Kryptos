@@ -25,6 +25,9 @@ pub mod genesis;
 pub mod mempool;
 pub mod params;
 pub mod pow;
+pub mod receipt;
+pub mod snapshot;
+pub mod state;
 pub mod target;
 pub mod validate;
 

@@ -26,7 +26,7 @@ use crypto::diversifier::DiversifierIndex;
 use crypto::keys::SpendingKey;
 use crypto::merkle::{MerklePath, Node};
 use incrementalmerkletree::Position;
-use protocol::address::RhombusAddress;
+use protocol::address::KryptosAddress;
 use protocol::block::{Block, BlockHash};
 use protocol::bytes::Encodable;
 use protocol::compact::CompactBlock;
@@ -72,14 +72,13 @@ const AUTO_ROTATE_RECEIVE: &str = "auto_rotate_receive";
 const NEXT_OPERATION: &str = "next_operation";
 /// Version of the wallet's address derivation metadata (not consensus).
 const ADDRESS_KEY_SCHEME: &str = "address_key_scheme";
-/// Indices below this threshold retain the legacy shared ML-KEM key.
+/// First address index using per-diversifier keys; must be zero.
 const ADDRESS_KEY_START: &str = "address_key_start";
 const COIN_INDEX_VERSION: &str = "coin_nullifier_index_version";
-const BACKUP_FORMAT: &str = "rhombus-wallet-plaintext-backup";
+const BACKUP_FORMAT: &str = "kryptos-wallet-plaintext-backup";
 const BACKUP_VERSION: u32 = 1;
 
-/// Half-open range of separate ML-KEM keys the wallet scans. The legacy
-/// receiver key covers every legacy address independently of this range.
+/// Half-open range of per-diversifier ML-KEM keys the wallet scans.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AddressScanRange {
     /// First index using a separate key.
@@ -305,7 +304,7 @@ impl Wallet {
     }
 
     /// Creates a fresh recovery wallet scanning every new address from zero
-    /// through `last_address_index` inclusive, plus every legacy address.
+    /// through `last_address_index` inclusive.
     /// The caller must supply a bound covering all previously issued addresses.
     /// A larger bound later requires a fresh wallet and a historical rescan.
     ///
@@ -372,13 +371,10 @@ impl Wallet {
         let sk_bytes: [u8; 32] = stored
             .try_into()
             .map_err(|_| Error::Corrupt("spending key"))?;
-        let mut keys = WalletKeys::from_spending_key(SpendingKey::from_bytes(sk_bytes))?;
-        let range = Self::migrate_address_scheme(&db)?;
+        let keys = WalletKeys::from_spending_key(SpendingKey::from_bytes(sk_bytes))?;
+        Self::migrate_address_scheme(&db)?;
         let file_key = FileKey;
         Self::migrate_coin_nullifier_index(&db, &file_key)?;
-        if range.start > 0 {
-            keys.set_legacy_default();
-        }
         Ok(Self {
             db,
             keys,
@@ -450,19 +446,8 @@ impl Wallet {
                 .map(|v| decode_u64(v.value()))
                 .transpose()?;
             range = match (scheme.as_deref(), start) {
-                (None, None) => {
-                    let next = stored_next.unwrap_or(1);
-                    // Every address already handed out keeps its exact bytes.
-                    meta.insert(ADDRESS_KEY_SCHEME, [1u8].as_slice())?;
-                    meta.insert(ADDRESS_KEY_START, next.to_le_bytes().as_slice())?;
-                    meta.insert(NEXT_ADDRESS, next.to_le_bytes().as_slice())?;
-                    AddressScanRange {
-                        start: next,
-                        end: next,
-                    }
-                }
-                (Some([1]), Some(start)) => AddressScanRange {
-                    start,
+                (Some([1]), Some(0)) => AddressScanRange {
+                    start: 0,
                     end: stored_next.ok_or(Error::Corrupt("missing address allocation counter"))?,
                 },
                 _ => return Err(Error::Corrupt("unsupported address key scheme")),
@@ -891,7 +876,7 @@ impl Wallet {
     ///
     /// # Errors
     /// Fails on invalid metadata, key derivation or database errors.
-    pub fn current_receive_address(&self) -> Result<Option<(u64, RhombusAddress)>> {
+    pub fn current_receive_address(&self) -> Result<Option<(u64, KryptosAddress)>> {
         {
             let tx = self.db.begin_read()?;
             let meta = tx.open_table(META)?;
@@ -951,7 +936,7 @@ impl Wallet {
     ///
     /// # Errors
     /// Fails on a database error or an exhausted index space.
-    pub fn new_address(&self, label: &str) -> Result<(u64, RhombusAddress)> {
+    pub fn new_address(&self, label: &str) -> Result<(u64, KryptosAddress)> {
         let tx = self.db.begin_write()?;
         let result = self.allocate_address(&tx, label)?;
         tx.open_table(META)?
@@ -964,7 +949,7 @@ impl Wallet {
         &self,
         tx: &WriteTransaction,
         label: &str,
-    ) -> Result<(u64, RhombusAddress)> {
+    ) -> Result<(u64, KryptosAddress)> {
         let mut meta = tx.open_table(META)?;
         let range = read_address_range(&meta)?;
         let index = range.end;
@@ -998,7 +983,7 @@ impl Wallet {
     pub(crate) fn reserve_send_address(
         &self,
         needs_change: bool,
-    ) -> Result<Option<RhombusAddress>> {
+    ) -> Result<Option<KryptosAddress>> {
         let tx = self.db.begin_write()?;
         let change = if needs_change {
             Some(self.allocate_address(&tx, "change")?.1)
@@ -1052,8 +1037,7 @@ impl Wallet {
     ///
     /// # Errors
     /// Fails on a database error or a label that does not decrypt.
-    pub fn addresses(&self) -> Result<Vec<(u64, RhombusAddress, String)>> {
-        let range = self.address_scan_range()?;
+    pub fn addresses(&self) -> Result<Vec<(u64, KryptosAddress, String)>> {
         let tx = self.db.begin_read()?;
         let addresses = tx.open_table(ADDRESSES)?;
         let mut out = vec![(0, self.keys.default_address()?, String::new())];
@@ -1063,11 +1047,7 @@ impl Wallet {
             let label = self.file_key.open(TAG_LABEL, index, sealed.value())?;
             out.push((
                 index,
-                if index < range.start {
-                    self.keys.legacy_address(DiversifierIndex::from(index))?
-                } else {
-                    self.keys.address(DiversifierIndex::from(index))?
-                },
+                self.keys.address(DiversifierIndex::from(index))?,
                 String::from_utf8(label).map_err(|_| Error::Corrupt("label"))?,
             ));
         }
@@ -1076,7 +1056,7 @@ impl Wallet {
 
     /// The index of one of our addresses, if it is ours and fits the
     /// wallet's `u64` index space.
-    pub fn address_index_of(&self, address: &RhombusAddress) -> Option<u64> {
+    pub fn address_index_of(&self, address: &KryptosAddress) -> Option<u64> {
         let index = self.keys.index_of(address)?;
         let bytes = index.as_bytes();
         let (low, high) = bytes.split_at(8);
@@ -1087,13 +1067,10 @@ impl Wallet {
 
     /// Whether the configured scan keys currently cover this address.
     /// Ownership alone does not imply that an arbitrary new index is scanned.
-    pub fn scans_address(&self, address: &RhombusAddress) -> Result<bool> {
+    pub fn scans_address(&self, address: &KryptosAddress) -> Result<bool> {
         let Some(index) = self.address_index_of(address) else {
             return Ok(false);
         };
-        if self.keys.legacy_address(index.into())? == *address {
-            return Ok(true);
-        }
         let range = self.address_scan_range()?;
         Ok((range.start..range.end).contains(&index))
     }
@@ -1427,7 +1404,7 @@ mod tests {
     fn wallet_permissions_are_private_even_with_a_permissive_umask() {
         use std::os::unix::fs::PermissionsExt;
 
-        const CHILD: &str = "RHOMBUS_WALLET_PERMISSION_TEST_CHILD";
+        const CHILD: &str = "KRYPTOS_WALLET_PERMISSION_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
             // Change umask in an isolated child, never in the multithreaded
             // test process. Use positional arguments rather than shell text.
@@ -2091,59 +2068,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_wallet_migration_preserves_addresses_and_reopens_new_keys() {
-        let mut rng = ChaCha20Rng::seed_from_u64(7200);
-        let (dir, wallet) = temp_wallet(&sk(7200), BlockHash::ZERO, &mut rng);
-        let path = dir.path().join("wallet.redb");
-        wallet.new_address("legacy label").unwrap();
-        let old_default = wallet.keys.legacy_address(0u64.into()).unwrap();
-        let old_issued = wallet.keys.legacy_address(1u64.into()).unwrap();
-        // Recreate metadata of a pre-upgrade wallet without changing keys,
-        // labels or the persisted allocation counter.
-        let tx = wallet.db.begin_write().unwrap();
-        {
-            let mut meta = tx.open_table(META).unwrap();
-            meta.remove(ADDRESS_KEY_SCHEME).unwrap();
-            meta.remove(ADDRESS_KEY_START).unwrap();
-        }
-        tx.commit().unwrap();
-        drop(wallet);
-
-        let wallet = Wallet::open(&path, BlockHash::ZERO).unwrap();
-        assert_eq!(wallet.keys.default_address().unwrap(), old_default);
-        assert_eq!(
-            wallet.addresses().unwrap()[1],
-            (1, old_issued, "legacy label".into())
-        );
-        assert_eq!(
-            wallet.address_scan_range().unwrap(),
-            AddressScanRange { start: 2, end: 2 }
-        );
-        let before = wallet.scanning_keys().unwrap();
-        let (index, fresh) = wallet.new_address("new label").unwrap();
-        assert_eq!(index, 2);
-        assert_ne!(fresh.kem_key(), old_default.kem_key());
-        let after = wallet.scanning_keys().unwrap();
-        assert!(
-            !Arc::ptr_eq(&before, &after),
-            "new address invalidates scan context"
-        );
-        assert!(Arc::ptr_eq(&after, &wallet.scanning_keys().unwrap()));
-        drop(wallet);
-
-        let reopened = Wallet::open(&path, BlockHash::ZERO).unwrap();
-        assert_eq!(reopened.keys.default_address().unwrap(), old_default);
-        assert_eq!(
-            reopened.addresses().unwrap()[2],
-            (2, fresh, "new label".into())
-        );
-        assert_eq!(
-            reopened.address_scan_range().unwrap(),
-            AddressScanRange { start: 2, end: 3 }
-        );
-    }
-
-    #[test]
     fn recovery_range_is_persistent_and_reserved_before_issuing_addresses() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("restore.redb");
@@ -2208,91 +2132,6 @@ mod tests {
             Wallet::open(&path, BlockHash::ZERO),
             Err(Error::Corrupt("missing address allocation counter"))
         ));
-    }
-
-    #[test]
-    fn migrated_high_legacy_indices_remain_scannable_but_cannot_issue_new_keys() {
-        let mut rng = ChaCha20Rng::seed_from_u64(7204);
-        let (dir, wallet) = temp_wallet(&sk(7204), BlockHash::ZERO, &mut rng);
-        let path = dir.path().join("wallet.redb");
-        let tx = wallet.db.begin_write().unwrap();
-        {
-            let mut meta = tx.open_table(META).unwrap();
-            meta.remove(ADDRESS_KEY_SCHEME).unwrap();
-            meta.remove(ADDRESS_KEY_START).unwrap();
-            meta.insert(NEXT_ADDRESS, 5001u64.to_le_bytes().as_slice())
-                .unwrap();
-        }
-        tx.commit().unwrap();
-        drop(wallet);
-        let wallet = Wallet::open(&path, BlockHash::ZERO).unwrap();
-        assert_eq!(wallet.scanning_keys().unwrap().candidate_count(), 1);
-        assert!(wallet
-            .scans_address(&wallet.keys.legacy_address(5000u64.into()).unwrap())
-            .unwrap());
-        assert!(!wallet
-            .scans_address(&wallet.keys.address(5000u64.into()).unwrap())
-            .unwrap());
-        assert!(wallet.new_address("outside recovery range").is_err());
-    }
-
-    #[test]
-    fn recovery_finds_legacy_and_new_payments_only_within_declared_range() {
-        let mut rng = ChaCha20Rng::seed_from_u64(7205);
-        let key = sk(7205);
-        let keys = WalletKeys::from_spending_key(key.clone()).unwrap();
-        let mut builder = Builder::new(Anchor::from_base(pallas::Base::from(0u64)));
-        builder
-            .add_output(OutputInfo::new(
-                keys.address(42u64.into()).unwrap(),
-                RawCoin::from_raw(19).unwrap(),
-            ))
-            .unwrap();
-        builder
-            .add_output(OutputInfo::new(
-                keys.legacy_address(5000u64.into()).unwrap(),
-                RawCoin::from_raw(11).unwrap(),
-            ))
-            .unwrap();
-        let tx = builder
-            .build_coinbase(pk(), RawCoin::from_raw(30).unwrap(), BRANCH, &mut rng)
-            .unwrap();
-        let block = Block::new(empty_header(0, BlockHash::ZERO, *tx.anchor()), vec![tx]);
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("full.redb");
-        drop(Wallet::restore(&path, &key, BlockHash::ZERO, 42, &mut rng).unwrap());
-        let full = Wallet::open(&path, BlockHash::ZERO).unwrap();
-        full.scan(&block).unwrap();
-        assert_eq!(full.balance().unwrap(), 30);
-        let compact = Wallet::restore(
-            dir.path().join("compact.redb"),
-            &key,
-            BlockHash::ZERO,
-            42,
-            &mut rng,
-        )
-        .unwrap();
-        compact
-            .scan_compact(&CompactBlock::from_block(&block).unwrap())
-            .unwrap();
-        assert_eq!(compact.balance().unwrap(), 30);
-        let short = Wallet::restore(
-            dir.path().join("short.redb"),
-            &key,
-            BlockHash::ZERO,
-            41,
-            &mut rng,
-        )
-        .unwrap();
-        short.scan(&block).unwrap();
-        assert_eq!(
-            short.balance().unwrap(),
-            11,
-            "legacy detection does not depend on index range"
-        );
-        assert!(!short
-            .scans_address(&keys.address(42u64.into()).unwrap())
-            .unwrap());
     }
 
     #[test]

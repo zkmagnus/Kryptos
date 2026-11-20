@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark light">
   <meta http-equiv="Content-Security-Policy" content="connect-src 'self'">
-  <title>Rhombus Explorer</title>
+  <title>Kryptos Explorer</title>
   <style>
     :root { color-scheme: dark; --bg:#101411; --panel:#181f1a; --line:#303b32; --text:#e8eee8; --muted:#9eaca0; --accent:#9dd6a5; --warn:#f1c779; }
     * { box-sizing:border-box } body { margin:0; background:radial-gradient(ellipse at 15% 0%,#233126 0,transparent 45%),var(--bg); color:var(--text); font:15px/1.55 ui-sans-serif,system-ui,sans-serif }
@@ -18,7 +18,7 @@
 </head>
 <body>
 <main>
-  <header><div class="eyebrow">Shielded chain explorer</div><h1>Rhombus Explorer</h1><p>Browse the tip, blocks, and transactions on a Rhombus node.</p></header>
+  <header><div class="eyebrow">Shielded chain explorer</div><h1>Kryptos Explorer</h1><p>Browse the tip, blocks, and transactions on a Kryptos node.</p></header>
   <section class="panel">
     <div class="row">
       <div class="field"><label for="endpoint">JSON-RPC endpoint</label><input id="endpoint" value="" readonly></div>
@@ -103,8 +103,8 @@
   }
   function updateMode() {
     for (const b of document.querySelectorAll('[data-mode]')) b.setAttribute('aria-pressed',String(b.dataset.mode===mode));
-    $('query-label').textContent=mode==='block'?'Block height or hash':mode==='tx'?'Transaction hash':'Rhombus address';
-    $('query').placeholder=mode==='block'?'Block height or hash':mode==='tx'?'64-character transaction hash':'Rhombus address';
+    $('query-label').textContent=mode==='block'?'Block height or hash':mode==='tx'?'Transaction hash':'Kryptos address';
+    $('query').placeholder=mode==='block'?'Block height or hash':mode==='tx'?'64-character transaction hash':'Kryptos address';
     $('hint').textContent=mode==='block'?'Enter a block height or hash.':mode==='tx'?'Enter a txid to view its status and public transaction data.':'Address activity cannot be searched in public data: coin recipients and values are encrypted. Sync a wallet with the corresponding viewing key to see its coins.';
   }
   async function lookup() {

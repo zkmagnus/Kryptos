@@ -147,7 +147,7 @@ The byte-budget tests include an actual TCP peer that does not read, and verify 
 env RUSTFLAGS='' cargo test -p p2p --lib sync::tests --locked --offline
 env RUSTFLAGS='' cargo test -p storage --lib --locked --offline
 env RUSTFLAGS='' cargo test -p runtime --test sync_adversarial --locked --offline -- --nocapture --test-threads=1
-env CARGO_TARGET_DIR=/tmp/rhombus-build-native cargo test --release -p runtime --lib --test sync --locked --offline -- --nocapture --test-threads=1
+env CARGO_TARGET_DIR=/tmp/kryptos-build-native cargo test --release -p runtime --lib --test sync --locked --offline -- --nocapture --test-threads=1
 env RUSTFLAGS='' cargo check --workspace --all-targets --locked --offline
 cargo fmt --all -- --check
 git diff --check
@@ -158,13 +158,13 @@ The original review commands and evidence are retained below for comparison:
 ```sh
 env RUSTFLAGS='' cargo test -p p2p --lib sync::tests --locked --offline
 env RUSTFLAGS='' cargo test -p chain --lib --locked --offline
-env CARGO_TARGET_DIR=/tmp/rhombus-build-native cargo test --release -p runtime --test sync follower_syncs_from_miner_and_relays_a_payment --locked --offline -- --nocapture --test-threads=1
+env CARGO_TARGET_DIR=/tmp/kryptos-build-native cargo test --release -p runtime --test sync follower_syncs_from_miner_and_relays_a_payment --locked --offline -- --nocapture --test-threads=1
 ```
 
 - Sync unit tests: **6 passed**. These cover ordered downloads, queue/request caps, gaps, timeouts, and exhaustion.
 - Chain library tests: **30 passed**, including the published RandomX vectors, difficulty/target checks, and recovery after interrupted reorg phases.
 - Two-node release test: **1 passed** in 48.11 seconds. The follower followed six mined blocks and relayed a payment that was mined into the sixth block. Its first sandboxed run was denied permission to bind a local socket; the same offline test passed when rerun with loopback access.
-- A temporary public-API probe at `/tmp/rhombus-sync-probe` exercised S1 and S2. It used synthetic headers and simulated the child's orphan outcome; it did not run a full-node adversarial peer or validate PoW for those synthetic headers. Output:
+- A temporary public-API probe at `/tmp/kryptos-sync-probe` exercised S1 and S2. It used synthetic headers and simulated the child's orphan outcome; it did not run a full-node adversarial peer or validate PoW for those synthetic headers. Output:
 
 ```text
 out_of_order: requested=2 child_removed=true parent_removed=true queued=0 in_flight=0 idle=true exhausted=true retries=0

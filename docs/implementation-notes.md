@@ -96,7 +96,7 @@ modules were checked with normal workspace lint settings; no live Tor test is
 claimed by this document.
 
 The subsequent generator-domain update in `crates/crypto/src/curve.rs`
-uses `rhombus:Generator` and `rhombus:DiversifiedBase`. The fixed-base tables
+uses `kryptos:Generator` and `kryptos:DiversifiedBase`. The fixed-base tables
 were regenerated with the existing generator tool, and the verifying-key,
 proof, and transaction vectors were updated to the resulting values. See
 `docs/circuit.md` for regeneration and compatibility details.

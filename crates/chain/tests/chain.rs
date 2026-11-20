@@ -13,6 +13,7 @@ mod common;
 use chain::chain::{Chain, Import};
 use chain::genesis::genesis;
 use chain::params::{ChainParams, Upgrade};
+use chain::snapshot::{verify_snapshot, SnapshotPayload};
 use chain::target::{ChainWork, Target};
 use chain::Error;
 use common::{proving_key, spend_first_coin_for, spend_first_coin_with_fee, Harness, Wallet};
@@ -24,7 +25,7 @@ use protocol::consensus::{subsidy, BranchId};
 use protocol::transaction::Transaction;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
-use storage::store::Store;
+use storage::store::{SnapshotInstallMode, Store};
 use storage::tree::CommitmentTree;
 
 #[test]
@@ -188,6 +189,36 @@ fn bad_blocks_are_rejected() {
     assert!(matches!(
         h.import(&bad),
         Err(Error::InvalidHeader("commitment root mismatch"))
+    ));
+
+    let mut bad_nullifier = good.header().clone();
+    bad_nullifier.nullifier_root =
+        protocol::transaction::Anchor::from_base(crypto::pallas::Base::from(7u64));
+    assert!(h
+        .chain
+        .pow()
+        .mine(&mut bad_nullifier, 256, &mut h.rng)
+        .unwrap());
+    assert!(matches!(
+        h.chain.import(
+            &Block::new(bad_nullifier, good.transactions().to_vec()),
+            good.header().timestamp,
+            &mut h.rng,
+        ),
+        Err(Error::InvalidHeader("nullifier root mismatch"))
+    ));
+
+    let mut bad_state = good.header().clone();
+    bad_state.state_root =
+        protocol::transaction::Anchor::from_base(crypto::pallas::Base::from(8u64));
+    assert!(h.chain.pow().mine(&mut bad_state, 256, &mut h.rng).unwrap());
+    assert!(matches!(
+        h.chain.import(
+            &Block::new(bad_state, good.transactions().to_vec()),
+            good.header().timestamp,
+            &mut h.rng,
+        ),
+        Err(Error::InvalidHeader("state root mismatch"))
     ));
 
     let mut no_pow = good.header().clone();
@@ -464,6 +495,7 @@ fn overflowing_work_does_not_store_the_child_or_move_the_tip() {
 fn equivalent_noncanonical_nbits_are_rejected() {
     let params = ChainParams {
         pow_limit: Target::from_compact(0x207f_ff00).unwrap(),
+        checkpoints: &[],
         ..ChainParams::test()
     };
     let h = Harness::with_params(43, params);
@@ -476,10 +508,12 @@ fn equivalent_noncanonical_nbits_are_rejected() {
         Target::from_compact(header.target).unwrap(),
         params.pow_limit
     );
+    let chain_id = h.chain.tip().unwrap().hash;
     let validator = chain::validate::Validator {
         params: h.chain.params(),
         pow: h.chain.pow(),
         vk: h.chain.verifying_key(),
+        chain_id: chain_id.as_bytes(),
         now: header.timestamp,
     };
     assert!(matches!(
@@ -563,7 +597,12 @@ fn block_over(
     use chain::target::Target;
     use chain::validate::{header_lookback, recent_headers};
     let params = *h.chain.params();
-    let mut tree = h.chain.store().tree_at(parent.height).unwrap().unwrap();
+    let mut tree = h
+        .chain
+        .store()
+        .commitment_tree_at(&parent.hash())
+        .unwrap()
+        .unwrap();
     for tx in &transactions {
         for action in tx.actions() {
             tree.append(action.body().cmx()).unwrap();
@@ -577,17 +616,58 @@ fn block_over(
             target: Target::from_compact(hd.target).unwrap(),
         })
         .collect();
+    let nullifiers = transactions
+        .iter()
+        .flat_map(protocol::transaction::Transaction::nullifiers)
+        .copied()
+        .collect::<Vec<_>>();
+    let (nullifier_root, nullifier_count) = match h
+        .chain
+        .store()
+        .preview_nullifier_transition(parent.hash(), &nullifiers)
+    {
+        Ok(transition) => (transition.root(), transition.count()),
+        Err(_) => (
+            h.chain
+                .store()
+                .nullifier_root_at(&parent.hash())
+                .unwrap()
+                .unwrap(),
+            h.chain
+                .store()
+                .nullifier_count_at(&parent.hash())
+                .unwrap()
+                .unwrap(),
+        ),
+    };
     let mut header = protocol::block::BlockHeader {
         version: protocol::consensus::BLOCK_VERSION,
         prev_hash: parent.hash(),
         height: parent.height + 1,
         timestamp: parent.timestamp + params.block_interval,
         commitment_root: tree.root(),
+        nullifier_root,
+        state_root: chain::state::state_root(
+            h.chain.chain_id(),
+            parent.height + 1,
+            tree.root(),
+            tree.size(),
+            nullifier_root,
+            nullifier_count,
+        ),
         tx_root: protocol::block::tx_root(
             transactions
                 .iter()
                 .map(protocol::transaction::Transaction::txid),
         ),
+        body_root: protocol::body_tree::body_root(&transactions).unwrap(),
+        history_root: h
+            .chain
+            .store()
+            .header_frontier(&parent.hash())
+            .unwrap()
+            .unwrap()
+            .root(),
         target: next_target(&params, parent.height + 1, &samples).to_compact(),
         nonce: [0; 32],
         solution: PowSolution::empty(),
@@ -777,6 +857,76 @@ fn a_store_built_under_other_rules_is_refused() {
         Err(Error::RulesMismatch)
     ));
     assert!(Chain::new(Store::open(&path).unwrap(), ChainParams::test(), vk()).is_ok());
+}
+
+#[test]
+fn exported_checkpoint_installs_and_accepts_the_next_block() {
+    let mut source = Harness::new(14_001);
+    let params = ChainParams::test();
+    let checkpoint = source.chain.tip().unwrap();
+    let next = source.extend(Vec::new());
+    let payload = SnapshotPayload::from_store_at(
+        source.chain.store(),
+        &params,
+        source.chain.chain_id(),
+        checkpoint.height,
+    )
+    .unwrap();
+    let rules = chain::chain::rules_digest(&params, source.chain.verifying_key());
+    let checkpoint_header = source
+        .chain
+        .store()
+        .header(&checkpoint.hash)
+        .unwrap()
+        .unwrap();
+    verify_snapshot(
+        &params,
+        &rules,
+        source.chain.chain_id(),
+        &checkpoint_header,
+        ChainWork::ZERO,
+        &payload,
+    )
+    .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let destination_path = dir.path().join("destination.redb");
+    let destination = Chain::new(
+        Store::open(&destination_path).unwrap(),
+        params,
+        proving_key().verifying_key(),
+    )
+    .unwrap();
+    destination
+        .store()
+        .install_snapshot(
+            &payload.to_storage_install().unwrap(),
+            SnapshotInstallMode::EmptyOnly,
+        )
+        .unwrap();
+    drop(destination);
+    let destination = Chain::new(
+        Store::open(&destination_path).unwrap(),
+        params,
+        proving_key().verifying_key(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        destination
+            .import(&next, next.header().timestamp, &mut source.rng)
+            .unwrap(),
+        Import::Extended
+    );
+    assert_eq!(destination.tip().unwrap(), source.chain.tip().unwrap());
+    assert_eq!(
+        destination.store().nullifier_root().unwrap(),
+        source.chain.store().nullifier_root().unwrap()
+    );
+    assert_eq!(
+        destination.store().tree().unwrap().root(),
+        source.chain.store().tree().unwrap().root()
+    );
 }
 
 /// A block after `parent` declaring the easiest target, mined and

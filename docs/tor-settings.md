@@ -1,6 +1,6 @@
 # Tor transport settings
 
-Rhombus uses embedded Arti 0.48.0 for both client and anonymous onion service.
+Kryptos uses embedded Arti 0.48.0 for both client and anonymous onion service.
 The P2P destination type is exclusively `NetAddr::TorV3`; there is no direct-IP,
 DNS or alternative transport fallback. Full vanguards remain enabled. None of
 the following options shortens paths or enables a non-anonymous service.

@@ -6,8 +6,8 @@
 //! - [`miner`]: the block template and mining task.
 //! - [`rpc`]: the local line-oriented control socket.
 //! - [`jsonrpc`]: JSON-RPC 2.0 over HTTP, for exchanges, pools and tools.
-//! - [`cli`]: the `rhombus` commands.
-//! - [`walletd`]: the `rhombus-wallet-rpc` daemon for exchanges.
+//! - [`cli`]: the `kryptos` commands.
+//! - [`walletd`]: the `wallet` daemon for exchanges.
 //! - [`paths`]: per-user storage locations on Linux, macOS and Windows.
 //! - [`shutdown`]: stop requests from Ctrl-C, service managers and Windows.
 #![cfg_attr(
@@ -36,6 +36,7 @@ pub mod paths;
 mod peers_file;
 pub mod rpc;
 pub mod shutdown;
+mod sync_bodies;
 pub mod tor;
 pub mod walletd;
 

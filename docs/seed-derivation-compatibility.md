@@ -21,7 +21,7 @@ introduced by ML-KEM address changes or the CI configuration.
 An independent implementation using Python's standard-library `hashlib`
 PBKDF2-HMAC-SHA512 and BLAKE2b reproduces the current production result, including
 the intermediate derivation stages and account 1. It neither imports Rust code
-nor reads values from Rust test output. Before checking the Rhombus vectors, it
+nor reads values from Rust test output. Before checking the Kryptos vectors, it
 checks the standard BIP39 all-zero 256-bit entropy vector with passphrase
 `TREZOR`, whose seed starts `bda85446c6841370`. That reference is published in
 [Trezor's BIP39 vectors](https://github.com/trezor/python-mnemonic/blob/master/vectors.json)
@@ -38,14 +38,14 @@ after independent verification. It does not invent a legacy recovery scheme.
 For the public test phrase consisting of 23 `abandon` words followed by `art`:
 
 1. Derive 64 bytes with PBKDF2-HMAC-SHA512, 2,048 rounds, NFKD mnemonic as
-   password and `mnemonic` plus NFKD BIP39 passphrase as salt. Rhombus uses an
+   password and `mnemonic` plus NFKD BIP39 passphrase as salt. Kryptos uses an
    empty passphrase; the `TREZOR` passphrase is only a BIP39 reference check.
 2. Compute `I = BLAKE2b-512(seed, personalization="IP32Master______")`.
    Its first 32 bytes are the spending key and the last 32 bytes the chain code.
 3. For each hardened index `i`, compute
    `I_child = BLAKE2b-512(c_parent || 0x81 || sk_parent || LE32(i | 0x80000000),
    personalization="ExpandSeed______")`, with the same 32/32 split.
-4. Follow `m / 32' / 1' / account'`. This is Rhombus's ZIP32-style hierarchy,
+4. Follow `m / 32' / 1' / account'`. This is Kryptos's ZIP32-style hierarchy,
    not a claim of byte-compatible Zcash ZIP32 derivation.
 
 | Stage | Spending-key bytes for the public test vector |

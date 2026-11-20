@@ -19,7 +19,7 @@ pub const WORD_COUNT: usize = 24;
 /// The only language phrases are generated in; parsing accepts it only,
 /// so a phrase written down is unambiguous.
 const LANGUAGE: Language = Language::English;
-/// BIP 39 passphrase used for RHOMBUS seed derivation.
+/// BIP 39 passphrase used for KRYPTOS seed derivation.
 const SEED_PASSPHRASE: &str = "";
 
 /// A validated seed phrase.
@@ -144,11 +144,11 @@ mod tests {
         );
         let keys = WalletKeys::from_spending_key(sk0).unwrap();
         let address = keys.default_address().unwrap();
-        let encoded = address.encode(protocol::address::AddressPrefix::Main);
+        let encoded = address.encode(protocol::address::Network::Main);
         assert_eq!(
-            protocol::address::RhombusAddress::decode(
+            protocol::address::KryptosAddress::decode(
                 &encoded,
-                protocol::address::AddressPrefix::Main
+                protocol::address::Network::Main
             ),
             Ok(address),
             "account 0 address of the all-zero phrase did not round-trip"
@@ -159,7 +159,7 @@ mod tests {
     fn bip39_reference_and_intermediate_derivation_stages_are_pinned() {
         let phrase = SeedPhrase::parse(ZERO_PHRASE).unwrap();
         // Official BIP39 all-zero 256-bit entropy vector. TREZOR is only
-        // the reference passphrase; Rhombus production uses the empty one.
+        // the reference passphrase; Kryptos production uses the empty one.
         assert_eq!(
             to_hex(&phrase.0.to_seed("TREZOR")),
             concat!(

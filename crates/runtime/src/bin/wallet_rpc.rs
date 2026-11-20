@@ -1,4 +1,4 @@
-//! The `rhombus-wallet-rpc` binary.
+//! The `kryptos-wallet-rpc` binary.
 
 use clap::Parser;
 

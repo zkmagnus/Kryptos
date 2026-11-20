@@ -1,6 +1,6 @@
 [package]
 name = "circuit"
-description = "Internal Halo2 backend for Rhombus transfer proofs"
+description = "Internal Halo2 backend for Kryptos transfer proofs"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

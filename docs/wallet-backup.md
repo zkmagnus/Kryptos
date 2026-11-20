@@ -1,13 +1,13 @@
 # Wallet backup and restoration
 
 `backupwallet` exports the complete version-1 plaintext wallet JSON under
-the `rhombus-wallet-plaintext-backup` format identifier. Earlier development
+the `kryptos-wallet-plaintext-backup` format identifier. Earlier development
 exports with the old format identifier are not accepted.
 `restorewallet` restores that export to a new database for the selected network:
 
 ```sh
-rhombus backupwallet --network test --wallet wallet.redb --out wallet-backup.json
-rhombus restorewallet --network test --backup wallet-backup.json --wallet restored.redb
+kryptos backupwallet --network test --wallet wallet.redb --out wallet-backup.json
+kryptos restorewallet --network test --backup wallet-backup.json --wallet restored.redb
 ```
 
 Stop the wallet daemon before exporting, and keep the source database and backup
@@ -69,8 +69,7 @@ without external address metadata require a separate design and review.
 
 The focused tests exercise a wallet with received and spent coins, surviving
 witnesses, pending operations and address reservations; spending after import
-checks the rebuilt nullifier index. They also cover empty and migrated legacy
-wallets, wrong networks, malformed state, existing files/symlinks and staging
+checks the rebuilt nullifier index. They also cover empty wallets and rejection of legacy address metadata, wrong networks, malformed state, existing files/symlinks and staging
 cleanup. Corrupt-checkpoint and contradictory operation-status regressions are
 paired with successful restoration of a pruned checkpoint suffix after rollback
 and a pending operation retaining older attempts and stale position metadata.

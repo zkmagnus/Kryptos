@@ -165,7 +165,7 @@ pub(crate) mod tests {
     use rand_chacha::ChaCha20Rng;
 
     use super::*;
-    use crate::address::RhombusAddress as Address;
+    use crate::address::KryptosAddress as Address;
     use crate::amount::RawCoin;
     use crate::coin::{Coin, RandomSeed, Rho};
     use crate::encryption::encrypt_coin;

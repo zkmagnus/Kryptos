@@ -1,4 +1,4 @@
-# Rhombus Generic Private Object Model
+# Kryptos Generic Private Object Model
 
 Status: architecture proposal; it is not an active consensus rule or
 implementation. This document defines targets an implementation must satisfy.

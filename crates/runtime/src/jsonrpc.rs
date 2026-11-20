@@ -4,7 +4,7 @@
 //!
 //! Every method dispatches to the same [`Request`] enum the line protocol
 //! uses, so both interfaces have one behaviour. Method names follow
-//! Bitcoin's where the meaning is the same. Rhombuss are strings in the
+//! Bitcoin's where the meaning is the same. Kryptoss are strings in the
 //! smallest unit; hashes, ids and encoded objects are lowercase hex;
 //! heights are numbers. See `docs/rpc.md`.
 
@@ -18,13 +18,13 @@ use chain::target::Target;
 use crypto::encoding::{from_hex, to_hex};
 use p2p::message::PROTOCOL_VERSION;
 use p2p::peer::Direction;
-use protocol::address::RhombusAddress;
+use protocol::address::KryptosAddress;
 use protocol::amount::RAWCOIN;
 use protocol::block::{Block, BlockHash, BlockHeader, PowSolution};
 use protocol::bytes::Encodable;
 use protocol::consensus::{
-    next_height, proof_len, BranchId, ACTION_CLASSES, BLOCK_EMISSION_START, EMISSION_INTERVAL,
-    MAX_ACTIONS, MAX_BLOCK_TRANSACTIONS, TAIL_BLOCK_EMISSION,
+    next_height, proof_len, BranchId, ACTION_CLASSES, INITIAL_EMISSION, MAX_ACTIONS,
+    MAX_BLOCK_TRANSACTIONS, TAIL_EMISSION, TAIL_HEIGHT, TARGET_MINED,
 };
 use protocol::nullifier::Nullifier;
 use protocol::transaction::{Transaction, TxId};
@@ -180,7 +180,7 @@ impl From<Error> for RpcError {
 /// A block template handed to a pool: everything but nonce and solution.
 #[derive(Clone, Debug)]
 struct CachedTemplate {
-    payout: RhombusAddress,
+    payout: KryptosAddress,
     header: BlockHeader,
     transactions: Arc<Vec<Transaction>>,
     created_at: u64,
@@ -200,7 +200,7 @@ impl TemplateCache {
     /// A recent template for `payout` on `parent`, if one is fresh.
     fn find(
         &self,
-        payout: &RhombusAddress,
+        payout: &KryptosAddress,
         parent: BlockHash,
         at: u64,
     ) -> Option<(String, CachedTemplate)> {
@@ -219,7 +219,7 @@ impl TemplateCache {
     /// transactions and all other template inputs still match.
     fn compatible(
         &self,
-        payout: &RhombusAddress,
+        payout: &KryptosAddress,
         source: &Template,
         at: u64,
     ) -> Option<CachedTemplate> {
@@ -342,7 +342,7 @@ impl Context {
     /// equivalent concurrent requests share the completed proof.
     async fn template_for(
         &self,
-        payout: RhombusAddress,
+        payout: KryptosAddress,
     ) -> core::result::Result<(String, CachedTemplate), RpcError> {
         self.ready_to_mine().await?;
         let (_, tip, ..) = self.tip().await?;
@@ -743,7 +743,7 @@ async fn mining_methods(
         },
         "getblocktemplate" => {
             let address: String = params.get(0, "payout_address")?;
-            let payout = RhombusAddress::decode(&address, context.params.address_prefix)?;
+            let payout = KryptosAddress::decode(&address, context.params.address_network)?;
             if let Some(seen) = params.opt::<String>(1, "longpollid")? {
                 context.wait_for_new_tip(parse_hash(&seen)?).await?;
             }
@@ -799,7 +799,11 @@ fn template_json(context: &Context, id: &str, template: &CachedTemplate) -> Valu
         "min_timestamp": header.timestamp,
         "max_timestamp": now().saturating_add(context.params.max_future_seconds),
         "commitment_root": to_hex(&header.commitment_root.to_bytes()),
+        "nullifier_root": to_hex(&header.nullifier_root.to_bytes()),
+        "state_root": to_hex(&header.state_root.to_bytes()),
         "tx_root": to_hex(&header.tx_root),
+        "body_root": to_hex(&header.body_root),
+        "history_root": to_hex(&header.history_root),
         "target": format!("{:08x}", header.target),
         "target_hex": target_hex(header.target),
         "pow_input": to_hex(&header.pow_input()),
@@ -812,7 +816,7 @@ fn template_json(context: &Context, id: &str, template: &CachedTemplate) -> Valu
 fn randomx_json(params: &ChainParams) -> Value {
     json!({
         "algorithm": "RandomX",
-        "version": 1,
+        "version": 2,
         "key": to_hex(params.randomx_key),
         "solution_length": protocol::consensus::POW_SOLUTION_LEN,
     })
@@ -1052,10 +1056,11 @@ async fn blockchain_info(context: &Context) -> core::result::Result<Value, RpcEr
         "max_block_transactions": MAX_BLOCK_TRANSACTIONS,
         "amount": RAWCOIN.to_string(),
         "emission": {
-            "initial": BLOCK_EMISSION_START.to_string(),
-            "tail": TAIL_BLOCK_EMISSION.to_string(),
-            "interval": EMISSION_INTERVAL,
-            "halvings_until_tail": protocol::consensus::EMISSION_HALVINGS_TO_TAIL,
+            "decimals": protocol::amount::DECIMAL,
+            "initial": INITIAL_EMISSION.to_string(),
+            "tail": TAIL_EMISSION.to_string(),
+            "tail_height": TAIL_HEIGHT,
+            "target_mined": TARGET_MINED.to_string(),
         },
     }))
 }
@@ -1169,7 +1174,17 @@ fn header_json(header: &BlockHeader) -> serde_json::Map<String, Value> {
         "commitment_root".into(),
         json!(to_hex(&header.commitment_root.to_bytes())),
     );
+    object.insert(
+        "nullifier_root".into(),
+        json!(to_hex(&header.nullifier_root.to_bytes())),
+    );
+    object.insert(
+        "state_root".into(),
+        json!(to_hex(&header.state_root.to_bytes())),
+    );
     object.insert("tx_root".into(), json!(to_hex(&header.tx_root)));
+    object.insert("body_root".into(), json!(to_hex(&header.body_root)));
+    object.insert("history_root".into(), json!(to_hex(&header.history_root)));
     object.insert("target".into(), json!(format!("{:08x}", header.target)));
     object.insert("target_hex".into(), json!(target_hex(header.target)));
     object.insert("nonce".into(), json!(to_hex(&header.nonce)));
@@ -1424,7 +1439,7 @@ mod tests {
         server.abort();
     }
 
-    use protocol::address::RhombusAddress as Address;
+    use protocol::address::KryptosAddress as Address;
 
     use super::*;
 
@@ -1501,6 +1516,11 @@ mod tests {
                     .clone(),
                 recent: Vec::new(),
                 tree: storage::tree::CommitmentTree::empty(),
+                nullifier_store: None,
+                chain_id: chain::genesis::genesis(&ChainParams::test())
+                    .hash()
+                    .as_bytes()
+                    .to_owned(),
                 transactions: Vec::new(),
                 params: ChainParams::test(),
                 now: created_at,
@@ -1537,6 +1557,8 @@ mod tests {
                 parent: genesis.header().clone(),
                 recent: vec![genesis.header().clone()],
                 tree,
+                nullifier_store: None,
+                chain_id: genesis.hash().as_bytes().to_owned(),
                 transactions: Vec::new(),
                 params,
                 now: now(),
@@ -1606,6 +1628,8 @@ mod tests {
             parent: genesis.header().clone(),
             recent: vec![genesis.header().clone()],
             tree,
+            nullifier_store: None,
+            chain_id: genesis.hash().as_bytes().to_owned(),
             transactions: Vec::new(),
             params,
             now: now(),

@@ -1,7 +1,7 @@
 # Circuit constants and generator domains
 
 The native curve code derives the value commitment generator under
-`rhombus:Generator` and diversified bases under `rhombus:DiversifiedBase`.
+`kryptos:Generator` and diversified bases under `kryptos:DiversifiedBase`.
 The circuit's committed value-generator multiplication tables must use that
 same generator. SpendAuth and commitment randomness use the RedPallas bases
 from `reddsa`; those tables are unchanged by the domain update.
@@ -9,7 +9,7 @@ from `reddsa`; those tables are unchanged by the domain update.
 Regenerate all tables into a temporary file using the existing tool:
 
 ```sh
-FIXED_BASE_TABLES_OUT=/tmp/rhombus-tables.rs cargo test -p circuit --test gen_tables --offline -- --ignored --nocapture
+FIXED_BASE_TABLES_OUT=/tmp/kryptos-tables.rs cargo test -p circuit --test gen_tables --offline -- --ignored --nocapture
 ```
 
 Copy the result into `crates/circuit/src/constants/tables.rs`, format it with

@@ -1,6 +1,6 @@
-# Running and checking Rhombus
+# Running and checking Kryptos
 
-Rhombus is an experimental implementation. The `main` parameters remain
+Kryptos is an experimental implementation. The `main` parameters remain
 provisional; neither `main` nor `test` has built-in bootstrap peers. The examples
 below create a test network over Tor. They do not activate a public release.
 
@@ -55,9 +55,9 @@ runtime and build-time measurements justify changing them. Panic strategy and
 symbol stripping remain at Cargo's defaults.
 
 Run commands from the repository root. The binaries are
-`target/release/rhombus` (node and wallet CLI), `target/release/wallet` (wallet
+`target/release/kryptos` (node and wallet CLI), `target/release/wallet` (wallet
 RPC daemon), and `target/release/rhomscan` (local database scanner). The `wallet` binary
-currently prints `Rhombus-wallet-rpc` in its help text.
+currently prints `Kryptos-wallet-rpc` in its help text.
 
 ## Test network over embedded Tor
 
@@ -78,17 +78,17 @@ Create a test wallet and keep its printed seed phrase private:
 ```sh
 mkdir -p local-test
 chmod 700 local-test
-target/release/rhombus create --network test --wallet local-test/wallet.redb
+target/release/kryptos create --network test --wallet local-test/wallet.redb
 ```
 
 In the first terminal, start a mining node. The address command prints its public
 payment address:
 
 ```sh
-RHOMBUS_TEST_ADDRESS="$(target/release/rhombus address --network test --wallet local-test/wallet.redb)"
-target/release/rhombus run --network test --datadir local-test/node-a \
+KRYPTOS_TEST_ADDRESS="$(target/release/kryptos address --network test --wallet local-test/wallet.redb)"
+target/release/kryptos run --network test --datadir local-test/node-a \
   --p2p-port 19000 --rpc 127.0.0.1:18444 --rpc-http 127.0.0.1:18443 \
-  --mine "$RHOMBUS_TEST_ADDRESS" --mining-threads 1 --bootstrap-mining
+  --mine "$KRYPTOS_TEST_ADDRESS" --mining-threads 1 --bootstrap-mining
 ```
 
 With `--mine`, the online node waits for both its embedded Tor client and onion
@@ -107,12 +107,12 @@ and `embedded Tor ready` alone does not establish chain synchronization. See
 [mining readiness](mining-readiness.md) for the bootstrap and recovery policy.
 
 After service readiness, copy node A's reported onion hostname into
-`RHOMBUS_ONION_A`. The placeholder below is deliberately not a working peer:
+`KRYPTOS_ONION_A`. The placeholder below is deliberately not a working peer:
 
 ```sh
-RHOMBUS_ONION_A='<node-a-v3-hostname>.onion'
-target/release/rhombus run --network test --datadir local-test/node-b \
-  --p2p-port 19000 --addnode "$RHOMBUS_ONION_A:19000" \
+KRYPTOS_ONION_A='<node-a-v3-hostname>.onion'
+target/release/kryptos run --network test --datadir local-test/node-b \
+  --p2p-port 19000 --addnode "$KRYPTOS_ONION_A:19000" \
   --rpc 127.0.0.1:18544 --rpc-http 127.0.0.1:18543
 ```
 
@@ -126,10 +126,10 @@ readiness independently of the node. Use a separate client datadir so it never
 opens another process's Arti state:
 
 ```sh
-target/release/rhombus status --rpc "$RHOMBUS_ONION_A:18444" \
+target/release/kryptos status --rpc "$KRYPTOS_ONION_A:18444" \
   --datadir local-test/status-client --rpc-token-file local-test/node-a/rpc.token
-target/release/rhombus balance --wallet local-test/wallet.redb \
-  --rpc "$RHOMBUS_ONION_A:18444" --datadir local-test/wallet-client \
+target/release/kryptos balance --wallet local-test/wallet.redb \
+  --rpc "$KRYPTOS_ONION_A:18444" --datadir local-test/wallet-client \
   --rpc-token-file local-test/node-a/rpc.token
 ```
 
@@ -150,7 +150,7 @@ state:
 
 ```sh
 target/release/wallet --network test --wallet local-test/wallet.redb \
-  --node "$RHOMBUS_ONION_A:18444" --datadir local-test/wallet-daemon \
+  --node "$KRYPTOS_ONION_A:18444" --datadir local-test/wallet-daemon \
   --node-token-file local-test/node-a/rpc.token --listen 127.0.0.1:18447
 ```
 
@@ -234,7 +234,7 @@ Receipt rotation can be disabled per wallet without disabling scanning. Use
 RPC, or use the CLI while the wallet daemon is stopped:
 
 ```sh
-rhombus set-receive-rotation --network main --wallet wallet.redb --enabled false
+kryptos set-receive-rotation --network main --wallet wallet.redb --enabled false
 ```
 
 The setting is saved in wallet metadata and version-1 plaintext backups.
@@ -269,14 +269,14 @@ exports contain plaintext secrets even though Unix files are owner-only.
 Create an export with the wallet daemon stopped:
 
 ```sh
-target/release/rhombus backupwallet --network test \
+target/release/kryptos backupwallet --network test \
   --wallet local-test/wallet.redb --out local-test/wallet-backup.json
 ```
 
 Restore a version-1 plaintext JSON export into a **new** wallet file:
 
 ```sh
-target/release/rhombus restorewallet --network test \
+target/release/kryptos restorewallet --network test \
   --backup local-test/wallet-backup.json --wallet local-test/restored.redb
 ```
 
@@ -299,10 +299,10 @@ reservations left by interrupted or failed transaction builds. For example, if i
 0 through 7 may have been used:
 
 ```sh
-target/release/rhombus create --network test --wallet local-test/restored.redb \
+target/release/kryptos create --network test --wallet local-test/restored.redb \
   --phrase --account 0 --restore-through 7
-target/release/rhombus balance --wallet local-test/restored.redb \
-  --rpc "$RHOMBUS_ONION_A:18444" --datadir local-test/wallet-client \
+target/release/kryptos balance --wallet local-test/restored.redb \
+  --rpc "$KRYPTOS_ONION_A:18444" --datadir local-test/wallet-client \
   --rpc-token-file local-test/node-a/rpc.token
 ```
 
@@ -316,27 +316,14 @@ Record the highest reserved index in the backup procedure. A normal wallet keeps
 its durable range and extends it as new addresses are issued, up to 4096
 separate ML-KEM keys. To recover a larger historical range later, create a new
 wallet file with a higher bound and rescan from genesis; increasing the bound
-does not silently apply only to future blocks. Existing wallets preserve their
-legacy address bytes and continue scanning all legacy addresses. New addresses
+does not silently apply only to future blocks. Legacy shared-key address recovery
+and scanning are no longer supported. Wallets with missing address-scheme
+metadata or a legacy shared-key allocation range are rejected. Current addresses
 use separate ML-KEM keys; reusing one address remains linkable.
 
-For legacy-only recovery, `--restore-through 0` still finds payments to every
-legacy index, even indices above 4095. Its declared historical separate-key
-recovery range covers only index zero; selecting the fresh current address then
-allocates the next index. This does not recover an unknown historical range. New
-allocation can reuse diversifiers previously used by legacy addresses, allowing
-those old/new address pairs to be linked. Supply the maximum
-historical allocation index if it is known and fits the limit. If it is unknown
-or above 4095, use that recovered wallet for recovery/spending and a fresh
-account or seed for future receipts. Keeping the original database preserves
-the allocation counter and avoids this ambiguity.
-
-The automatic wallet API only issues new per-address indices `0..4095`, so every
-wallet-created address remains within the supported phrase-recovery bound. A
-legacy wallet whose next index is already above that cap remains open and keeps
-scanning its old addresses, but it cannot issue another per-address address;
-retain it for its labels/default address and use a new account or fresh wallet
-for new receiving addresses. Low-level library callers that derive arbitrary
+The automatic wallet API only issues per-address indices `0..4095`, so every
+wallet-created address remains within the supported phrase-recovery bound.
+Low-level library callers that derive arbitrary
 indices must supply and preserve their own recovery range.
 Do not downgrade a migrated wallet: older receivers cannot discover payments
 to the new per-address keys. The address and transaction byte layouts are
@@ -360,7 +347,7 @@ grows with the number of address keys times the number of outputs; an oversized
 range is rejected rather than silently truncated.
 `getaddressinfo` also reports `scan_covered`: an address may belong to the wallet
 while its new key lies outside the configured scan range. Receipt records keep
-the actual legacy/new address scheme, including after mixed recovery.
+the address scheme; legacy coin addresses cannot be reconstructed.
 Version-1 plaintext JSON backups include this metadata and the extended coin
 records.
 

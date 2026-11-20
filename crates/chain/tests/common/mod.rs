@@ -19,8 +19,8 @@ use chain::Error;
 use crypto::encryption::TransmissionKey;
 use crypto::keys::{Diversifier, FullViewingKey, SpendingKey};
 use crypto::merkle::MerkleTree;
-use protocol::address::RhombusAddress;
-use protocol::amount::RawCoin as Rhombus;
+use protocol::address::KryptosAddress;
+use protocol::amount::RawCoin as Kryptos;
 use protocol::block::{empty_header, Block, BlockHeader, PowSolution};
 use protocol::builder::{Builder, OutputInfo, SpendInfo};
 use protocol::coin::{Coin, Rho};
@@ -45,7 +45,7 @@ pub struct Wallet {
     pub fvk: FullViewingKey,
     pub receiver_key: crypto::encryption::ReceiverKey,
     pub transmission_key: TransmissionKey,
-    pub address: RhombusAddress,
+    pub address: KryptosAddress,
     /// Every commitment on the chain, in tree order, for witnesses.
     pub tree: MerkleTree,
     /// Coins this wallet owns, with their tree positions.
@@ -56,7 +56,7 @@ impl Wallet {
     pub fn new(rng: &mut ChaCha20Rng) -> Self {
         let sk = SpendingKey::random(rng);
         let fvk = FullViewingKey::derive(&sk).unwrap();
-        let address = RhombusAddress::derive(&fvk, Diversifier::random(rng)).unwrap();
+        let address = KryptosAddress::derive(&fvk, Diversifier::random(rng)).unwrap();
         let (receiver_key, transmission_key) =
             fvk.receiver_key_for_diversifier(address.diversifier());
         Self {
@@ -185,7 +185,7 @@ impl Harness {
         let height = parent.height + 1;
         let fees = txs
             .iter()
-            .try_fold(Rhombus::ZERO, |sum, tx| sum.checked_add(tx.fee()))
+            .try_fold(Kryptos::ZERO, |sum, tx| sum.checked_add(tx.fee()))
             .unwrap();
         let credit = subsidy(height).checked_add(fees).unwrap();
         let anchor = parent.commitment_root;
@@ -212,6 +212,38 @@ impl Harness {
                 tree.append(action.body().cmx()).unwrap();
             }
         }
+        let nullifiers = transactions
+            .iter()
+            .flat_map(Transaction::nullifiers)
+            .copied()
+            .collect::<Vec<_>>();
+        let nullifier_transition = self
+            .chain
+            .store()
+            .preview_nullifier_transition(parent.hash(), &nullifiers);
+        let (nullifier_root, nullifier_count) = match nullifier_transition {
+            Ok(transition) => (transition.root(), transition.count()),
+            Err(_) => (
+                self.chain
+                    .store()
+                    .nullifier_root_at(&parent.hash())
+                    .unwrap()
+                    .unwrap(),
+                self.chain
+                    .store()
+                    .nullifier_count_at(&parent.hash())
+                    .unwrap()
+                    .unwrap(),
+            ),
+        };
+        let state_root = chain::state::state_root(
+            self.chain.chain_id(),
+            height,
+            tree.root(),
+            tree.size(),
+            nullifier_root,
+            nullifier_count,
+        );
 
         let recent =
             recent_headers(self.chain.store(), parent.height, header_lookback(&params)).unwrap();
@@ -228,7 +260,17 @@ impl Harness {
             height,
             timestamp: parent.timestamp + self.spacing,
             commitment_root: tree.root(),
+            nullifier_root,
+            state_root,
             tx_root: protocol::block::tx_root(transactions.iter().map(Transaction::txid)),
+            body_root: protocol::body_tree::body_root(&transactions).unwrap(),
+            history_root: self
+                .chain
+                .store()
+                .header_frontier(&parent.hash())
+                .unwrap()
+                .unwrap()
+                .root(),
             target: next_target(&params, height, &samples).to_compact(),
             nonce: [0; 32],
             solution: PowSolution::empty(),
@@ -281,7 +323,7 @@ impl Harness {
 pub fn spend_first_coin(
     h: &mut Harness,
     wallet: &Wallet,
-    recipient: &RhombusAddress,
+    recipient: &KryptosAddress,
     pay: u64,
 ) -> Transaction {
     let branch = h.chain.params().branch_at(h.tip_header().height + 1);
@@ -292,7 +334,7 @@ pub fn spend_first_coin(
 pub fn spend_first_coin_for(
     h: &mut Harness,
     wallet: &Wallet,
-    recipient: &RhombusAddress,
+    recipient: &KryptosAddress,
     pay: u64,
     branch: BranchId,
 ) -> Transaction {
@@ -306,18 +348,18 @@ pub fn spend_first_coin_for(
         .unwrap();
     b.add_output(OutputInfo::new(
         recipient.clone(),
-        Rhombus::from_raw(pay).unwrap(),
+        Kryptos::from_raw(pay).unwrap(),
     ))
     .unwrap();
     if change > 0 {
         b.add_output(OutputInfo::new(
             wallet.address.clone(),
-            Rhombus::from_raw(change).unwrap(),
+            Kryptos::from_raw(change).unwrap(),
         ))
         .unwrap();
     }
     b.build_with_fee(
-        Rhombus::from_raw(fee).unwrap(),
+        Kryptos::from_raw(fee).unwrap(),
         proving_key(),
         branch,
         &mut h.rng,
@@ -329,7 +371,7 @@ pub fn spend_first_coin_for(
 pub fn spend_first_coin_with_fee(
     h: &mut Harness,
     wallet: &Wallet,
-    recipient: &RhombusAddress,
+    recipient: &KryptosAddress,
     pay: u64,
     fee: u64,
 ) -> Transaction {
@@ -343,18 +385,18 @@ pub fn spend_first_coin_with_fee(
         .unwrap();
     b.add_output(OutputInfo::new(
         recipient.clone(),
-        Rhombus::from_raw(pay).unwrap(),
+        Kryptos::from_raw(pay).unwrap(),
     ))
     .unwrap();
     if change > 0 {
         b.add_output(OutputInfo::new(
             wallet.address.clone(),
-            Rhombus::from_raw(change).unwrap(),
+            Kryptos::from_raw(change).unwrap(),
         ))
         .unwrap();
     }
     b.build_with_fee(
-        Rhombus::from_raw(fee).unwrap(),
+        Kryptos::from_raw(fee).unwrap(),
         proving_key(),
         branch,
         &mut h.rng,

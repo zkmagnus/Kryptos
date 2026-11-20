@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 chain.workspace = true
+crypto.workspace = true
 protocol.workspace = true
 arti-client.workspace = true
 tor-hsservice.workspace = true

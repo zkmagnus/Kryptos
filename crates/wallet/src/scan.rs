@@ -161,8 +161,7 @@ impl StandIn {
 ///
 /// # Errors
 /// Fails if a decrypted coin cannot derive its nullifier.
-/// This convenience wrapper scans the new default address and all legacy
-/// addresses. Use [`scan_block_with_keys`] for other new address indices.
+/// This convenience wrapper scans the default address. Use [`scan_block_with_keys`] for other new address indices.
 pub fn scan_block(
     keys: &WalletKeys,
     block: &Block,
@@ -243,8 +242,7 @@ pub fn scan_block_with_keys(
 ///
 /// # Errors
 /// Fails if a detected coin cannot derive its nullifier.
-/// This convenience wrapper scans the new default address and all legacy
-/// addresses. Use [`scan_compact_block_with_keys`] for other new indices.
+/// This convenience wrapper scans the default address. Use [`scan_compact_block_with_keys`] for other new indices.
 pub fn scan_compact_block(
     keys: &WalletKeys,
     block: &CompactBlock,
@@ -421,172 +419,6 @@ mod tests {
         }
         assert_eq!(full.found[0].txid, Some(tree[0].txid()));
         assert_eq!(light.found[0].txid, None);
-    }
-
-    #[test]
-    fn legacy_and_per_address_scans_obey_the_range_and_reject_wrong_routing() {
-        use crypto::commitment::{ValueCommitTrapdoor, ValueCommitment};
-        use crypto::keys::SpendAuthorizingKey;
-        use crypto::signature::{
-            BindingSignature, RandomizedSigningKey, SpendAuthRandomizer, SpendAuthSignature,
-        };
-        use protocol::action::ActionBody;
-        use protocol::block::{empty_header, BlockHash};
-        use protocol::compact::CompactAction;
-        use protocol::encryption::{encrypt_coin, EncryptedCoin, COMPACT_COIN_LEAD};
-        use protocol::transaction::Anchor;
-        use transaction_proof::{ActionProofEnvelope, Proof};
-
-        let mut rng = ChaCha20Rng::seed_from_u64(71);
-        let keys = WalletKeys::from_spending_key(SpendingKey::random(&mut rng)).unwrap();
-        let foreign = WalletKeys::from_spending_key(SpendingKey::random(&mut rng)).unwrap();
-        let default = keys.default_address().unwrap();
-        let high = keys.address(42u64.into()).unwrap();
-        let outputs = [
-            (keys.legacy_address(5000u64.into()).unwrap(), 11),
-            (default.clone(), 12),
-            (high.clone(), 13),
-            (foreign.default_address().unwrap(), 14),
-            (high.clone(), 15),
-            (high.clone(), 16),
-            (high, 0),
-            (keys.address(43u64.into()).unwrap(), 17),
-        ];
-        let mut actions = Vec::new();
-        let mut compact = CompactBlock {
-            height: 7,
-            hash: BlockHash::ZERO,
-            actions: Vec::new(),
-        };
-        for (index, (address, value)) in outputs.into_iter().enumerate() {
-            let nf = Nullifier::from_base(&crypto::pallas::Base::from(index as u64 + 1));
-            let coin = Coin::new(
-                *address.diversifier(),
-                *address.pk_d(),
-                RawCoin::from_raw(value).unwrap(),
-                Rho::from_nullifier(&nf).unwrap(),
-                RandomSeed::random(&mut rng),
-            );
-            let cmx = coin.cmx().unwrap();
-            let cv = ValueCommitment::commit(0, &ValueCommitTrapdoor::random(&mut rng));
-            // A valid ciphertext for the wrong per-address key must not be
-            // accepted even when ivk and the commitment still match.
-            let ek = if index == 4 {
-                default.kem_key()
-            } else {
-                address.kem_key()
-            };
-            let mut encrypted = encrypt_coin(&coin, ek, &mut rng).unwrap();
-            if index == 5 {
-                let mut ciphertext = *encrypted.enc_ciphertext();
-                ciphertext[0] ^= 1;
-                encrypted =
-                    EncryptedCoin::from_parts(encrypted.kem_ciphertext().clone(), ciphertext);
-            }
-            let rk = RandomizedSigningKey::new(
-                &SpendAuthorizingKey::derive(keys.spending_key()).unwrap(),
-                &SpendAuthRandomizer::random(&mut rng),
-            )
-            .unwrap()
-            .verification_key();
-            let mut lead = [0; COMPACT_COIN_LEAD];
-            lead.copy_from_slice(&encrypted.enc_ciphertext()[..COMPACT_COIN_LEAD]);
-            compact.actions.push(CompactAction {
-                nullifier: nf,
-                cmx,
-                kem_ciphertext: encrypted.kem_ciphertext().clone(),
-                enc_lead: lead,
-            });
-            actions.push(
-                ActionBody::new(nf, rk, cmx, cv, encrypted)
-                    .sign(SpendAuthSignature::from_bytes([0; 64])),
-            );
-        }
-        let tx = Transaction::new(
-            Anchor::from_base(crypto::pallas::Base::zero()),
-            RawCoin::ZERO,
-            actions,
-            ActionProofEnvelope::new(&Proof::from_bytes(vec![
-                0;
-                protocol::consensus::proof_len(8)
-                    .unwrap()
-            ]))
-            .unwrap(),
-            BindingSignature::from_bytes([0; 64]),
-        )
-        .unwrap();
-        let block = Block::new(empty_header(7, BlockHash::ZERO, *tx.anchor()), vec![tx]);
-        let tree = vec![&block.transactions()[0]];
-
-        for (start, end, expected) in [
-            (0, 1, vec![(0, 11), (1, 12)]),
-            (42, 43, vec![(0, 11), (2, 13)]),
-            (0, 43, vec![(0, 11), (1, 12), (2, 13)]),
-        ] {
-            let scan_keys = ScanKeys::new(&keys, start, end).unwrap();
-            let full = scan_block_with_keys(&keys, &scan_keys, &block, &tree, 0).unwrap();
-            let light = scan_compact_block_with_keys(&keys, &scan_keys, &compact, 0).unwrap();
-            for scanned in [&full, &light] {
-                assert_eq!(
-                    scanned
-                        .found
-                        .iter()
-                        .map(|coin| (coin.position, coin.coin.value().raw()))
-                        .collect::<Vec<_>>(),
-                    expected
-                );
-                for owned in &scanned.found {
-                    assert_eq!(owned.legacy_address, owned.position == 0);
-                    let reconstructed = keys
-                        .address_for_coin(&owned.coin, owned.legacy_address)
-                        .unwrap();
-                    let expected_address = match owned.position {
-                        0 => keys.legacy_address(5000u64.into()).unwrap(),
-                        1 => keys.default_address().unwrap(),
-                        2 => keys.address(42u64.into()).unwrap(),
-                        _ => panic!("unexpected owned output"),
-                    };
-                    assert_eq!(reconstructed, expected_address);
-                    assert!(foreign
-                        .address_for_coin(&owned.coin, owned.legacy_address)
-                        .is_err());
-                }
-            }
-            assert_eq!(full.leaves, light.leaves);
-            assert_eq!(
-                full.found
-                    .iter()
-                    .map(|coin| coin.nullifier)
-                    .collect::<Vec<_>>(),
-                light
-                    .found
-                    .iter()
-                    .map(|coin| coin.nullifier)
-                    .collect::<Vec<_>>()
-            );
-
-            // Check all candidate trials execute for legacy (first), new,
-            // foreign and malformed outputs alike; a successful trial cannot
-            // shorten the loop and disclose which address received a coin.
-            for action in tree[0].actions() {
-                let body = action.body();
-                let mut attempts = 0;
-                let _ = scan_keys.trial_decrypt(|receiver_key| {
-                    attempts += 1;
-                    decrypt_coin_with_ivk(
-                        keys.incoming_viewing_key(),
-                        receiver_key,
-                        body.encrypted_coin(),
-                        Rho::from_nullifier(body.nullifier()).unwrap(),
-                        body.cmx(),
-                    )
-                });
-                assert_eq!(attempts, scan_keys.candidate_count());
-            }
-        }
-        let wrong_context = ScanKeys::new(&foreign, 0, 1).unwrap();
-        assert!(scan_block_with_keys(&keys, &wrong_context, &block, &tree, 0).is_err());
-        assert!(scan_compact_block_with_keys(&keys, &wrong_context, &compact, 0).is_err());
     }
 
     #[test]

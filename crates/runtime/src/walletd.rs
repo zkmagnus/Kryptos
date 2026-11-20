@@ -1,4 +1,4 @@
-//! The wallet daemon `Rhombus-wallet-rpc`: a long-running process that
+//! The wallet daemon `Kryptos-wallet-rpc`: a long-running process that
 //! holds one wallet file, keeps it synced from a node, serves the wallet
 //! methods over JSON-RPC, and carries send operations from request to
 //! confirmation, rebuilding them if their transaction is not mined.
@@ -17,7 +17,7 @@ use chain::genesis::genesis;
 use chain::params::ChainParams;
 use clap::Parser;
 use crypto::encoding::to_hex;
-use protocol::address::RhombusAddress;
+use protocol::address::KryptosAddress;
 use protocol::amount::RawCoin;
 use protocol::bytes::Encodable;
 use protocol::consensus::next_height;
@@ -71,14 +71,14 @@ pub const METHODS: &[&str] = &[
     "help",
 ];
 
-/// Command line of `Rhombus-wallet-rpc`.
+/// Command line of `Kryptos-wallet-rpc`.
 #[derive(Parser, Debug)]
 #[command(
-    name = "Rhombus-wallet-rpc",
+    name = "Kryptos-wallet-rpc",
     about = "Wallet daemon: sync, addresses, sends, JSON-RPC"
 )]
 pub struct Args {
-    /// Wallet file, created with `Rhombus create` or the desktop app;
+    /// Wallet file, created with `Kryptos create` or the desktop app;
     /// defaults to `<user data>/<network>/wallet.redb`.
     #[arg(long)]
     pub wallet: Option<PathBuf>,
@@ -100,7 +100,7 @@ pub struct Args {
     )]
     pub node_token: Option<String>,
     /// File holding the node's token; defaults to the `rpc.token` a
-    /// default `Rhombus run` writes, `<user data>/<network>/chain/rpc.token`.
+    /// default `Kryptos run` writes, `<user data>/<network>/chain/rpc.token`.
     #[arg(long)]
     pub node_token_file: Option<PathBuf>,
     /// Address to serve the wallet's JSON-RPC on.
@@ -290,7 +290,7 @@ fn node_token(text: Option<String>, file: Option<PathBuf>, network: Network) -> 
     }
 }
 
-/// Runs the `Rhombus-wallet-rpc` command line: opens the wallet, starts the
+/// Runs the `Kryptos-wallet-rpc` command line: opens the wallet, starts the
 /// daemon and waits for a stop request.
 ///
 /// # Errors
@@ -307,7 +307,7 @@ pub async fn main(args: Args) -> Result<()> {
     // an empty file behind a mistyped or missing path.
     if !wallet_path.try_exists()? {
         return Err(Error::Argument(format!(
-            "no wallet at {}; create one with the desktop app or `Rhombus create --wallet <file>`",
+            "no wallet at {}; create one with the desktop app or `Kryptos create --wallet <file>`",
             wallet_path.display()
         )));
     }
@@ -346,7 +346,7 @@ pub async fn main(args: Args) -> Result<()> {
     })
     .await?;
     logging::info(&format!(
-        "Rhombus-wallet-rpc up on the {} network, json-rpc http://{}/",
+        "Kryptos-wallet-rpc up on the {} network, json-rpc http://{}/",
         args.network, handle.addr
     ));
     shutdown.requested().await;
@@ -785,7 +785,7 @@ impl WalletDaemon {
             "height": coin.height,
             "confirmations": self.confirmations(coin.height)?,
             "amount": coin.coin.value().raw().to_string(),
-            "address": address.encode(self.0.params.address_prefix),
+            "address": address.encode(self.0.params.address_network),
             "address_index": index,
             "label": index.and_then(|i| labels.get(&i).cloned()),
             "spent": coin.spent_at.is_some(),
@@ -795,8 +795,8 @@ impl WalletDaemon {
         }))
     }
 
-    fn parse_address(&self, text: &str) -> core::result::Result<RhombusAddress, RpcError> {
-        Ok(RhombusAddress::decode(text, self.0.params.address_prefix)?)
+    fn parse_address(&self, text: &str) -> core::result::Result<KryptosAddress, RpcError> {
+        Ok(KryptosAddress::decode(text, self.0.params.address_network)?)
     }
 
     fn payment(&self, value: &Value) -> core::result::Result<Payment, RpcError> {
@@ -812,7 +812,7 @@ impl WalletDaemon {
     }
 
     fn operation_json(&self, op: &Operation) -> Value {
-        let prefix = self.0.params.address_prefix;
+        let prefix = self.0.params.address_network;
         let (txid, height) = match &op.status {
             OperationStatus::Submitted { txid, .. } => (Some(txid.to_string()), None),
             OperationStatus::Confirmed { txid, height } => (Some(txid.to_string()), Some(*height)),
@@ -891,7 +891,7 @@ impl WalletDaemon {
         params: &Params,
     ) -> core::result::Result<Value, RpcError> {
         let wallet = &self.0.wallet;
-        let prefix = self.0.params.address_prefix;
+        let prefix = self.0.params.address_network;
         match method {
             "getwalletinfo" => {
                 let scanned = self.scanned_height()?;
@@ -920,7 +920,7 @@ impl WalletDaemon {
                     "receive_address_index": receiving.as_ref().map(|(index, _)| *index),
                     "address_rotation_exhausted": receiving.is_none(),
                     "auto_receive_rotation": wallet.auto_rotate_receive()?,
-                    "legacy_address_scanning": true,
+                    "legacy_address_scanning": false,
                     "max_separate_address_keys": wallet::keys::MAX_SCAN_ADDRESSES,
                     "last_error": self.0.last_error.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone(),
                 }))
@@ -964,7 +964,7 @@ impl WalletDaemon {
             }
             "validateaddress" => {
                 let text: String = params.get(0, "address")?;
-                let valid = RhombusAddress::decode(&text, prefix).is_ok();
+                let valid = KryptosAddress::decode(&text, prefix).is_ok();
                 Ok(json!({ "valid": valid, "network": self.0.network.to_string() }))
             }
             "help" => Ok(json!(METHODS)),
@@ -1159,10 +1159,10 @@ mod tests {
     #[test]
     fn the_wallet_daemon_defaults_to_the_main_network() {
         let target = format!("{}:18444", p2p::address::NetAddr::TorV3([1; 32]));
-        let args = Args::try_parse_from(["Rhombus-wallet-rpc", "--node", &target]).unwrap();
+        let args = Args::try_parse_from(["Kryptos-wallet-rpc", "--node", &target]).unwrap();
         assert_eq!(args.network, Network::Main);
         assert!(args.datadir.is_none());
-        assert!(Args::try_parse_from(["Rhombus-wallet-rpc"]).is_err());
+        assert!(Args::try_parse_from(["Kryptos-wallet-rpc"]).is_err());
     }
 
     #[tokio::test]
@@ -1244,6 +1244,8 @@ mod tests {
             parent: genesis.header().clone(),
             recent: vec![genesis.header().clone()],
             tree: storage::tree::CommitmentTree::default(),
+            nullifier_store: None,
+            chain_id: genesis.hash().as_bytes().to_owned(),
             transactions: Vec::new(),
             params,
             now: std::time::SystemTime::now()
@@ -1350,7 +1352,7 @@ mod tests {
             .unwrap();
         assert_ne!(
             manual["address"],
-            json!(first.1.encode(Network::Test.address_prefix()))
+            json!(first.1.encode(Network::Test.address_network()))
         );
         assert_eq!(
             daemon.wallet_methods("getreceiveaddress", &params).unwrap()["address"],
@@ -1418,10 +1420,9 @@ mod tests {
     fn received_coin_json_preserves_the_actual_address_scheme() {
         let (_dir, wallet) = wallet_file();
         let (index, new_address) = wallet.new_address("separate key").unwrap();
-        let legacy = wallet.keys().legacy_address(index.into()).unwrap();
         let daemon = offline_daemon(wallet);
         let labels = daemon.labels().unwrap();
-        for (address, legacy_address) in [(&new_address, false), (&legacy, true)] {
+        for (address, legacy_address) in [(&new_address, false)] {
             let coin = protocol::coin::Coin::new(
                 *address.diversifier(),
                 *address.pk_d(),
@@ -1447,7 +1448,7 @@ mod tests {
             let json = daemon.coin_json(&owned, &labels, &[]).unwrap();
             assert_eq!(
                 json["address"],
-                address.encode(Network::Test.address_prefix())
+                address.encode(Network::Test.address_network())
             );
             assert_eq!(json["address_index"], index);
             assert_eq!(json["label"], "separate key");
@@ -1908,7 +1909,7 @@ mod tests {
             .keys()
             .address(1u64.into())
             .unwrap()
-            .encode(Network::Test.address_prefix());
+            .encode(Network::Test.address_network());
         let daemon = offline_daemon(wallet);
         let send = |params: Value| daemon.coin_methods("send", &Params::new(params));
         assert_eq!(

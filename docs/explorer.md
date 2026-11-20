@@ -1,4 +1,4 @@
-# Rhombus Explorer
+# Kryptos Explorer
 
 The node serves a local browser explorer from its JSON-RPC HTTP listener:
 
@@ -26,7 +26,7 @@ transaction ids, mempool capacity, and node snapshot shown by the page.
 
 ## Address lookups
 
-Rhombus transfer outputs are shielded. Public block data exposes commitments,
+Kryptos transfer outputs are shielded. Public block data exposes commitments,
 nullifiers, and encrypted note payloads, but does not expose the recipient
 address or note value. The explorer therefore cannot build a public address
 activity index from chain data alone. To see activity for an address, scan with

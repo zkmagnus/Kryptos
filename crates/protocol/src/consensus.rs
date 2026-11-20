@@ -12,7 +12,7 @@ pub const TRANSFER_KIND: u8 = 0;
 /// Coinbase kind. Consensus also requires this transaction at block index 0.
 pub const COINBASE_KIND: u8 = 1;
 
-/// Block version whose transactions use the recipient-only output encoding.
+/// Current and only block-header encoding.
 pub const BLOCK_VERSION: u8 = 1;
 
 /// Identifies one set of consensus rules. Every signature hash binds the
@@ -42,25 +42,24 @@ pub const POW_SOLUTION_LEN: usize = 32;
 /// Most transactions a block may carry. Provisional.
 pub const MAX_BLOCK_TRANSACTIONS: usize = 512;
 
-/// Initial block emission: 50 rawcoin.
-pub const BLOCK_EMISSION_START: u64 = 50 * RAWCOIN;
-/// Permanent tail emission: 0.1953125 rawcoin.
-pub const TAIL_BLOCK_EMISSION: u64 = 19_531_250;
-/// Number of 150,000-block intervals until the subsidy enters tail emission.
-pub const EMISSION_HALVINGS_TO_TAIL: u64 = 8;
-/// Blocks per halving interval.
-pub const EMISSION_INTERVAL: u64 = 150_000;
+/// Initial block reward: 25 BUS.
+pub const INITIAL_EMISSION: u64 = 25 * RAWCOIN;
+/// Permanent tail reward: 0.25 BUS.
+pub const TAIL_EMISSION: u64 = RAWCOIN / 4;
+/// Last block paid the initial reward; the tail starts at height 525,601.
+pub const TAIL_HEIGHT: u64 = 525_600;
+/// Total initial-reward issuance through [`TAIL_HEIGHT`], excluding fees.
+pub const TARGET_MINED: u64 = 13_140_000 * RAWCOIN;
 
 /// The block subsidy at `height`. Genesis pays nothing.
 pub fn subsidy(height: u32) -> RawCoin {
     if height == 0 {
         return RawCoin::ZERO;
     }
-    let completed_intervals = u64::from(height - 1) / EMISSION_INTERVAL;
-    let raw = if completed_intervals >= EMISSION_HALVINGS_TO_TAIL {
-        TAIL_BLOCK_EMISSION
+    let raw = if u64::from(height) > TAIL_HEIGHT {
+        TAIL_EMISSION
     } else {
-        BLOCK_EMISSION_START >> completed_intervals
+        INITIAL_EMISSION
     };
     RawCoin::from_raw(raw).unwrap_or(RawCoin::ZERO)
 }
@@ -162,17 +161,17 @@ mod tests {
     }
 
     #[test]
-    fn emission_reaches_the_permanent_tail_after_one_interval() {
+    fn emission_switches_to_the_tail_after_the_target_initial_issuance() {
         assert_eq!(subsidy(0), RawCoin::ZERO);
-        assert_eq!(subsidy(1).raw(), BLOCK_EMISSION_START);
-        assert_eq!(subsidy(150_000).raw(), BLOCK_EMISSION_START);
-        assert_eq!(BLOCK_EMISSION_START, 5_000_000_000);
-        assert_eq!(subsidy(150_001).raw(), 2_500_000_000);
-        assert_eq!(subsidy(1_050_000).raw(), 78_125_000);
-        assert_eq!(subsidy(1_050_001).raw(), 39_062_500);
-        assert_eq!(TAIL_BLOCK_EMISSION, 19_531_250);
-        assert_eq!(subsidy(1_200_000).raw(), 39_062_500);
-        assert_eq!(subsidy(1_200_001).raw(), TAIL_BLOCK_EMISSION);
-        assert_eq!(subsidy(u32::MAX).raw(), TAIL_BLOCK_EMISSION);
+        assert_eq!(INITIAL_EMISSION, 2_500_000_000);
+        assert_eq!(TAIL_EMISSION, 25_000_000);
+        assert_eq!(TAIL_HEIGHT, 525_600);
+        assert_eq!(TARGET_MINED, 1_314_000_000_000_000);
+        assert_eq!(INITIAL_EMISSION * TAIL_HEIGHT, TARGET_MINED);
+        assert_eq!(subsidy(1).raw(), INITIAL_EMISSION);
+        assert_eq!(subsidy(525_599).raw(), INITIAL_EMISSION);
+        assert_eq!(subsidy(525_600).raw(), INITIAL_EMISSION);
+        assert_eq!(subsidy(525_601).raw(), TAIL_EMISSION);
+        assert_eq!(subsidy(u32::MAX).raw(), TAIL_EMISSION);
     }
 }

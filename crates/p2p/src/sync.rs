@@ -71,6 +71,8 @@ struct Request {
     generation: u64,
     /// No response deadline until the stream writer completes the request.
     sent: Option<u64>,
+    /// Body is quarantined locally; network latency no longer applies.
+    received: bool,
 }
 
 /// Download state.
@@ -359,6 +361,7 @@ impl BlockSync {
                     peer,
                     generation,
                     sent: None,
+                    received: false,
                 },
             );
             requests.push(hash);
@@ -384,6 +387,7 @@ impl BlockSync {
                 if request.peer == peer
                     && request.generation == *generation
                     && request.sent.is_none()
+                    && !request.received
                 {
                     request.sent = Some(now);
                 }
@@ -394,6 +398,27 @@ impl BlockSync {
     /// Whether this block is still awaiting successful import.
     pub fn expects(&self, hash: &BlockHash) -> bool {
         self.in_flight.contains_key(hash)
+    }
+
+    /// Exact header validated before a body was requested.
+    pub fn requested_header(&self, hash: &BlockHash) -> Option<&BlockHeader> {
+        self.in_flight.get(hash).map(|request| &request.header)
+    }
+
+    /// Stops the network deadline only after the exact requested body header
+    /// was received. Import still must acknowledge the unresolved request.
+    pub fn body_received(&mut self, header: &BlockHeader) -> bool {
+        let hash = header.hash();
+        if self.requested_header(&hash) != Some(header) {
+            return false;
+        }
+        if !self.retry(&hash) {
+            return false;
+        }
+        if let Some(request) = self.in_flight.get_mut(&hash) {
+            request.received = true;
+        }
+        true
     }
 
     /// The peer responsible for a reserved or written body request.
@@ -415,12 +440,26 @@ impl BlockSync {
         self.request_generation = generation;
         request.generation = generation;
         request.sent = None;
+        request.received = false;
         true
     }
 
     /// Returns a missing body to the queue only if this peer owns its request.
     /// The caller excludes that peer before rescheduling to prevent retry loops.
     pub fn request_failed(&mut self, peer: u64, hash: &BlockHash) -> bool {
+        if self
+            .in_flight
+            .get(hash)
+            .is_some_and(|request| request.received)
+        {
+            return false;
+        }
+        self.requeue_download(peer, hash)
+    }
+
+    /// Requeues a body lost locally (quarantine eviction or I/O failure),
+    /// including one whose network transfer already completed.
+    pub fn requeue_download(&mut self, peer: u64, hash: &BlockHash) -> bool {
         if self.owner(hash) != Some(peer) {
             return false;
         }
@@ -441,7 +480,7 @@ impl BlockSync {
     pub fn peer_disconnected(&mut self, peer: u64) {
         let mut returned = Vec::new();
         self.in_flight.retain(|_, request| {
-            if request.peer == peer {
+            if request.peer == peer && !request.received {
                 returned.push(request.header.clone());
                 false
             } else {

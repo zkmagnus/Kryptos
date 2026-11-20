@@ -51,7 +51,7 @@ def check_equal(name, actual, expected):
 
 
 def main():
-    # Standard BIP39 vector, independent of Rhombus's empty-passphrase choice.
+    # Standard BIP39 vector, independent of Kryptos's empty-passphrase choice.
     check_equal("BIP39 TREZOR", bip39_seed("TREZOR"), BIP39_TREZOR_SEED)
     seed = bip39_seed("")
     check_equal("BIP39 empty passphrase", seed, EMPTY_PASSPHRASE_SEED)
@@ -67,7 +67,7 @@ def main():
     }
     for name, node in nodes.items():
         check_equal(name, node[:32], EXPECTED_KEYS[name])
-    print("Verified BIP39 references and five Rhombus derivation stages independently.")
+    print("Verified BIP39 references and five Kryptos derivation stages independently.")
 
 
 if __name__ == "__main__":

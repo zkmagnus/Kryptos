@@ -125,7 +125,7 @@ async fn the_wallet_daemon_serves_an_exchange() {
     .unwrap();
     let addr = daemon.addr;
     let t = token.expose();
-    let prefix = Network::Test.address_prefix();
+    let prefix = Network::Test.address_network();
     let payment_amount = 15_575u64;
 
     // It syncs and sees the coinbase coins from blocks 1 to 3.

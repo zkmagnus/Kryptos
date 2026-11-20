@@ -1,4 +1,4 @@
-//! The `Rhombus` command line.
+//! The `Kryptos` command line.
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::SocketAddr;
@@ -8,7 +8,7 @@ use chain::genesis::genesis;
 use clap::{Parser, Subcommand};
 use crypto::encoding::{from_hex, to_hex};
 use crypto::keys::SpendingKey;
-use protocol::address::RhombusAddress;
+use protocol::address::KryptosAddress;
 use protocol::amount::RawCoin;
 use protocol::block::{Block, BlockHash};
 use protocol::bytes::Encodable;
@@ -38,7 +38,7 @@ const PHRASE_ENV: &str = "SEED_PHRASE";
 
 /// The node daemon and wallet tools.
 #[derive(Parser, Debug)]
-#[command(name = "Rhombus", version)]
+#[command(name = "Kryptos", version)]
 pub struct Cli {
     /// What to do.
     #[command(subcommand)]
@@ -341,7 +341,7 @@ pub enum Command {
         /// Recipient address.
         #[arg(long)]
         to: String,
-        /// Rhombus in smallest units.
+        /// Kryptos in smallest units.
         #[arg(long)]
         amount: u64,
         /// The node.
@@ -528,7 +528,7 @@ async fn send(
     let mut client = endpoint.connect().await?;
     let genesis = fetch_genesis(&mut client).await?;
     let network = network_of(&genesis)?;
-    let recipient = RhombusAddress::decode(to, network.address_prefix())?;
+    let recipient = KryptosAddress::decode(to, network.address_network())?;
     let wallet = open_wallet(wallet, genesis)?;
     let params = network.params();
     let scanned = sync_wallet(&mut client, &wallet, light).await?;
@@ -550,7 +550,7 @@ async fn send(
     Ok(())
 }
 
-/// The chain directory for `Rhombus run`: the given one, the per-user
+/// The chain directory for `Kryptos run`: the given one, the per-user
 /// default. Directories are created owner-only.
 fn node_datadir(datadir: Option<PathBuf>, network: Network) -> Result<PathBuf> {
     let dir = match datadir {
@@ -563,7 +563,7 @@ fn node_datadir(datadir: Option<PathBuf>, network: Network) -> Result<PathBuf> {
 
 /// Starts a node and runs it until interrupted.
 #[allow(clippy::too_many_arguments)] // mirrors the command line options
-/// The options `Rhombus run` was given.
+/// The options `Kryptos run` was given.
 struct RunOptions {
     network: Network,
     datadir: PathBuf,
@@ -609,7 +609,7 @@ async fn run_node(opts: RunOptions) -> Result<()> {
         blocknotify,
     } = opts;
     let mine_to = mine
-        .map(|a| RhombusAddress::decode(&a, network.address_prefix()))
+        .map(|a| KryptosAddress::decode(&a, network.address_network()))
         .transpose()?;
     let token_file = datadir.join(TOKEN_FILE);
     let token_given = rpc_token.is_some();
@@ -640,7 +640,7 @@ async fn run_node(opts: RunOptions) -> Result<()> {
     let shutdown = Shutdown::listen()?;
     let handle = crate::node::spawn(config).await?;
     let log = crate::node::log;
-    log(&format!("Rhombus up on the {network} network"));
+    log(&format!("Kryptos up on the {network} network"));
     if bootstrap_mining {
         crate::logging::warn("bootstrap mining enabled: may create a separate chain without peers");
     } else {
@@ -680,7 +680,7 @@ pub async fn pay(
     client: &mut Client,
     wallet: &Wallet,
     pk: &ProvingKey,
-    recipient: RhombusAddress,
+    recipient: KryptosAddress,
     amount: RawCoin,
     branch: BranchId,
 ) -> Result<String> {
@@ -744,7 +744,7 @@ fn create_wallet(
     match receiving {
         Some((index, address)) => {
             println!("address_index: {index}");
-            println!("address: {}", address.encode(network.address_prefix()));
+            println!("address: {}", address.encode(network.address_network()));
         }
         None => println!(
             "address_rotation_exhausted: true; use another account or wallet for new addresses"
@@ -763,7 +763,7 @@ fn backup_wallet(wallet: &WalletArgs, out: &Path, network: Network) -> Result<()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let mut file = tempfile::Builder::new()
-        .prefix(".rhombus-wallet-backup-")
+        .prefix(".kryptos-wallet-backup-")
         .tempfile_in(parent)?;
     file.write_all(&bytes)?;
     file.as_file().sync_all()?;
@@ -789,7 +789,7 @@ fn keygen(network: Network) -> Result<()> {
     println!("spending_key: {}", to_hex(&keys.spending_key().to_bytes()));
     println!(
         "address: {}",
-        keys.default_address()?.encode(network.address_prefix())
+        keys.default_address()?.encode(network.address_network())
     );
     Ok(())
 }
@@ -803,7 +803,7 @@ fn show_address(wallet: &WalletArgs, network: Network) -> Result<()> {
             "address rotation exhausted; use another account or wallet for new addresses".into(),
         )
     })?;
-    println!("{}", address.encode(network.address_prefix()));
+    println!("{}", address.encode(network.address_network()));
     Ok(())
 }
 
@@ -998,7 +998,7 @@ mod tests {
 
     #[test]
     fn restore_requires_an_explicit_bounded_address_range() {
-        let base = ["rhombus", "create", "--wallet", "unused.redb", "--phrase"];
+        let base = ["kryptos", "create", "--wallet", "unused.redb", "--phrase"];
         assert!(Cli::try_parse_from(base).is_err());
         for bound in ["0", "4095"] {
             assert!(
@@ -1011,7 +1011,7 @@ mod tests {
             );
         }
         assert!(Cli::try_parse_from([
-            "rhombus",
+            "kryptos",
             "create",
             "--wallet",
             "unused.redb",
@@ -1025,7 +1025,7 @@ mod tests {
     fn receive_rotation_command_requires_an_explicit_boolean() {
         for value in ["true", "false"] {
             assert!(Cli::try_parse_from([
-                "rhombus",
+                "kryptos",
                 "set-receive-rotation",
                 "--wallet",
                 "wallet.redb",
@@ -1035,7 +1035,7 @@ mod tests {
             .is_ok());
         }
         assert!(Cli::try_parse_from([
-            "rhombus",
+            "kryptos",
             "set-receive-rotation",
             "--wallet",
             "wallet.redb",
@@ -1188,11 +1188,11 @@ mod tests {
             "--tor-binary",
             "--tor-external",
         ] {
-            assert!(Cli::try_parse_from(["Rhombus", "run", flag, "127.0.0.1:9050"]).is_err());
+            assert!(Cli::try_parse_from(["kryptos", "run", flag, "127.0.0.1:9050"]).is_err());
         }
         let target = p2p::address::NetAddr::TorV3([9; 32]).endpoint(19000);
         let cli = Cli::try_parse_from([
-            "Rhombus",
+            "kryptos",
             "run",
             "--addnode",
             &target,
@@ -1217,13 +1217,13 @@ mod tests {
         assert_eq!(addnode.len(), 2);
         assert_eq!(max_outbound, 8);
         assert_eq!(p2p_port, crate::config::DEFAULT_P2P_PORT);
-        assert!(Cli::try_parse_from(["Rhombus", "status"]).is_err());
+        assert!(Cli::try_parse_from(["kryptos", "status"]).is_err());
     }
 
     #[test]
     fn tor_deadlines_and_circuit_settings_are_configurable() {
         let cli = Cli::try_parse_from([
-            "Rhombus",
+            "kryptos",
             "run",
             "--connect-timeout",
             "45",
@@ -1339,12 +1339,12 @@ mod tests {
     #[test]
     fn every_command_defaults_to_the_main_network() {
         for argv in [
-            &["Rhombus", "run"][..],
-            &["Rhombus", "keygen"],
-            &["Rhombus", "create", "--wallet", "w"],
-            &["Rhombus", "address", "--wallet", "w"],
+            &["kryptos", "run"][..],
+            &["kryptos", "keygen"],
+            &["kryptos", "create", "--wallet", "w"],
+            &["kryptos", "address", "--wallet", "w"],
             &[
-                "Rhombus",
+                "kryptos",
                 "backupwallet",
                 "--wallet",
                 "w",
@@ -1352,7 +1352,7 @@ mod tests {
                 "backup.json",
             ],
             &[
-                "Rhombus",
+                "kryptos",
                 "restorewallet",
                 "--backup",
                 "backup.json",
@@ -1367,7 +1367,7 @@ mod tests {
                 "{argv:?}"
             );
         }
-        let explicit = Cli::try_parse_from(["Rhombus", "keygen", "--network", "test"]).unwrap();
+        let explicit = Cli::try_parse_from(["kryptos", "keygen", "--network", "test"]).unwrap();
         assert_eq!(network_of_command(&explicit.command), Some(Network::Test));
     }
 }

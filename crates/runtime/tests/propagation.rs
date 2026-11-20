@@ -14,7 +14,7 @@ use chain::pow::RandomXPow;
 use crypto::keys::SpendingKey;
 use p2p::address::NetAddr;
 use p2p::transport::{self, Incoming, Stream, TorNetwork};
-use protocol::address::RhombusAddress;
+use protocol::address::KryptosAddress;
 use protocol::block::Block;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
@@ -104,7 +104,7 @@ async fn submit(node: &Handle, block: Block) -> Submission {
 async fn solve(
     template: Template,
     key: Arc<ProvingKey>,
-    payout: RhombusAddress,
+    payout: KryptosAddress,
     seed: u64,
 ) -> Block {
     tokio::task::spawn_blocking(move || {
@@ -118,7 +118,7 @@ async fn solve(
     .unwrap()
 }
 
-fn payout() -> RhombusAddress {
+fn payout() -> KryptosAddress {
     let mut rng = ChaCha20Rng::seed_from_u64(902);
     WalletKeys::from_spending_key(SpendingKey::random(&mut rng))
         .unwrap()
@@ -290,7 +290,7 @@ async fn delayed_three_node_relay_reports_timings() {
         "PROPAGATION_REPORT {}",
         serde_json::to_string(&report).unwrap()
     );
-    if let Ok(path) = std::env::var("RHOMBUS_PROPAGATION_REPORT") {
+    if let Ok(path) = std::env::var("KRYPTOS_PROPAGATION_REPORT") {
         std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
     }
     third.shutdown().await;
@@ -420,7 +420,7 @@ async fn public_tor_two_node_relay_reports_timings() {
     .expect("application handshake over public Tor");
     let key = proving_key().await;
     let payout = payout();
-    let samples: usize = std::env::var("RHOMBUS_PROPAGATION_SAMPLES").map_or(SAMPLES, |value| {
+    let samples: usize = std::env::var("KRYPTOS_PROPAGATION_SAMPLES").map_or(SAMPLES, |value| {
         value.parse().expect("sample count must be an integer")
     });
     assert!((1..=100).contains(&samples), "use 1..=100 samples per run");
@@ -459,7 +459,7 @@ async fn public_tor_two_node_relay_reports_timings() {
         "PROPAGATION_REPORT {}",
         serde_json::to_string(&report).unwrap()
     );
-    if let Ok(path) = std::env::var("RHOMBUS_PROPAGATION_REPORT") {
+    if let Ok(path) = std::env::var("KRYPTOS_PROPAGATION_REPORT") {
         std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
     }
     second.shutdown().await;

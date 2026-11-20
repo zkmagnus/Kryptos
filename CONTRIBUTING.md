@@ -1,6 +1,6 @@
-# Contributing to Rhombus
+# Contributing to Kryptos
 
-Rhombus is experimental privacy-focused consensus software. Contributions
+Kryptos is experimental privacy-focused consensus software. Contributions
 that change transaction validity, cryptographic relations, state effects, or
 network compatibility need extra protocol review.
 

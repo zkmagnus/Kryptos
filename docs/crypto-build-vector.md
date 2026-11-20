@@ -5,7 +5,7 @@ transaction encoding, circuit, verifier, genesis or consensus parameter is
 changed by this correction.
 
 Commit `7a97c456` changed `crates/crypto/src/curve.rs` from `null:Generator` and
-`null:DiversifiedBase` to `rhombus:Generator` and `rhombus:DiversifiedBase`.
+`null:DiversifiedBase` to `kryptos:Generator` and `kryptos:DiversifiedBase`.
 The generator tables and proof vectors were already updated as described in
 [circuit.md](circuit.md) and [implementation-notes.md](implementation-notes.md).
 The aggregate digest expected by `crypto/tests/build_consistency.rs` still

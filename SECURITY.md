@@ -1,6 +1,6 @@
 # Security policy
 
-Rhombus is experimental consensus and wallet software. There is no supported
+Kryptos is experimental consensus and wallet software. There is no supported
 production release or guarantee of compatibility between development revisions.
 Use the exact revision agreed by your test-network operators. Passing CI is not
 an independent security audit.
@@ -9,7 +9,7 @@ an independent security audit.
 
 For this repository, use GitHub's private vulnerability report form:
 
-<https://github.com/zkmagnus/Rhombus/security/advisories/new>
+<https://github.com/zkmagnus/Kryptos/security/advisories/new>
 
 The form works only after repository maintainers enable **Private vulnerability
 reporting** in GitHub's security settings. That hosting setting is separate from

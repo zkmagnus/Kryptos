@@ -50,11 +50,13 @@ already pads to an allowed action class whose minimum is two actions.
 
 ## Emission schedule
 
-- The first non-genesis block pays 50 oriul (`5,000,000,000` raw units).
-- Subsidy halves every 150,000 blocks: block 150,001 pays 25 oriul, and
-  block 1,050,001 pays 0.390625 oriul.
-- At block 1,200,001 the subsidy reaches the permanent tail of 0.1953125
-  oriul (`19,531,250` raw units).
+- The first non-genesis block pays 25 BUS (`2,500,000,000` raw units).
+- Blocks 1 through 525,600 inclusive pay the initial reward. At a nominal
+  120-second block interval and 365 days per year, that is 720 blocks per day,
+  262,800 per year, and two nominal years.
+- The initial-reward issuance is 13,140,000 BUS (`1,314,000,000,000,000` raw
+  units). The permanent tail begins at height 525,601 and pays 0.25 BUS
+  (`25,000,000` raw units) per block.
 - Genesis pays no subsidy. Transfer fees are added to the coinbase mint and
   do not increase scheduled issuance.
 
@@ -77,8 +79,8 @@ already pads to an allowed action class whose minimum is two actions.
   submission plumbing.
 - `crates/chain/src/validate.rs` and `mempool.rs`: native transaction checks
   and direct action effects, with no SystemCall dispatcher.
-- `crates/protocol/src/consensus.rs`: 50 oriul initial subsidy, 150,000-block
-  halving interval, and 0.1953125 oriul tail.
+- `crates/protocol/src/consensus.rs`: 25 BUS initial subsidy through height
+  525,600 and 0.25 BUS tail from height 525,601.
 - Chain tests were adjusted to treat fees as public transaction fields.
 
 Changing `FEE_PER_BYTE` changes consensus and requires a coordinated protocol

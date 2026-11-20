@@ -1,4 +1,4 @@
-# Building Rhombus
+# Building Kryptos
 
 This guide covers building the node, wallet tools, and tests from this repository.
 Run commands from the repository root, the directory containing `Cargo.toml`,
@@ -129,6 +129,11 @@ the commands here also prepare an offline fuzzing environment.
 
 ## 4. Build release binaries
 
+One release build produces the node and wallet CLI (`Kryptos`), the wallet daemon
+(`wallet`), and the local scanner (`rhomscan`). The commands below select all three
+with `-p runtime --bins`. The same `wallet` executable can run in a terminal or
+under a service manager; choose how to start it after building.
+
 Choose one of the following CPU configurations. Two Cargo build jobs are a useful
 starting point for limiting simultaneous compiler processes; reduce this to one
 if memory is tight.
@@ -180,7 +185,7 @@ link can take time and memory even with a low Cargo job count.
 
 | Binary | Default release path | Purpose |
 | --- | --- | --- |
-| `rhombus` | `target/release/rhombus` | Node and wallet command-line interface |
+| `Kryptos` | `target/release/Kryptos` | Node and wallet command-line interface |
 | `wallet` | `target/release/wallet` | Wallet RPC daemon |
 | `rhomscan` | `target/release/rhomscan` | Scan a local chain database into a wallet |
 
@@ -190,23 +195,76 @@ Windows adds `.exe`. An explicit `--target` adds the target triple beneath
 Check that the binaries start without opening a node or modifying a wallet:
 
 ```sh
-./target/release/rhombus --help
+./target/release/Kryptos --help
 ./target/release/wallet --help
 ./target/release/rhomscan --help
 ```
 
-To build only the node/CLI executable:
+If you only need the node/CLI executable, select it with `--bin Kryptos`:
 
 ```sh
-CARGO_BUILD_JOBS=2 cargo build --release --locked --offline -p runtime --bin rhombus
+CARGO_BUILD_JOBS=2 cargo build --release --locked --offline -p runtime --bin Kryptos
 ```
 
 For running nodes, choosing onion peers, creating wallets, and recovery, follow
 the [operations guide](docs/operations.md). Built-in seed lists are empty, so a
-successful build alone does not connect a node to an existing Rhombus network.
+successful build alone does not connect a node to an existing Kryptos network.
 
 Keep production builds on the default features used above. `--all-features`
 enables P2P `test-support`, which is intended for fixtures.
+
+### Start the wallet daemon
+
+Start the wallet daemon separately from `Kryptos run`. For manual use, either
+run individual `Kryptos` wallet commands or start `wallet` in a terminal using
+the [wallet daemon example](docs/operations.md#wallet-daemon).
+
+For automatic startup on Linux with systemd, first verify that the foreground
+example works with your wallet and node, then stop it. Install the same binary
+to a stable path as your normal user:
+
+```sh
+install -Dm755 target/release/wallet "$HOME/.local/bin/Kryptos-wallet"
+mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+```
+
+Save the following as `Kryptos-wallet.service` in that `systemd/user` directory.
+This example uses testnet. Set `--network` to match your wallet and node, replace
+the example `.onion` hostname and port with the node's control RPC endpoint, and
+adjust the wallet and token file paths. `%h` expands to your home directory. Give
+the wallet daemon its own `--datadir` for Tor state.
+
+```ini
+[Unit]
+Description=Kryptos wallet daemon
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/Kryptos-wallet --network test \
+    --wallet %h/Kryptos-data/wallet.redb \
+    --node REPLACE_WITH_V3_HOSTNAME.onion:18444 \
+    --node-token-file %h/Kryptos-data/node-a/rpc.token \
+    --datadir %h/Kryptos-data/wallet-daemon --listen 127.0.0.1:18447
+Restart=on-failure
+RestartSec=15s
+
+[Install]
+WantedBy=default.target
+```
+
+Enable the service to start now and on future logins through the
+[systemd user service manager](https://www.freedesktop.org/software/systemd/man/latest/systemd.special.html):
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now Kryptos-wallet.service
+systemctl --user status Kryptos-wallet.service
+```
+
+Use Wallet RPC for balance, addresses, and sends while the service owns the
+wallet database. To use a CLI command that opens the same `wallet.redb` directly,
+stop the service with `systemctl --user stop Kryptos-wallet.service` first, then
+start it again when done.
 
 ## 5. Development checks and tests
 
@@ -298,14 +356,14 @@ workspace: it also includes measurements and a table-generation utility.
 With Docker Engine, Buildx, and Compose available, build from the repository root:
 
 ```sh
-sudo docker build --tag rhombus:local .
-sudo docker run --rm rhombus:local --help
+sudo docker build --tag Kryptos:local .
+sudo docker run --rm Kryptos:local --help
 ```
 
 Omit `sudo` if your Docker setup already allows access as your normal user. The
-Dockerfile builds a portable release `rhombus` executable in a Rust 1.100.0 builder
+Dockerfile builds a portable release `Kryptos` executable in a Rust 1.100.0 builder
 and copies it into a Debian Bookworm runtime image with its runtime libraries.
-Of the workspace executables, the image packages only `rhombus`; the separate `wallet` and `rhomscan` binaries are not packaged.
+Of the workspace executables, the image packages only `Kryptos`; the separate `wallet` and `rhomscan` binaries are not packaged.
 
 Docker needs network access for base images and `apt` packages unless these are
 provided locally. Only the Cargo dependency build inside the image is offline.

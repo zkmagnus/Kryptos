@@ -17,7 +17,7 @@ use transaction_circuit::{ActionWitness, CoinWitness, SpendWitness};
 use transaction_proof::{ActionProofEnvelope, ProvingKey};
 
 use crate::action::{Action, ActionBody};
-use crate::address::RhombusAddress;
+use crate::address::KryptosAddress;
 use crate::amount::{RawCoin, ValueSum};
 use crate::coin::{Coin, RandomSeed, Rho};
 use crate::consensus::action_class_for;
@@ -73,13 +73,13 @@ impl SpendInfo {
 /// A coin to create.
 #[derive(Clone, Debug)]
 pub struct OutputInfo {
-    recipient: RhombusAddress,
+    recipient: KryptosAddress,
     value: RawCoin,
 }
 
 impl OutputInfo {
     /// A real output encrypted for its recipient.
-    pub fn new(recipient: RhombusAddress, value: RawCoin) -> Self {
+    pub fn new(recipient: KryptosAddress, value: RawCoin) -> Self {
         Self { recipient, value }
     }
 
@@ -101,9 +101,9 @@ impl OutputInfo {
 fn random_address(
     sk: &SpendingKey,
     rng: &mut (impl RngCore + CryptoRng),
-) -> Result<RhombusAddress> {
+) -> Result<KryptosAddress> {
     let fvk = FullViewingKey::derive(sk)?;
-    RhombusAddress::derive(&fvk, Diversifier::random(rng))
+    KryptosAddress::derive(&fvk, Diversifier::random(rng))
 }
 
 /// Collects spends and outputs, then builds the transaction.
@@ -406,7 +406,7 @@ fn shuffle<T>(items: &mut [T], rng: &mut (impl RngCore + CryptoRng)) {
 
 #[cfg(test)]
 mod tests {
-    use crate::address::RhombusAddress as Address;
+    use crate::address::KryptosAddress as Address;
     use crate::amount::RawCoin;
     /// The branch every test transaction is signed for.
     const BRANCH: BranchId = BranchId::new(1);

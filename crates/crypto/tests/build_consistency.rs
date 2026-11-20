@@ -60,7 +60,7 @@ fn deterministic_crypto_build_vector() -> crypto::Result<()> {
     );
     let message = blake2b_short(
         TXID,
-        &[b"Rhombus build consistency", &commitment.to_bytes()],
+        &[b"Kryptos build consistency", &commitment.to_bytes()],
     );
     let ask = SpendAuthorizingKey::derive(spending_key)?;
     let randomizer = SpendAuthRandomizer::from_scalar(pallas::Scalar::from(23u64));

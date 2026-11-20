@@ -32,6 +32,7 @@ mod error;
 pub mod message;
 pub mod peer;
 mod random;
+pub mod snapshot;
 pub mod sync;
 pub mod transport;
 

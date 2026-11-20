@@ -9,10 +9,10 @@ cargo test -p runtime --test propagation delayed_three_node_relay_reports_timing
 To save the JSON report and evaluate it:
 
 ```sh
-RHOMBUS_PROPAGATION_REPORT=/tmp/rhombus-propagation.json \
+KRYPTOS_PROPAGATION_REPORT=/tmp/kryptos-propagation.json \
   cargo test -p runtime --test propagation delayed_three_node_relay_reports_timings \
   --locked --offline -- --nocapture
-python3 scripts/evaluate_block_interval.py /tmp/rhombus-propagation.json
+python3 scripts/evaluate_block_interval.py /tmp/kryptos-propagation.json
 ```
 
 The test builds a three-node `A -> B -> C` path over the memory transport and delays each application frame by 75 ms in each direction. It measures time from source block submission to the follower's accepted tip with a monotonic process clock. The report includes p50, p90, and p95 samples and records that the transport is synthetic. It does not claim public-Tor latency, majority-hashrate propagation, or stale rate under contention.
@@ -20,8 +20,8 @@ The test builds a three-node `A -> B -> C` path over the memory transport and de
 An ignored test can collect a small public-Tor result after two onion services bootstrap:
 
 ```sh
-RHOMBUS_PROPAGATION_SAMPLES=20 \
-RHOMBUS_PROPAGATION_REPORT=/tmp/rhombus-public-tor.json \
+KRYPTOS_PROPAGATION_SAMPLES=20 \
+KRYPTOS_PROPAGATION_REPORT=/tmp/kryptos-public-tor.json \
   cargo test -p runtime --test propagation public_tor_two_node_relay_reports_timings \
   --locked --offline -- --ignored --nocapture
 ```

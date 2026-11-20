@@ -58,6 +58,8 @@ fn blocks() -> &'static [Block; 5] {
                 recent: recent_headers(chain.store(), parent.height, header_lookback(&params))
                     .unwrap(),
                 tree: chain.store().tree().unwrap(),
+                nullifier_store: Some(chain.store().clone()),
+                chain_id: *chain.chain_id(),
                 transactions: Vec::new(),
                 params,
                 now: parent.timestamp.saturating_add(params.block_interval),

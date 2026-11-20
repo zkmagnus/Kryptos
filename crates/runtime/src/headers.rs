@@ -7,8 +7,9 @@ use std::path::Path;
 use chain::chain::Chain;
 use chain::target::ChainWork;
 use chain::validate::{branch_headers, header_lookback, Validator};
-use protocol::block::{BlockHeader, HEADER_LEN};
+use protocol::block::{header_len_for_version, BlockHeader};
 use protocol::bytes::Encodable;
+use protocol::header_tree::HeaderFrontier;
 
 use crate::Result;
 
@@ -17,6 +18,8 @@ use crate::Result;
 pub(crate) struct SyncHeaders {
     recent: Vec<BlockHeader>,
     work: Option<ChainWork>,
+    /// Header-tree frontier through the last verified candidate header.
+    header_frontier: Option<HeaderFrontier>,
     /// Headers below this fixed release checkpoint are only hash-linked so
     /// far: their calculated work must not authorize body downloads yet.
     pending_checkpoint: Option<chain::params::Checkpoint>,
@@ -53,9 +56,10 @@ impl SyncHeaders {
         file.seek(SeekFrom::Start(self.write_offset))?;
         let mut next_offset = self.write_offset;
         for header in headers {
-            file.write_all(&header.to_vec())?;
+            let bytes = header.to_vec();
+            file.write_all(&bytes)?;
             next_offset = next_offset
-                .checked_add(HEADER_LEN as u64)
+                .checked_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
                 .ok_or_else(|| std::io::Error::other("header spool offset overflow"))?;
         }
         self.write_offset = next_offset;
@@ -90,11 +94,20 @@ impl SyncHeaders {
         let mut next_offset = self.read_offset;
         let mut headers = Vec::new();
         while next_offset < self.write_offset && headers.len() < limit {
-            let mut bytes = [0; HEADER_LEN];
-            file.read_exact(&mut bytes)?;
+            let mut version = [0u8; 1];
+            file.read_exact(&mut version)?;
+            let len = header_len_for_version(version[0])
+                .ok_or(p2p::Error::BadHeaders("unknown header version"))?;
+            let mut bytes = vec![0; len];
+            bytes[0] = version[0];
+            file.read_exact(
+                bytes
+                    .get_mut(1..)
+                    .ok_or_else(|| std::io::Error::other("invalid header length"))?,
+            )?;
             headers.push(BlockHeader::from_slice(&bytes)?);
             next_offset = next_offset
-                .checked_add(HEADER_LEN as u64)
+                .checked_add(u64::try_from(len).unwrap_or(u64::MAX))
                 .ok_or_else(|| std::io::Error::other("header spool offset overflow"))?;
         }
         self.read_offset = next_offset;
@@ -124,8 +137,16 @@ impl SyncHeaders {
         }
         let params = chain.params();
         let lookback = header_lookback(params);
-        let (mut recent, mut work) = if let Some(work) = self.work {
-            (self.recent.clone(), work)
+        let (mut recent, mut work, mut history) = if let Some(work) = self.work {
+            (
+                self.recent.clone(),
+                work,
+                self.header_frontier
+                    .clone()
+                    .ok_or(chain::Error::InvalidHeader(
+                        "candidate header frontier missing",
+                    ))?,
+            )
         } else {
             let parent = chain
                 .store()
@@ -134,6 +155,9 @@ impl SyncHeaders {
             (
                 branch_headers(chain.store(), &parent, lookback)?,
                 chain.chainwork(&first.prev_hash)?,
+                chain.store().header_frontier(&first.prev_hash)?.ok_or(
+                    chain::Error::InvalidHeader("parent header frontier missing"),
+                )?,
             )
         };
         let mut pending_checkpoint = self.pending_checkpoint;
@@ -158,7 +182,7 @@ impl SyncHeaders {
                 return Err(chain::Error::InvalidHeader("header chain gap").into());
             }
             if let Some(checkpoint) = params.checkpoint_at(header.height) {
-                if header.hash() != checkpoint.hash {
+                if header.hash() != checkpoint.hash || header.state_root != checkpoint.state_root {
                     return Err(chain::Error::InvalidHeader("conflicts with a checkpoint").into());
                 }
             }
@@ -171,14 +195,27 @@ impl SyncHeaders {
             params,
             pow: chain.pow(),
             vk: chain.verifying_key(),
+            chain_id: chain.chain_id(),
             now,
         };
         for header in headers {
             let target = validator.check_header_rules(header, &recent)?;
+            if history.count() != u64::from(header.height)
+                || history.tip_hash() != Some(header.prev_hash)
+                || header.history_root != history.root()
+            {
+                return Err(chain::Error::InvalidHeader("header history root mismatch").into());
+            }
+            history.append(header)?;
             if checkpoint_height.is_none_or(|height| header.height > height) {
                 chain.pow().check(header)?;
             }
             work = work.checked_add(target.work()?)?;
+            if let Some(checkpoint) = params.checkpoint_at(header.height) {
+                if work != checkpoint.work {
+                    return Err(chain::Error::InvalidHeader("conflicts with a checkpoint").into());
+                }
+            }
             recent.push(header.clone());
             if recent.len() > lookback {
                 recent.remove(0);
@@ -186,6 +223,7 @@ impl SyncHeaders {
         }
         self.recent = recent;
         self.work = Some(work);
+        self.header_frontier = Some(history);
         self.pending_checkpoint = pending_checkpoint;
         Ok(work)
     }
@@ -197,12 +235,18 @@ mod tests {
     use chain::params::{ChainParams, Checkpoint};
     use chain::target::Target;
     use protocol::block::empty_header;
+    use protocol::transaction::Anchor;
     use storage::store::Store;
     use transaction_proof::VerifyingKey;
 
     use super::*;
 
-    fn child(parent: &BlockHeader, params: &ChainParams) -> BlockHeader {
+    fn child(
+        parent: &BlockHeader,
+        params: &ChainParams,
+        history: &mut HeaderFrontier,
+    ) -> BlockHeader {
+        history.append(parent).unwrap();
         let mut header = empty_header(
             parent.height.saturating_add(1),
             parent.hash(),
@@ -210,7 +254,14 @@ mod tests {
         );
         header.timestamp = parent.timestamp.saturating_add(params.block_interval);
         header.target = params.pow_limit.to_compact();
+        header.history_root = history.root();
         header
+    }
+
+    fn expected_work(params: &ChainParams, height: u32) -> ChainWork {
+        (0..height).fold(ChainWork::ZERO, |work, _| {
+            work.checked_add(params.pow_limit.work().unwrap()).unwrap()
+        })
     }
 
     fn make_chain(dir: &std::path::Path, params: ChainParams) -> Chain {
@@ -226,11 +277,14 @@ mod tests {
     fn wrong_difficulty_is_rejected_even_when_anchored_at_a_checkpoint() {
         let mut params = ChainParams::test();
         let genesis = genesis(&params);
-        let mut header = child(genesis.header(), &params);
+        let mut history = HeaderFrontier::empty();
+        let mut header = child(genesis.header(), &params, &mut history);
         header.target = Target::from_compact(0x200f_ffff).unwrap().to_compact();
         params.checkpoints = Box::leak(Box::new([Checkpoint {
             height: 1,
             hash: header.hash(),
+            work: expected_work(&params, 1),
+            state_root: Anchor::from_base(crypto::pallas::Base::zero()),
         }]));
         let dir = tempfile::tempdir().unwrap();
         let chain = make_chain(dir.path(), params);
@@ -246,14 +300,44 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_cannot_authorize_an_inconsistent_header_history_root() {
+        let mut params = ChainParams::test();
+        let genesis = genesis(&params);
+        let mut history = HeaderFrontier::empty();
+        let mut header = child(genesis.header(), &params, &mut history);
+        header.history_root[0] ^= 1;
+        params.checkpoints = Box::leak(Box::new([Checkpoint {
+            height: 1,
+            hash: header.hash(),
+            work: expected_work(&params, 1),
+            state_root: header.state_root,
+        }]));
+        let dir = tempfile::tempdir().unwrap();
+        let chain = make_chain(dir.path(), params);
+        let mut state = SyncHeaders::default();
+        assert!(matches!(
+            state.verify(&chain, &[header], u64::MAX),
+            Err(crate::Error::Chain(chain::Error::InvalidHeader(
+                "header history root mismatch"
+            )))
+        ));
+        assert!(state.work.is_none());
+        assert!(state.header_frontier.is_none());
+        assert!(state.recent.is_empty());
+    }
+
+    #[test]
     fn checkpoint_authenticates_ancestry_but_rejected_batch_cannot_advance_state() {
         let mut params = ChainParams::test();
         let genesis = genesis(&params);
-        let first = child(genesis.header(), &params);
-        let second = child(&first, &params);
+        let mut history = HeaderFrontier::empty();
+        let first = child(genesis.header(), &params, &mut history);
+        let second = child(&first, &params, &mut history);
         params.checkpoints = Box::leak(Box::new([Checkpoint {
             height: 2,
             hash: second.hash(),
+            work: expected_work(&params, 2),
+            state_root: Anchor::from_base(crypto::pallas::Base::zero()),
         }]));
         let dir = tempfile::tempdir().unwrap();
         let chain = make_chain(dir.path(), params);
@@ -274,6 +358,9 @@ mod tests {
         let single = params.pow_limit.work().unwrap();
         assert_eq!(work, single.checked_add(single).unwrap());
         assert_eq!(state.recent.last(), Some(&second));
+        let frontier = state.header_frontier.as_ref().unwrap();
+        assert_eq!(frontier.count(), 3);
+        assert_eq!(frontier.tip_hash(), Some(second.hash()));
         assert_eq!(state.verify(&chain, &[], u64::MAX).unwrap(), work);
     }
 
@@ -281,18 +368,23 @@ mod tests {
     fn verified_ancestry_and_work_continue_across_responses() {
         let mut params = ChainParams::test();
         let genesis = genesis(&params);
-        let first = child(genesis.header(), &params);
-        let second = child(&first, &params);
-        let third = child(&second, &params);
-        let fourth = child(&third, &params);
+        let mut history = HeaderFrontier::empty();
+        let first = child(genesis.header(), &params, &mut history);
+        let second = child(&first, &params, &mut history);
+        let third = child(&second, &params, &mut history);
+        let fourth = child(&third, &params, &mut history);
         params.checkpoints = Box::leak(Box::new([
             Checkpoint {
                 height: 2,
                 hash: second.hash(),
+                work: expected_work(&params, 2),
+                state_root: Anchor::from_base(crypto::pallas::Base::zero()),
             },
             Checkpoint {
                 height: 4,
                 hash: fourth.hash(),
+                work: expected_work(&params, 4),
+                state_root: Anchor::from_base(crypto::pallas::Base::zero()),
             },
         ]));
         let dir = tempfile::tempdir().unwrap();
@@ -320,10 +412,11 @@ mod tests {
     fn deferred_headers_exceed_memory_window_and_drain_in_order() {
         let params = ChainParams::test();
         let mut parent = genesis(&params).header().clone();
+        let mut history = HeaderFrontier::empty();
         let mut all = Vec::new();
         let count = p2p::sync::MAX_QUEUED_HEADERS.saturating_add(10);
         for _ in 0..count {
-            parent = child(&parent, &params);
+            parent = child(&parent, &params, &mut history);
             all.push(parent.clone());
         }
         let dir = tempfile::tempdir().unwrap();
@@ -353,11 +446,14 @@ mod tests {
     fn incomplete_checkpoint_prefix_never_becomes_authenticated() {
         let mut params = ChainParams::test();
         let genesis = genesis(&params);
-        let first = child(genesis.header(), &params);
-        let second = child(&first, &params);
+        let mut history = HeaderFrontier::empty();
+        let first = child(genesis.header(), &params, &mut history);
+        let second = child(&first, &params, &mut history);
         params.checkpoints = Box::leak(Box::new([Checkpoint {
             height: 2,
             hash: second.hash(),
+            work: expected_work(&params, 2),
+            state_root: Anchor::from_base(crypto::pallas::Base::zero()),
         }]));
         let dir = tempfile::tempdir().unwrap();
         let chain = make_chain(dir.path(), params);
