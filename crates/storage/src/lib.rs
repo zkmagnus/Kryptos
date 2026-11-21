@@ -4,13 +4,15 @@
 //!
 //! - [`tree`]: the commitment tree frontier and its encoding.
 //! - [`store`]: the database, its tables, and atomic apply and revert.
+#![deny(clippy::arithmetic_side_effects)]
 #![cfg_attr(
     test,
     allow(
         clippy::unwrap_used,
         clippy::expect_used,
         clippy::panic,
-        clippy::indexing_slicing
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
     )
 )]
 

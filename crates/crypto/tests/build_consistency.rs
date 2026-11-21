@@ -90,13 +90,12 @@ fn deterministic_crypto_build_vector() -> crypto::Result<()> {
         ],
     );
     eprintln!("crypto build vector: {}", to_hex(&digest));
-    // The generator-domain migration in 7a97c456 changed the commitments and
-    // signatures in this vector. Restoring just the two old curve domains in
-    // an isolated source copy reproduces the former 94d44403... value; see
-    // docs/crypto-build-vector.md. Production derivation is unchanged here.
+    // The Kryptos rename in 97e66eba changed both curve domains and the
+    // synthetic message above. An isolated copy restoring those three strings
+    // reproduces the previous e1081cf1... vector; see docs/crypto-build-vector.md.
     assert_eq!(
         to_hex(&digest),
-        "e1081cf184e5f362183188e288ffcf789ac426b22059076f062b58d3f4f37eaf",
+        "913080149e20a8cfee83882726b90abb661c4ebbd6a710f60d9790c548da3de1",
         "canonical crypto outputs changed between builds",
     );
     Ok(())

@@ -40,6 +40,17 @@ mod tests {
     }
 
     #[test]
+    fn configured_genesis_checkpoints_match_generated_blocks() {
+        for params in [ChainParams::mainnet(), ChainParams::test()] {
+            if let Some(checkpoint) = params.checkpoint_at(0) {
+                let block = genesis(&params);
+                assert_eq!(checkpoint.hash, block.hash(), "stale genesis checkpoint");
+                assert!(checkpoint.matches(block.header(), crate::target::ChainWork::ZERO));
+            }
+        }
+    }
+
+    #[test]
     fn networks_have_different_genesis_blocks() {
         assert_ne!(
             genesis(&ChainParams::mainnet()).hash(),

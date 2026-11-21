@@ -178,7 +178,7 @@ impl KryptosAddress {
 
 fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
     for &byte in bytes {
         out.push(char::from(HEX[usize::from(byte >> 4)]));
         out.push(char::from(HEX[usize::from(byte & 0x0f)]));
@@ -202,6 +202,8 @@ fn hex_decode(text: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+// Each match arm restricts subtraction to its digit range; results are 0..=15.
+#[allow(clippy::arithmetic_side_effects)]
 fn hex_value(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),

@@ -141,7 +141,10 @@ impl NullifierPath {
         let domain = domain_field(chain_id);
         let mut node = pallas::Base::ZERO;
         for (index, sibling) in self.siblings.iter().enumerate() {
-            let Ok(level) = u8::try_from(index + 1) else {
+            let Some(level) = index
+                .checked_add(1)
+                .and_then(|level| u8::try_from(level).ok())
+            else {
                 return false;
             };
             node = if key_bit(&key, index) {
@@ -215,8 +218,11 @@ pub(crate) fn reachable_nodes(
         {
             return Err(Error::Corrupt("invalid reachable nullifier node"));
         }
-        stack.push((record.left, level - 1));
-        stack.push((record.right, level - 1));
+        let child_level = level
+            .checked_sub(1)
+            .ok_or(Error::Corrupt("nullifier tree level"))?;
+        stack.push((record.left, child_level));
+        stack.push((record.right, child_level));
     }
     Ok(marked)
 }
@@ -275,7 +281,10 @@ pub(crate) fn non_membership_path(
     let mut siblings = Vec::with_capacity(NULLIFIER_TREE_DEPTH);
     for level in (1..=NULLIFIER_TREE_DEPTH).rev() {
         let (left, right) = children(domain, &empty, node_hash, level, &overlay, &mut load_node)?;
-        let bit = key_bit(&key, level - 1);
+        let child_level = level
+            .checked_sub(1)
+            .ok_or(Error::Corrupt("nullifier tree level"))?;
+        let bit = key_bit(&key, child_level);
         if bit {
             siblings.push(left);
             node_hash = right;
@@ -312,10 +321,9 @@ fn sorted_entries(nullifiers: &[Nullifier]) -> Result<Option<Vec<Entry>>> {
 
 fn path_order(key: &Encoded) -> Encoded {
     let mut order = [0u8; 32];
-    for index in 0..NULLIFIER_TREE_DEPTH {
+    for (index, output_bit) in (0..NULLIFIER_TREE_DEPTH).zip((0..NULLIFIER_TREE_DEPTH).rev()) {
         if key_bit(key, index) {
-            let output_bit = NULLIFIER_TREE_DEPTH - 1 - index;
-            order[output_bit / 8] |= 1 << (7 - output_bit % 8);
+            order[output_bit / 8] |= 0x80 >> (output_bit % 8);
         }
     }
     order
@@ -336,9 +344,12 @@ fn compute_set_root(
             .map(|entry| leaf_hash(domain, entry.value))
             .ok_or(Error::Corrupt("nullifier snapshot leaf missing"));
     }
-    let split = entries.partition_point(|entry| !key_bit(&entry.key, level - 1));
-    let left = compute_set_root(domain, empty, &entries[..split], level - 1)?;
-    let right = compute_set_root(domain, empty, &entries[split..], level - 1)?;
+    let child_level = level
+        .checked_sub(1)
+        .ok_or(Error::Corrupt("nullifier tree level"))?;
+    let split = entries.partition_point(|entry| !key_bit(&entry.key, child_level));
+    let left = compute_set_root(domain, empty, &entries[..split], child_level)?;
+    let right = compute_set_root(domain, empty, &entries[split..], child_level)?;
     Ok(node_hash_for(
         domain,
         u8::try_from(level).map_err(|_| Error::Corrupt("nullifier tree level"))?,
@@ -368,12 +379,15 @@ fn update_subtree(
         return Ok(Some(leaf_hash(domain, entries[0].value)));
     }
     let (left, right) = children(domain, empty, root, level, empty_overlay, load_node)?;
-    let split = entries.partition_point(|entry| !key_bit(&entry.key, level - 1));
+    let child_level = level
+        .checked_sub(1)
+        .ok_or(Error::Corrupt("nullifier tree level"))?;
+    let split = entries.partition_point(|entry| !key_bit(&entry.key, child_level));
     let Some(new_left) = update_subtree(
         domain,
         empty,
         left,
-        level - 1,
+        child_level,
         &entries[..split],
         empty_overlay,
         load_node,
@@ -386,7 +400,7 @@ fn update_subtree(
         domain,
         empty,
         right,
-        level - 1,
+        child_level,
         &entries[split..],
         empty_overlay,
         load_node,
@@ -421,7 +435,10 @@ fn children(
     load_node: &mut impl FnMut(&Encoded) -> Result<Option<NodeRecord>>,
 ) -> Result<(pallas::Base, pallas::Base)> {
     if node_hash == empty[level] {
-        let empty_child = empty[level - 1];
+        let child_level = level
+            .checked_sub(1)
+            .ok_or(Error::Corrupt("nullifier tree level"))?;
+        let empty_child = empty[child_level];
         return Ok((empty_child, empty_child));
     }
     let key = base_to_bytes(&node_hash);
@@ -488,12 +505,12 @@ fn domain_field(chain_id: &[u8; 32]) -> pallas::Base {
 
 fn empty_roots(domain: pallas::Base) -> [pallas::Base; NULLIFIER_TREE_DEPTH + 1] {
     let mut roots = [pallas::Base::ZERO; NULLIFIER_TREE_DEPTH + 1];
-    for level in 1..=NULLIFIER_TREE_DEPTH {
+    for (child_level, level) in (0..NULLIFIER_TREE_DEPTH).zip(1..=NULLIFIER_TREE_DEPTH) {
         roots[level] = node_hash_for(
             domain,
             u8::try_from(level).unwrap_or(u8::MAX),
-            roots[level - 1],
-            roots[level - 1],
+            roots[child_level],
+            roots[child_level],
         );
     }
     roots

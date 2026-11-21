@@ -10,7 +10,7 @@ use crypto::encoding::{from_hex, to_hex};
 use crypto::keys::SpendingKey;
 use protocol::address::KryptosAddress;
 use protocol::amount::RawCoin;
-use protocol::block::{Block, BlockHash};
+use protocol::block::{Block, BlockHash, BlockHeader, HEADER_LEN};
 use protocol::bytes::Encodable;
 use protocol::compact::CompactBlock;
 use protocol::consensus::{next_height, BranchId};
@@ -131,6 +131,9 @@ pub enum Command {
         /// `<user data>/<network>/chain`, the same chain the desktop app uses.
         #[arg(long)]
         datadir: Option<PathBuf>,
+        /// Open this existing wallet in the node and enable wallet methods on local HTTP RPC.
+        #[arg(long)]
+        wallet: Option<PathBuf>,
         /// Disable inbound P2P service streams.
         #[arg(long)]
         no_p2p: bool,
@@ -266,6 +269,14 @@ pub enum Command {
         /// Required when restoring a phrase/key; scan costs grow with this range.
         #[arg(long, value_parser = clap::value_parser!(u64).range(0..4096))]
         restore_through: Option<u64>,
+        /// First height that could contain a payment to this wallet. Defaults
+        /// to genesis when unknown; retain this value with the recovery phrase.
+        #[arg(long, conflicts_with = "chain")]
+        birthday_height: Option<u32>,
+        /// Start a fresh wallet at the block after this local chain's tip.
+        /// Pass the existing chain.redb file after stopping the node.
+        #[arg(long, conflicts_with_all = ["birthday_height", "phrase", "sk"])]
+        chain: Option<PathBuf>,
         /// Account of the seed phrase to use.
         #[arg(long, default_value_t = 0, conflicts_with = "sk")]
         account: u32,
@@ -362,6 +373,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Run {
             network,
             datadir,
+            wallet,
             no_p2p,
             connect,
             seed,
@@ -401,6 +413,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             run_node(RunOptions {
                 network,
                 datadir: node_datadir(datadir, network)?,
+                wallet,
                 p2p: !no_p2p,
                 connect,
                 seed,
@@ -460,6 +473,8 @@ pub async fn run(cli: Cli) -> Result<()> {
             sk,
             phrase,
             restore_through,
+            birthday_height,
+            chain,
             account,
             network,
         } => create_wallet(
@@ -469,6 +484,8 @@ pub async fn run(cli: Cli) -> Result<()> {
             account,
             network,
             restore_through,
+            birthday_height,
+            chain.as_deref(),
         ),
         Command::BackupWallet {
             wallet,
@@ -567,6 +584,7 @@ fn node_datadir(datadir: Option<PathBuf>, network: Network) -> Result<PathBuf> {
 struct RunOptions {
     network: Network,
     datadir: PathBuf,
+    wallet: Option<PathBuf>,
     p2p: bool,
     connect: Vec<String>,
     seed: Vec<String>,
@@ -590,6 +608,7 @@ async fn run_node(opts: RunOptions) -> Result<()> {
     let RunOptions {
         network,
         datadir,
+        wallet,
         p2p,
         connect,
         seed,
@@ -638,7 +657,20 @@ async fn run_node(opts: RunOptions) -> Result<()> {
         max_inbound,
     };
     let shutdown = Shutdown::listen()?;
-    let handle = crate::node::spawn(config).await?;
+    let mut handle = if let Some(path) = wallet {
+        if !path.try_exists()? {
+            return Err(Error::Argument(format!("no wallet at {}", path.display())));
+        }
+        let wallet = Wallet::open(&path, genesis(&network.params()).hash())?;
+        let handle = crate::node::spawn_with_wallet(config, wallet).await?;
+        crate::node::log(&format!(
+            "wallet     {} (local JSON-RPC only)",
+            path.display()
+        ));
+        handle
+    } else {
+        crate::node::spawn(config).await?
+    };
     let log = crate::node::log;
     log(&format!("Kryptos up on the {network} network"));
     if bootstrap_mining {
@@ -667,7 +699,10 @@ async fn run_node(opts: RunOptions) -> Result<()> {
     } else {
         log(&format!("token      {}", token_file.display()));
     }
-    shutdown.requested().await;
+    tokio::select! {
+        () = shutdown.requested() => {},
+        () = handle.stopped() => {},
+    }
     handle.shutdown().await;
     Ok(())
 }
@@ -707,12 +742,21 @@ fn create_wallet(
     account: u32,
     network: Network,
     restore_through: Option<u64>,
+    birthday_height: Option<u32>,
+    chain: Option<&Path>,
 ) -> Result<()> {
     if (restore || sk.is_some()) != restore_through.is_some() {
         return Err(Error::Argument(
             "restoring a phrase/key requires --restore-through; omit it for a new seed".into(),
         ));
     }
+    let (birthday_height, initial_checkpoint) = match chain {
+        Some(path) => {
+            let (birthday, header, tree) = birthday_from_chain(path, network)?;
+            (birthday, Some((header, tree)))
+        }
+        None => (birthday_height.unwrap_or(0), None),
+    };
     let (sk, fresh) = match (sk, restore) {
         (Some(hex), _) => (sk_from_hex(hex)?, None),
         (None, true) => (seed_phrase()?.spending_key(account)?, None),
@@ -723,12 +767,30 @@ fn create_wallet(
     };
     let genesis = genesis(&network.params()).hash();
     let created = match restore_through {
-        Some(last) => Wallet::restore(path, &sk, genesis, last, &mut rand::rngs::OsRng)?,
-        None => Wallet::create(path, &sk, genesis, &mut rand::rngs::OsRng)?,
+        Some(last) => Wallet::restore_with_birthday(
+            path,
+            &sk,
+            genesis,
+            last,
+            birthday_height,
+            &mut rand::rngs::OsRng,
+        )?,
+        None => Wallet::create_with_birthday(
+            path,
+            &sk,
+            genesis,
+            birthday_height,
+            &mut rand::rngs::OsRng,
+        )?,
     };
+    if let Some((header, tree)) = initial_checkpoint {
+        created.initialize_scan_checkpoint(&header, tree.frontier())?;
+    }
     if let Some(phrase) = fresh {
         println!("seed_phrase: {}", *phrase.words());
-        println!("record the seed phrase and highest issued address index for recovery");
+        println!(
+            "record the seed phrase, birthday height and highest issued address index for recovery"
+        );
     }
     let receiving = created.current_receive_address()?;
     let range = created.address_scan_range()?;
@@ -741,6 +803,7 @@ fn create_wallet(
         range.start, last_index
     );
     println!("next_address_index: {}", range.end);
+    println!("birthday_height: {}", created.birthday_height()?);
     match receiving {
         Some((index, address)) => {
             println!("address_index: {index}");
@@ -751,6 +814,48 @@ fn create_wallet(
         ),
     }
     Ok(())
+}
+
+fn birthday_from_chain(
+    path: &Path,
+    network: Network,
+) -> Result<(u32, BlockHeader, storage::tree::CommitmentTree)> {
+    if !path.is_file() {
+        return Err(Error::Argument(
+            "--chain must name an existing local chain database".into(),
+        ));
+    }
+    let store = storage::store::Store::open(path)?;
+    if store.hash_at(0)? != Some(genesis(&network.params()).hash()) {
+        return Err(Error::Argument(
+            "birthday chain is on another network".into(),
+        ));
+    }
+    let tip = store
+        .tip()?
+        .ok_or_else(|| Error::Argument("birthday chain has no tip".into()))?;
+    let header = store
+        .header(&tip.hash)?
+        .ok_or_else(|| Error::Argument("birthday chain tip is missing".into()))?;
+    if header.height != tip.height
+        || header.hash() != tip.hash
+        || store.hash_at(tip.height)? != Some(tip.hash)
+    {
+        return Err(Error::Argument("birthday chain tip is inconsistent".into()));
+    }
+    let birthday = tip
+        .height
+        .checked_add(1)
+        .ok_or_else(|| Error::Argument("chain tip has no following birthday height".into()))?;
+    let tree = store
+        .commitment_tree_at(&tip.hash)?
+        .ok_or_else(|| Error::Argument("birthday chain frontier is missing".into()))?;
+    if tree.root() != header.commitment_root {
+        return Err(Error::Argument(
+            "birthday chain frontier is inconsistent".into(),
+        ));
+    }
+    Ok((birthday, header, tree))
 }
 
 /// Writes a complete wallet backup as owner-readable JSON.
@@ -861,39 +966,54 @@ fn open_wallet_file(path: &Path, genesis: BlockHash) -> Result<Wallet> {
 /// Fails on a control socket or wallet error.
 pub async fn sync_wallet(client: &mut impl Control, wallet: &Wallet, light: bool) -> Result<u32> {
     let tip = status_height(client).await?;
-    let mut height = wallet.next_height()?;
-    let oldest_checkpoint = wallet.oldest_checkpoint()?;
-    let mut rollback_height = None;
-    while height > 0 {
-        let scanned = height.saturating_sub(1);
-        let Some(hash) = wallet.scanned_hash(scanned)? else {
-            break;
-        };
-        let matches = scanned <= tip && fetch_hash(client, scanned).await? == Some(hash);
-        if matches {
-            break;
+    let tip_hash = fetch_hash(client, tip)
+        .await?
+        .ok_or_else(|| Error::Argument("wallet snapshot tip is missing".into()))?;
+    match wallet.scan_base()? {
+        Some((base, hash)) => {
+            if base > tip || fetch_hash(client, base).await? != Some(hash) {
+                wallet.reset_scan_to_genesis()?;
+            }
         }
-        if oldest_checkpoint.is_some_and(|oldest| scanned < oldest) {
-            rollback_height = Some(oldest_checkpoint.unwrap_or(0).saturating_sub(1));
-            break;
-        }
-        height = scanned;
+        None => bootstrap_wallet_frontier(client, wallet, tip).await?,
     }
-    if let Some(height) = rollback_height {
-        wallet.rollback_to(height)?;
-    } else if height < wallet.next_height()? {
-        wallet.rollback_to(height.saturating_sub(1))?;
+    if let Some(scanned) = wallet.scanned_height()? {
+        let canonical = match scanned.cmp(&tip) {
+            std::cmp::Ordering::Less => fetch_hash(client, scanned).await?,
+            std::cmp::Ordering::Equal => Some(tip_hash),
+            std::cmp::Ordering::Greater => None,
+        };
+        if canonical.is_none() || wallet.scanned_hash(scanned)? != canonical {
+            let mut common = None;
+            if let Some(oldest) = wallet.oldest_checkpoint()? {
+                let candidate = scanned.saturating_sub(1).min(tip);
+                for height in (oldest..=candidate).rev() {
+                    if let Some(hash) = wallet.scanned_hash(height)? {
+                        if fetch_hash(client, height).await? == Some(hash) {
+                            common = Some(height);
+                            break;
+                        }
+                    }
+                }
+            }
+            wallet.rewind_after_reorg(common)?;
+        }
     }
     let first = wallet.next_height()?;
     if first > tip {
         client.close().await?;
         return Ok(tip);
     }
-    let mut downloaded = download_wallet_snapshot(client, first, tip, light).await?;
+    let mut downloaded = download_wallet_snapshot(client, first, tip, tip_hash, light).await?;
+    if fetch_hash(client, tip).await? != Some(tip_hash) {
+        return Err(Error::Argument(
+            "chain changed during wallet snapshot download".into(),
+        ));
+    }
     // End-of-session timing must depend on downloading public bytes, not on
     // the subsequent private scan or database writes.
     client.close().await?;
-    for h in wallet.next_height()?..=tip {
+    for h in first..=tip {
         let mut length = [0u8; 8];
         downloaded.read_exact(&mut length)?;
         let length = usize::try_from(u64::from_le_bytes(length))
@@ -919,6 +1039,59 @@ pub async fn sync_wallet(client: &mut impl Control, wallet: &Wallet, light: bool
         tokio::task::yield_now().await;
     }
     Ok(tip)
+}
+
+async fn bootstrap_wallet_frontier(
+    client: &mut impl Control,
+    wallet: &Wallet,
+    tip: u32,
+) -> Result<()> {
+    if let Some(base) = wallet
+        .birthday_height()?
+        .checked_sub(1)
+        .filter(|h| *h <= tip)
+    {
+        if let Some((header, tree)) = fetch_scan_checkpoint(client, base).await? {
+            if fetch_hash(client, base).await? == Some(header.hash()) {
+                wallet.initialize_scan_checkpoint(&header, tree.frontier())?;
+                return Ok(());
+            }
+        }
+        // The node may still have the blocks needed to replay from genesis
+        // even if it has lost or replaced the birthday frontier.
+        wallet.reset_scan_to_genesis()?;
+    }
+    Ok(())
+}
+
+async fn fetch_scan_checkpoint(
+    client: &mut impl Control,
+    height: u32,
+) -> Result<Option<(BlockHeader, storage::tree::CommitmentTree)>> {
+    let hex = match client.call(&format!("scancheckpoint {height}")).await {
+        Ok(hex) => hex,
+        Err(Error::Argument(reason))
+            if matches!(
+                reason.as_str(),
+                "not found" | "invalid argument: unknown command scancheckpoint"
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let bytes = from_hex(&hex)?;
+    if bytes.len() <= HEADER_LEN {
+        return Err(Error::Argument("wallet checkpoint is truncated".into()));
+    }
+    let header = BlockHeader::from_slice(&bytes[..HEADER_LEN])?;
+    let tree = storage::tree::CommitmentTree::from_slice(&bytes[HEADER_LEN..])?;
+    if header.height != height || tree.root() != header.commitment_root {
+        return Err(Error::Argument(
+            "wallet checkpoint does not match its header".into(),
+        ));
+    }
+    Ok(Some((header, tree)))
 }
 
 /// The genesis hash, over the cheap `hash` request.
@@ -949,6 +1122,7 @@ async fn download_wallet_snapshot(
     client: &mut impl Control,
     first: u32,
     tip: u32,
+    tip_hash: BlockHash,
     light: bool,
 ) -> Result<std::fs::File> {
     let mut file = tempfile::tempfile()?;
@@ -959,13 +1133,20 @@ async fn download_wallet_snapshot(
             return Err(Error::Argument("downloaded block too large".into()));
         }
         let bytes = from_hex(&hex)?;
-        let actual = if light {
-            CompactBlock::from_slice(&bytes)?.height
+        let (actual, hash) = if light {
+            let block = CompactBlock::from_slice(&bytes)?;
+            (block.height, block.hash)
         } else {
-            Block::from_slice(&bytes)?.header().height
+            let block = Block::from_slice(&bytes)?;
+            (block.header().height, block.hash())
         };
         if actual != height {
             return Err(Error::Argument("downloaded block height mismatch".into()));
+        }
+        if height == tip && hash != tip_hash {
+            return Err(Error::Argument(
+                "chain changed during wallet snapshot download".into(),
+            ));
         }
         file.write_all(&(bytes.len() as u64).to_le_bytes())?;
         file.write_all(&bytes)?;
@@ -1089,19 +1270,216 @@ mod tests {
         }
     }
 
-    struct ReorgSource<'a>(SnapshotSource<'a>);
+    struct ReorgSource<'a> {
+        source: SnapshotSource<'a>,
+        rewind_next: u32,
+    }
+
     impl Control for ReorgSource<'_> {
         async fn close(&mut self) -> Result<()> {
-            self.0.close().await
+            self.source.close().await
         }
 
         async fn call(&mut self, line: &str) -> Result<String> {
-            self.0.expected_next = if line.starts_with("hash ") || line == "status" {
-                3
-            } else {
-                2
-            };
-            self.0.call(line).await
+            if line.starts_with("block ") || line.starts_with("compact ") {
+                self.source.expected_next = self.rewind_next;
+            }
+            self.source.call(line).await
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_birthday_frontier_replays_from_genesis() {
+        struct PrunedSource<'a>(SnapshotSource<'a>);
+
+        impl Control for PrunedSource<'_> {
+            async fn close(&mut self) -> Result<()> {
+                self.0.close().await
+            }
+
+            async fn call(&mut self, line: &str) -> Result<String> {
+                if line == "scancheckpoint 1" {
+                    assert_eq!(self.0.wallet.next_height()?, 2);
+                    self.0.expected_next = 0;
+                    return Err(Error::Argument("not found".into()));
+                }
+                self.0.call(line).await
+            }
+        }
+
+        for light in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let first = genesis(&Network::Test.params());
+            let wallet = Wallet::create_with_birthday(
+                dir.path().join("wallet.redb"),
+                &SpendingKey::from_bytes([42; 32]),
+                first.hash(),
+                2,
+                &mut rand::rngs::OsRng,
+            )
+            .unwrap();
+            let mut blocks = vec![first];
+            extend_empty_blocks(&mut blocks, 2, 0);
+            let mut source = PrunedSource(SnapshotSource {
+                wallet: &wallet,
+                blocks,
+                light,
+                expected_next: 2,
+                requests: vec![],
+                fail_at: None,
+            });
+            assert_eq!(sync_wallet(&mut source, &wallet, light).await.unwrap(), 2);
+            assert_eq!(source.0.requests, vec![0, 1, 2]);
+            assert_eq!(wallet.scan_start_height().unwrap(), 0);
+            assert_eq!(
+                wallet.scanned_hash(2).unwrap(),
+                Some(source.0.blocks[2].hash())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn noncanonical_birthday_frontier_replays_from_genesis() {
+        for light in [false, true] {
+            for shorter in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let first = genesis(&Network::Test.params());
+                let wallet = Wallet::create_with_birthday(
+                    dir.path().join("wallet.redb"),
+                    &SpendingKey::from_bytes([43; 32]),
+                    first.hash(),
+                    2,
+                    &mut rand::rngs::OsRng,
+                )
+                .unwrap();
+                let mut old_tree = storage::tree::CommitmentTree::empty();
+                let mut commitment = [0; 32];
+                commitment[0] = 1;
+                old_tree
+                    .append(
+                        &protocol::coin::ExtractedCoinCommitment::from_bytes(&commitment).unwrap(),
+                    )
+                    .unwrap();
+                let old_base = protocol::block::empty_header(1, first.hash(), old_tree.root());
+                wallet
+                    .initialize_scan_checkpoint(&old_base, old_tree.frontier())
+                    .unwrap();
+                let old_tip = Block::new(
+                    protocol::block::empty_header(2, old_base.hash(), old_tree.root()),
+                    vec![],
+                );
+                if light {
+                    wallet
+                        .scan_compact(&CompactBlock::from_block(&old_tip).unwrap())
+                        .unwrap();
+                } else {
+                    wallet.scan(&old_tip).unwrap();
+                }
+                assert_eq!(wallet.scan_base().unwrap(), Some((1, old_base.hash())));
+                assert_eq!(wallet.tree_size().unwrap(), 1);
+
+                let mut blocks = vec![first];
+                if !shorter {
+                    for height in 1..=2 {
+                        let parent = blocks.last().unwrap();
+                        blocks.push(Block::new(
+                            protocol::block::empty_header(
+                                height,
+                                parent.hash(),
+                                parent.header().commitment_root,
+                            ),
+                            vec![],
+                        ));
+                    }
+                    assert_ne!(blocks[1].hash(), old_base.hash());
+                }
+                let tip = blocks.last().unwrap().header().height;
+                let mut reorg = ReorgSource {
+                    source: SnapshotSource {
+                        wallet: &wallet,
+                        blocks,
+                        light,
+                        expected_next: 3,
+                        requests: vec![],
+                        fail_at: None,
+                    },
+                    rewind_next: 0,
+                };
+                assert_eq!(sync_wallet(&mut reorg, &wallet, light).await.unwrap(), tip);
+                let source = reorg.source;
+                assert_eq!(source.requests, (0..=tip).collect::<Vec<_>>());
+                assert_eq!(wallet.scan_base().unwrap(), None);
+                assert_eq!(wallet.scan_start_height().unwrap(), 0);
+                assert_eq!(wallet.tree_size().unwrap(), 0);
+                assert_eq!(wallet.next_height().unwrap(), tip + 1);
+                assert_eq!(
+                    wallet.scanned_hash(tip).unwrap(),
+                    Some(source.blocks[tip as usize].hash())
+                );
+            }
+        }
+    }
+
+    fn extend_empty_blocks(blocks: &mut Vec<Block>, tip: u32, timestamp_offset: u64) {
+        while let Some(parent) = blocks.last().filter(|block| block.header().height < tip) {
+            let mut header = protocol::block::empty_header(
+                parent.header().height.saturating_add(1),
+                parent.hash(),
+                parent.header().commitment_root,
+            );
+            header.timestamp = header.timestamp.saturating_add(timestamp_offset);
+            blocks.push(Block::new(header, vec![]));
+        }
+    }
+
+    #[tokio::test]
+    async fn reorg_during_snapshot_download_does_not_scan_mixed_blocks() {
+        struct SwitchingSource<'a>(SnapshotSource<'a>);
+
+        impl Control for SwitchingSource<'_> {
+            async fn close(&mut self) -> Result<()> {
+                self.0.close().await
+            }
+
+            async fn call(&mut self, line: &str) -> Result<String> {
+                if matches!(line, "block 2" | "compact 2") {
+                    self.0.blocks.truncate(1);
+                    extend_empty_blocks(&mut self.0.blocks, 3, 1);
+                }
+                self.0.call(line).await
+            }
+        }
+
+        for light in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let first = genesis(&Network::Test.params());
+            let wallet = Wallet::create(
+                dir.path().join("wallet.redb"),
+                &SpendingKey::from_bytes([42; 32]),
+                first.hash(),
+                &mut rand::rngs::OsRng,
+            )
+            .unwrap();
+            let mut blocks = vec![first];
+            extend_empty_blocks(&mut blocks, 3, 0);
+            let mut source = SwitchingSource(SnapshotSource {
+                wallet: &wallet,
+                blocks,
+                light,
+                expected_next: 0,
+                requests: vec![],
+                fail_at: None,
+            });
+            assert!(matches!(
+                sync_wallet(&mut source, &wallet, light).await,
+                Err(Error::Argument(reason)) if reason == "chain changed during wallet snapshot download"
+            ));
+            assert_eq!(wallet.next_height().unwrap(), 0);
+            assert_eq!(sync_wallet(&mut source, &wallet, light).await.unwrap(), 3);
+            assert_eq!(
+                wallet.scanned_hash(1).unwrap(),
+                Some(source.0.blocks[1].hash())
+            );
         }
     }
 
@@ -1110,14 +1488,6 @@ mod tests {
         for light in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let first = genesis(&Network::Test.params());
-            let second = Block::new(
-                protocol::block::empty_header(1, first.hash(), first.header().commitment_root),
-                vec![],
-            );
-            let third = Block::new(
-                protocol::block::empty_header(2, second.hash(), second.header().commitment_root),
-                vec![],
-            );
             let wallet = Wallet::create(
                 dir.path().join("wallet.redb"),
                 &SpendingKey::from_bytes([42; 32]),
@@ -1125,9 +1495,11 @@ mod tests {
                 &mut rand::rngs::OsRng,
             )
             .unwrap();
+            let mut blocks = vec![first];
+            extend_empty_blocks(&mut blocks, 5, 0);
             let mut source = SnapshotSource {
                 wallet: &wallet,
-                blocks: vec![first, second, third],
+                blocks,
                 light,
                 expected_next: 0,
                 requests: vec![],
@@ -1141,31 +1513,47 @@ mod tests {
             );
             source.requests.clear();
             source.fail_at = None;
-            assert_eq!(sync_wallet(&mut source, &wallet, light).await.unwrap(), 2);
-            assert_eq!(source.requests, vec![0, 1, 2]);
-            assert_eq!(wallet.next_height().unwrap(), 3);
-            source.expected_next = 3;
+            assert_eq!(sync_wallet(&mut source, &wallet, light).await.unwrap(), 5);
+            assert_eq!(source.requests, (0..=5).collect::<Vec<_>>());
+
+            // The next batch touches the first. Both form a single history.
+            extend_empty_blocks(&mut source.blocks, 10, 0);
+            source.expected_next = 6;
             source.requests.clear();
-            assert_eq!(sync_wallet(&mut source, &wallet, light).await.unwrap(), 2);
+            assert_eq!(sync_wallet(&mut source, &wallet, light).await.unwrap(), 10);
+            assert_eq!(source.requests, (6..=10).collect::<Vec<_>>());
+            for block in &source.blocks {
+                assert_eq!(
+                    wallet.scanned_hash(block.header().height).unwrap(),
+                    Some(block.hash())
+                );
+            }
+            source.expected_next = 11;
+            source.requests.clear();
+            assert_eq!(sync_wallet(&mut source, &wallet, light).await.unwrap(), 10);
             assert!(
                 source.requests.is_empty(),
                 "up-to-date wallets do not fetch blocks"
             );
 
-            // Rollback happens before the download; the remaining snapshot is
-            // still fetched without interleaved scanning.
-            let mut replacement = source.blocks[2].header().clone();
-            replacement.timestamp += 1;
-            source.blocks[2] = Block::new(replacement, vec![]);
-            // Hash lookups happen before rollback, so use a separate source
-            // that checks the invariant only for block requests below.
-            let mut reorg = ReorgSource(source);
-            assert_eq!(sync_wallet(&mut reorg, &wallet, light).await.unwrap(), 2);
-            assert_eq!(reorg.0.requests, vec![2]);
-            assert_eq!(
-                wallet.scanned_hash(2).unwrap(),
-                Some(reorg.0.blocks[2].hash())
-            );
+            // Both tips are at 10. The fork at block 5 is inside the scanned
+            // range; its common block 4 plus the six-block margin retains
+            // genesis and replays starting at block 1.
+            source.blocks.truncate(5);
+            extend_empty_blocks(&mut source.blocks, 10, 1);
+            let mut reorg = ReorgSource {
+                source,
+                rewind_next: 1,
+            };
+            assert_eq!(sync_wallet(&mut reorg, &wallet, light).await.unwrap(), 10);
+            assert_eq!(reorg.source.requests, (1..=10).collect::<Vec<_>>());
+            assert_eq!(wallet.next_height().unwrap(), 11);
+            for block in &reorg.source.blocks {
+                assert_eq!(
+                    wallet.scanned_hash(block.header().height).unwrap(),
+                    Some(block.hash())
+                );
+            }
         }
     }
 

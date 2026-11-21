@@ -195,6 +195,8 @@ impl BindingSigningKey {
     ) -> Result<Self> {
         let added = ValueCommitTrapdoor::sum(trapdoors).expose();
         let subtracted = ValueCommitTrapdoor::sum(subtractions).expose();
+        // Scalar subtraction is defined modulo the prime and cannot overflow.
+        #[allow(clippy::arithmetic_side_effects)]
         let net = added - subtracted;
         if bool::from(net.is_zero()) {
             return Err(Error::DegenerateKey);

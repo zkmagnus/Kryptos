@@ -313,6 +313,9 @@ async fn local_side_branches_and_reorgs_are_counted_without_duplicates() {
     let a = solve(base.clone(), Arc::clone(&key), payout.clone(), 910).await;
     let b = solve(base, Arc::clone(&key), payout.clone(), 911).await;
     assert_ne!(a.hash(), b.hash());
+    // Keep the second solution on a losing equal-work branch so the next
+    // block, rather than the hash tie-break, triggers the measured reorg.
+    let (a, b) = if a.hash() > b.hash() { (a, b) } else { (b, a) };
     assert_eq!(submit(&first, a.clone()).await, Submission::Accepted);
     assert_eq!(submit(&alternate, b.clone()).await, Submission::Accepted);
     assert_eq!(submit(&first, b.clone()).await, Submission::Stale);
@@ -364,6 +367,16 @@ async fn service_ready(network: &TorNetwork) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires public Tor, two onion-service bootstraps and block proofs"]
 async fn public_tor_two_node_relay_reports_timings() {
+    public_tor_relay(runtime::config::Network::Test).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires public Tor, two onion-service bootstraps and mainnet block proofs"]
+async fn public_tor_mainnet_two_node_relay_reports_timings() {
+    public_tor_relay(runtime::config::Network::Main).await;
+}
+
+async fn public_tor_relay(network: runtime::config::Network) {
     let first_dir = tempfile::tempdir().unwrap();
     let second_dir = tempfile::tempdir().unwrap();
     let (first_net, source_incoming) =
@@ -378,6 +391,7 @@ async fn public_tor_two_node_relay_reports_timings() {
     let first_id = first_net.status().borrow().onion.unwrap();
     let first = node::spawn_with_network(
         Config {
+            network,
             datadir: first_dir.path().to_path_buf(),
             cleanup_datadir: false,
             offline: false,
@@ -394,6 +408,7 @@ async fn public_tor_two_node_relay_reports_timings() {
     .unwrap();
     let second = node::spawn_with_network(
         Config {
+            network,
             datadir: second_dir.path().to_path_buf(),
             cleanup_datadir: false,
             offline: false,
@@ -440,6 +455,7 @@ async fn public_tor_two_node_relay_reports_timings() {
     }
     let measured = metrics(&first).await;
     let report = json!({
+        "network": network.to_string(),
         "measurement": "source_submission_to_follower_tip",
         "transport": "public_tor_same_host",
         "topology": "A -> B",

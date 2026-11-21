@@ -159,6 +159,20 @@ async fn status(node: &Handle) -> (u32, BlockHash, bool) {
     }
 }
 
+/// Peer pongs acknowledge actor receipt, not completion of background validation.
+async fn wait_for_tip(node: &Handle, height: u32, hash: BlockHash) {
+    tokio::time::timeout(DEADLINE, async {
+        loop {
+            if status(node).await == (height, hash, false) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background block validation did not reach the expected tip");
+}
+
 async fn listener(network: &TorFixture) -> Handle {
     network
         .spawn(Config {
@@ -239,6 +253,6 @@ async fn independent_body_windows_survive_a_helper_missing_its_blocks() {
     source.send(Message::Block(Box::new(third.clone()))).await;
     source.send(Message::Block(Box::new(fourth.clone()))).await;
     source.barrier(74).await;
-    assert_eq!(status(&node).await, (4, fourth.hash(), false));
+    wait_for_tip(&node, 4, fourth.hash()).await;
     node.shutdown().await;
 }

@@ -294,6 +294,21 @@ fn with_corrupted_proof(block: &Block) -> Block {
     Block::new(block.header().clone(), txs)
 }
 
+/// Re-mines a sibling with a block hash below `tip_hash`, preserving its
+/// transactions and state roots. This lets tests exercise a losing equal-work
+/// branch independently of the stable fork-choice tie-break.
+fn mine_below_tip(h: &Harness, block: &Block, tip_hash: protocol::block::BlockHash) -> Block {
+    let mut header = block.header().clone();
+    for nonce in 0u64..1_000_000 {
+        header.nonce = [0; 32];
+        header.nonce[..8].copy_from_slice(&nonce.to_le_bytes());
+        if h.chain.pow().try_nonce(&mut header).unwrap() && header.hash() < tip_hash {
+            return Block::new(header, block.transactions().to_vec());
+        }
+    }
+    panic!("could not mine a sibling below the requested tip hash");
+}
+
 #[test]
 fn a_side_chain_block_with_a_bad_proof_is_not_stored_and_cannot_shadow_the_real_one() {
     let mut h = Harness::new(9);
@@ -302,6 +317,7 @@ fn a_side_chain_block_with_a_bad_proof_is_not_stored_and_cannot_shadow_the_real_
     let main_2 = h.extend(Vec::new());
     let fork_tree = h.chain.store().tree_at(fork.height).unwrap().unwrap();
     let (side_2, side_2_tree) = h.make_block_on(&fork, &fork_tree, Vec::new());
+    let side_2 = mine_below_tip(&h, &side_2, main_2.hash());
     let poisoned = with_corrupted_proof(&side_2);
     assert_eq!(
         poisoned.hash(),
@@ -338,6 +354,7 @@ fn a_longer_side_chain_triggers_a_reorganization() {
     // randomness makes it differ from the main-chain block at height 2.
     let fork_tree = h.chain.store().tree_at(fork.height).unwrap().unwrap();
     let (side_2, side_2_tree) = h.make_block_on(&fork, &fork_tree, Vec::new());
+    let side_2 = mine_below_tip(&h, &side_2, main_3.hash());
     assert_ne!(side_2.hash(), main_3.hash());
     assert_eq!(h.import(&side_2).unwrap(), Import::SideChain);
     assert_eq!(h.chain.tip().unwrap().hash, main_3.hash());
@@ -374,9 +391,10 @@ fn deep_side_branches_are_refused_before_persisting_body_or_work() {
     let (side, side_tree) = h.make_block_on(&fork, &fork_tree, Vec::new());
     let (unseen_side, _) = h.make_block_on(&fork, &fork_tree, Vec::new());
     h.extend(Vec::new());
+    h.extend(Vec::new());
+    // Store a lower-work branch at the depth boundary before it ages out.
     assert_eq!(h.import(&side).unwrap(), Import::SideChain);
     let (descendant, _) = h.make_block_on(side.header(), &side_tree, Vec::new());
-    h.extend(Vec::new());
     h.extend(Vec::new());
     let tip = h.chain.tip().unwrap();
     let work = h.chain.tip_chainwork().unwrap();
@@ -413,6 +431,7 @@ fn side_branch_can_reorganize_at_the_exact_depth_boundary() {
     let (side_2, tree_2) = h.make_block_on(&fork, &fork_tree, Vec::new());
     assert_eq!(h.import(&side_2).unwrap(), Import::SideChain);
     let (side_3, tree_3) = h.make_block_on(side_2.header(), &tree_2, Vec::new());
+    let side_3 = mine_below_tip(&h, &side_3, main_3.hash());
     assert_eq!(h.import(&side_3).unwrap(), Import::SideChain);
     let (side_4, _) = h.make_block_on(side_3.header(), &tree_3, Vec::new());
     assert_eq!(
@@ -454,6 +473,7 @@ fn boundary_reorg_retains_anchors_needed_before_the_fork() {
         "fork at height 2 still needs height-1 anchors"
     );
     let (side, side_tree) = h.make_block_on(&fork, &fork_tree, vec![transaction]);
+    let side = mine_below_tip(&h, &side, main.hash());
     assert_eq!(h.import(&side).unwrap(), Import::SideChain);
     let (winner, _) = h.make_block_on(side.header(), &side_tree, Vec::new());
     assert_eq!(
@@ -472,20 +492,38 @@ fn boundary_reorg_retains_anchors_needed_before_the_fork() {
 }
 
 #[test]
-fn equal_work_keeps_the_first_seen_block_even_when_its_hash_is_larger() {
-    let mut h = Harness::new(41);
-    let parent = h.tip_header();
-    let a = h.make_block(&parent, Vec::new());
-    let b = h.make_block(&parent, Vec::new());
-    let (first, second) = if a.hash() > b.hash() { (a, b) } else { (b, a) };
-    assert!(first.hash() > second.hash());
-    assert_eq!(h.import(&first).unwrap(), Import::Extended);
-    assert_eq!(h.import(&second).unwrap(), Import::SideChain);
+fn equal_work_fork_choice_is_independent_of_arrival_order() {
+    let mut source = Harness::new(41);
+    let parent = source.tip_header();
+    let a = source.make_block(&parent, Vec::new());
+    let b = source.make_block(&parent, Vec::new());
+    let (winner, loser) = if a.hash() > b.hash() { (a, b) } else { (b, a) };
+
+    let mut winner_first = Harness::new(42);
+    let mut loser_first = Harness::new(43);
     assert_eq!(
-        h.chain.chainwork(&first.hash()).unwrap(),
-        h.chain.chainwork(&second.hash()).unwrap()
+        winner_first.chain.tip().unwrap().hash,
+        loser_first.chain.tip().unwrap().hash
     );
-    assert_eq!(h.chain.tip().unwrap().hash, first.hash());
+
+    assert_eq!(winner_first.import(&winner).unwrap(), Import::Extended);
+    assert_eq!(winner_first.import(&loser).unwrap(), Import::SideChain);
+
+    assert_eq!(loser_first.import(&loser).unwrap(), Import::Extended);
+    assert_eq!(
+        loser_first.import(&winner).unwrap(),
+        Import::Reorganized {
+            reverted: vec![loser.clone()],
+            applied: 1,
+        }
+    );
+
+    assert_eq!(
+        winner_first.chain.chainwork(&winner.hash()).unwrap(),
+        winner_first.chain.chainwork(&loser.hash()).unwrap()
+    );
+    assert_eq!(winner_first.chain.tip().unwrap().hash, winner.hash());
+    assert_eq!(loser_first.chain.tip().unwrap().hash, winner.hash());
 }
 
 #[test]
@@ -1072,7 +1110,12 @@ fn a_store_with_history_but_no_rules_digest_is_refused() {
         store
             .apply(&first, &CommitmentTree::empty(), &[0; 32])
             .unwrap();
-        let header = empty_header(1, first.hash(), CommitmentTree::empty().root());
+        let mut header = empty_header(1, first.hash(), CommitmentTree::empty().root());
+        header.history_root = store
+            .header_frontier(&first.hash())
+            .unwrap()
+            .unwrap()
+            .root();
         store
             .apply(
                 &Block::new(header, Vec::new()),
@@ -1157,6 +1200,7 @@ fn failed_reorg_restores_original_chain_and_clears_journal() {
     let fork_tree = h.chain.store().tree().unwrap();
     let main = h.extend(Vec::new());
     let (side, side_tree) = h.make_block_on(&fork, &fork_tree, Vec::new());
+    let side = mine_below_tip(&h, &side, main.hash());
     assert_eq!(h.import(&side).unwrap(), Import::SideChain);
     let (bad, _) = h.make_block_on(side.header(), &side_tree, Vec::new());
     let mut header = bad.header().clone();

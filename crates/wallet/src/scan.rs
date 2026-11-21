@@ -5,7 +5,6 @@ use protocol::block::Block;
 use protocol::bytes::{Encodable, Reader, Writer};
 use protocol::coin::{Coin, RandomSeed, Rho};
 use protocol::compact::CompactBlock;
-use protocol::encryption::{decrypt_coin_with_ivk, detect_coin_with_ivk};
 use protocol::nullifier::Nullifier;
 use protocol::transaction::{Transaction, TxId};
 
@@ -173,7 +172,7 @@ pub fn scan_block(
 }
 
 /// Scans a full block using a previously derived, explicit address range.
-/// Every candidate key is tried for every output, including after a match.
+/// Every candidate key active at this height is tried, including after a match.
 ///
 /// # Errors
 /// Rejects a context for another wallet and propagates coin/nullifier errors.
@@ -203,14 +202,8 @@ pub fn scan_block_with_keys(
                 first_position.saturating_add(u64::try_from(scan.leaves.len()).unwrap_or(u64::MAX));
             scan.leaves.push(*body.cmx().inner());
             let rho = Rho::from_nullifier(body.nullifier())?;
-            let decrypted = scan_keys.trial_decrypt(|receiver_key| {
-                decrypt_coin_with_ivk(
-                    keys.incoming_viewing_key(),
-                    receiver_key,
-                    body.encrypted_coin(),
-                    rho,
-                    body.cmx(),
-                )
+            let decrypted = scan_keys.trial_decrypt(block.header().height, |ivk, receiver_key| {
+                ivk.decrypt_coin(receiver_key, body.encrypted_coin(), rho, body.cmx())
             });
             let nullifier = stand_in.nullifier(keys, decrypted.as_ref().map(|(coin, _)| coin))?;
             let Some((coin, legacy_address)) = decrypted else {
@@ -272,9 +265,8 @@ pub fn scan_compact_block_with_keys(
         scan.leaves.push(*action.cmx.inner());
         scan.spent.push((action.nullifier, None));
         let rho = Rho::from_nullifier(&action.nullifier)?;
-        let detected = scan_keys.trial_decrypt(|receiver_key| {
-            detect_coin_with_ivk(
-                keys.incoming_viewing_key(),
+        let detected = scan_keys.trial_decrypt(block.height, |ivk, receiver_key| {
+            ivk.detect_coin(
                 receiver_key,
                 &action.kem_ciphertext,
                 &action.enc_lead,

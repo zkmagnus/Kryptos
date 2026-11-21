@@ -122,11 +122,9 @@ impl Transaction {
                     .checked_mul(ACTION_BODY_LEN + crypto::signature::SIGNATURE_LEN)
                     .ok_or(crate::Error::Malformed("transaction size overflow"))?,
             )
-            .and_then(|len| {
-                len.checked_add(
-                    action_proof_len + ACTION_PROOF_MAGIC.len() + crypto::signature::SIGNATURE_LEN,
-                )
-            })
+            .and_then(|len| len.checked_add(action_proof_len))
+            .and_then(|len| len.checked_add(ACTION_PROOF_MAGIC.len()))
+            .and_then(|len| len.checked_add(crypto::signature::SIGNATURE_LEN))
             .ok_or(crate::Error::Malformed("transaction size overflow"))
     }
 
@@ -274,6 +272,8 @@ impl Transaction {
     /// Fails if an action carries a non-canonical point.
     pub fn public_inputs(&self, coinbase: bool) -> Result<Vec<PublicInputs>> {
         let total = ValueCommitment::sum(self.value_commitments());
+        // Field negation is defined modulo the prime and cannot overflow.
+        #[allow(clippy::arithmetic_side_effects)]
         let net_sign = if coinbase {
             -pallas::Base::one()
         } else {

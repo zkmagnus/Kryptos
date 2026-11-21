@@ -13,13 +13,15 @@
 //! - [`validate`]: stateless validation and signature checks.
 //! - [`builder`]: assembles a balanced, padded, signed transaction.
 //! - [`block`]: block header, block, and their hashes.
+#![deny(clippy::arithmetic_side_effects)]
 #![cfg_attr(
     test,
     allow(
         clippy::unwrap_used,
         clippy::expect_used,
         clippy::panic,
-        clippy::indexing_slicing
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
     )
 )]
 

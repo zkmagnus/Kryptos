@@ -34,7 +34,11 @@ impl ActionProofEnvelope {
         if action.as_bytes().is_empty() {
             return Err(Error::CountMismatch);
         }
-        let mut bytes = Vec::with_capacity(ACTION_PROOF_MAGIC.len() + action.as_bytes().len());
+        let capacity = ACTION_PROOF_MAGIC
+            .len()
+            .checked_add(action.as_bytes().len())
+            .ok_or(Error::InvalidProof)?;
+        let mut bytes = Vec::with_capacity(capacity);
         bytes.extend_from_slice(ACTION_PROOF_MAGIC);
         bytes.extend_from_slice(action.as_bytes());
         Ok(Self(bytes))

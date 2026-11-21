@@ -130,7 +130,7 @@ the commands here also prepare an offline fuzzing environment.
 ## 4. Build release binaries
 
 One release build produces the node and wallet CLI (`Kryptos`), the wallet daemon
-(`wallet`), and the local scanner (`rhomscan`). The commands below select all three
+(`wallet`), and the local scanner (`kryptoscan`). The commands below select all three
 with `-p runtime --bins`. The same `wallet` executable can run in a terminal or
 under a service manager; choose how to start it after building.
 
@@ -178,8 +178,9 @@ native dependency requirements still apply. In particular, the vendored RandomX
 CMake configuration uses `-march=armv8-a+crypto` for its default aarch64 build, so
 do not assume that clearing `RUSTFLAGS` makes it compatible with every ARM CPU.
 
-Release builds use optimization level 3, fat LTO, and one codegen unit. The final
-link can take time and memory even with a low Cargo job count.
+Release builds use optimization level 3, fat LTO, one codegen unit, and integer
+overflow checks. The final link can take time and memory even with a low Cargo
+job count.
 
 ### Output files
 
@@ -187,7 +188,7 @@ link can take time and memory even with a low Cargo job count.
 | --- | --- | --- |
 | `Kryptos` | `target/release/Kryptos` | Node and wallet command-line interface |
 | `wallet` | `target/release/wallet` | Wallet RPC daemon |
-| `rhomscan` | `target/release/rhomscan` | Scan a local chain database into a wallet |
+| `kryptoscan` | `target/release/kryptoscan` | Scan a local chain database into a wallet |
 
 Windows adds `.exe`. An explicit `--target` adds the target triple beneath
 `target/`; `CARGO_TARGET_DIR` changes the output root.
@@ -197,7 +198,7 @@ Check that the binaries start without opening a node or modifying a wallet:
 ```sh
 ./target/release/Kryptos --help
 ./target/release/wallet --help
-./target/release/rhomscan --help
+./target/release/kryptoscan --help
 ```
 
 If you only need the node/CLI executable, select it with `--bin Kryptos`:
@@ -289,7 +290,8 @@ incremental compilation. This avoids full Rust debug symbols in each test
 executable and the additional incremental compiler cache. Changed crates may
 take longer to recompile; Cargo still reuses unchanged compiled dependencies.
 Rust debug assertions and overflow checks remain enabled. Test optimization
-stays at level 1. See [Cargo profiles](https://doc.rust-lang.org/cargo/reference/profiles.html)
+defaults to level 1; `halo2_proofs`, `pasta_curves`, and `halo2_gadgets` use level 3
+to speed up proof-heavy tests. See [Cargo profiles](https://doc.rust-lang.org/cargo/reference/profiles.html)
 for these settings and their overrides.
 
 During iteration, check and test the affected package before running the full
@@ -363,7 +365,7 @@ sudo docker run --rm Kryptos:local --help
 Omit `sudo` if your Docker setup already allows access as your normal user. The
 Dockerfile builds a portable release `Kryptos` executable in a Rust 1.100.0 builder
 and copies it into a Debian Bookworm runtime image with its runtime libraries.
-Of the workspace executables, the image packages only `Kryptos`; the separate `wallet` and `rhomscan` binaries are not packaged.
+Of the workspace executables, the image packages only `Kryptos`; the separate `wallet` and `kryptoscan` binaries are not packaged.
 
 Docker needs network access for base images and `apt` packages unless these are
 provided locally. Only the Cargo dependency build inside the image is offline.

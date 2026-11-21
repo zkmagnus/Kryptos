@@ -25,9 +25,10 @@ use std::sync::{Arc, Mutex};
 use crypto::diversifier::DiversifierIndex;
 use crypto::keys::SpendingKey;
 use crypto::merkle::{MerklePath, Node};
-use incrementalmerkletree::Position;
+use incrementalmerkletree::frontier::Frontier;
+use incrementalmerkletree::{Marking, Position, Retention};
 use protocol::address::KryptosAddress;
-use protocol::block::{Block, BlockHash};
+use protocol::block::{Block, BlockHash, BlockHeader};
 use protocol::bytes::Encodable;
 use protocol::compact::CompactBlock;
 use protocol::transaction::Anchor;
@@ -75,6 +76,14 @@ const ADDRESS_KEY_SCHEME: &str = "address_key_scheme";
 /// First address index using per-diversifier keys; must be zero.
 const ADDRESS_KEY_START: &str = "address_key_start";
 const COIN_INDEX_VERSION: &str = "coin_nullifier_index_version";
+/// Local discovery metadata; absent in older wallets and defaults to genesis.
+const BIRTHDAY_HEIGHT: &str = "birthday_height";
+const SCAN_START_HEIGHT: &str = "scan_start_height";
+const SCAN_BASE_HEIGHT: &str = "scan_base_height";
+const SCAN_BASE_HASH: &str = "scan_base_hash";
+const ADDRESS_BIRTHDAY_PREFIX: &str = "address_birthday_";
+/// Number of additional canonical blocks to replay after a reorganization.
+const REORG_MARGIN: u32 = 6;
 const BACKUP_FORMAT: &str = "kryptos-wallet-plaintext-backup";
 const BACKUP_VERSION: u32 = 1;
 
@@ -159,7 +168,7 @@ pub struct Wallet {
     db: Database,
     keys: WalletKeys,
     file_key: FileKey,
-    scan_keys: Mutex<Option<(AddressScanRange, Arc<ScanKeys>)>>,
+    scan_keys: Mutex<Option<(AddressScanRange, Vec<u32>, Arc<ScanKeys>)>>,
 }
 
 impl core::fmt::Debug for Wallet {
@@ -292,15 +301,33 @@ impl Wallet {
         genesis: BlockHash,
         rng: &mut (impl RngCore + CryptoRng),
     ) -> Result<Self> {
+        Self::create_with_birthday(path, sk, genesis, 0, rng)
+    }
+
+    /// Creates a wallet whose first possible payment is at `birthday_height`.
+    /// Use zero when the creation height is unknown. A nonzero birthday needs
+    /// the preceding block's commitment frontier before scanning can begin.
+    ///
+    /// # Errors
+    /// Returns the same creation errors as [`Self::create`].
+    pub fn create_with_birthday(
+        path: impl AsRef<Path>,
+        sk: &SpendingKey,
+        genesis: BlockHash,
+        birthday_height: u32,
+        rng: &mut (impl RngCore + CryptoRng),
+    ) -> Result<Self> {
         let keys = WalletKeys::from_spending_key(sk.clone())?;
-        Self::create_with(
+        let wallet = Self::create_with(
             path,
             keys,
             genesis,
             AddressScanRange { start: 0, end: 1 },
             Some(0),
             rng,
-        )
+        )?;
+        wallet.set_initial_birthday(birthday_height)?;
+        Ok(wallet)
     }
 
     /// Creates a fresh recovery wallet scanning every new address from zero
@@ -318,6 +345,22 @@ impl Wallet {
         last_address_index: u64,
         rng: &mut (impl RngCore + CryptoRng),
     ) -> Result<Self> {
+        Self::restore_with_birthday(path, sk, genesis, last_address_index, 0, rng)
+    }
+
+    /// Restores a seed with an explicitly known earliest payment height.
+    /// A seed does not encode this height; [`Self::restore`] uses genesis.
+    ///
+    /// # Errors
+    /// Returns the same range and creation errors as [`Self::restore`].
+    pub fn restore_with_birthday(
+        path: impl AsRef<Path>,
+        sk: &SpendingKey,
+        genesis: BlockHash,
+        last_address_index: u64,
+        birthday_height: u32,
+        rng: &mut (impl RngCore + CryptoRng),
+    ) -> Result<Self> {
         let end = last_address_index
             .checked_add(1)
             .ok_or(crypto::Error::InvalidDerivation(
@@ -325,7 +368,27 @@ impl Wallet {
             ))?;
         let range = AddressScanRange { start: 0, end }.validate()?;
         let keys = WalletKeys::from_spending_key(sk.clone())?;
-        Self::create_with(path, keys, genesis, range, None, rng)
+        let wallet = Self::create_with(path, keys, genesis, range, None, rng)?;
+        wallet.set_initial_birthday(birthday_height)?;
+        Ok(wallet)
+    }
+
+    fn set_initial_birthday(&self, height: u32) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        {
+            let mut meta = tx.open_table(META)?;
+            meta.insert(BIRTHDAY_HEIGHT, height.to_le_bytes().as_slice())?;
+            meta.insert(SCAN_START_HEIGHT, height.to_le_bytes().as_slice())?;
+            let range = read_address_range(&meta)?;
+            for index in range.start..range.end {
+                meta.insert(
+                    format!("{ADDRESS_BIRTHDAY_PREFIX}{index}").as_str(),
+                    height.to_le_bytes().as_slice(),
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     fn create_with(
@@ -521,24 +584,156 @@ impl Wallet {
         read_address_range(&meta)
     }
 
-    #[cfg(test)]
-    fn scanning_keys(&self) -> Result<Arc<ScanKeys>> {
-        self.scanning_keys_for(self.address_scan_range()?)
+    /// The earliest block height that may contain a payment to this wallet.
+    /// Older wallet files without this hint default to genesis.
+    pub fn birthday_height(&self) -> Result<u32> {
+        let tx = self.db.begin_read()?;
+        Ok(read_meta_height(&tx.open_table(META)?, BIRTHDAY_HEIGHT)?.unwrap_or(0))
     }
 
-    fn scanning_keys_for(&self, range: AddressScanRange) -> Result<Arc<ScanKeys>> {
+    /// The first height of the wallet's scan history, excluding an imported base.
+    pub fn scan_start_height(&self) -> Result<u32> {
+        let tx = self.db.begin_read()?;
+        let meta = tx.open_table(META)?;
+        Ok(read_meta_height(&meta, SCAN_START_HEIGHT)?.unwrap_or(0))
+    }
+
+    /// The imported canonical base height, if this wallet started from a
+    /// retained commitment frontier instead of scanning from genesis.
+    pub fn scan_base(&self) -> Result<Option<(u32, BlockHash)>> {
+        let tx = self.db.begin_read()?;
+        let meta = tx.open_table(META)?;
+        let Some(height) = read_meta_height(&meta, SCAN_BASE_HEIGHT)? else {
+            return Ok(None);
+        };
+        let hash: [u8; 32] = meta
+            .get(SCAN_BASE_HASH)?
+            .ok_or(Error::Corrupt("scan base hash missing"))?
+            .value()
+            .try_into()
+            .map_err(|_| Error::Corrupt("scan base hash"))?;
+        Ok(Some((height, BlockHash::from_bytes(hash))))
+    }
+
+    #[cfg(test)]
+    fn scanning_keys(&self) -> Result<Arc<ScanKeys>> {
+        let tx = self.db.begin_read()?;
+        let meta = tx.open_table(META)?;
+        let range = read_address_range(&meta)?;
+        self.scanning_keys_for(range, read_address_birthdays(&meta, range)?)
+    }
+
+    fn scanning_keys_for(
+        &self,
+        range: AddressScanRange,
+        birthdays: Vec<u32>,
+    ) -> Result<Arc<ScanKeys>> {
         let mut cached = self
             .scan_keys
             .lock()
             .map_err(|_| Error::Corrupt("scan key cache poisoned"))?;
-        if let Some((previous, keys)) = cached.as_ref() {
-            if *previous == range {
+        if let Some((previous, previous_birthdays, keys)) = cached.as_ref() {
+            if *previous == range && *previous_birthdays == birthdays {
                 return Ok(Arc::clone(keys));
             }
         }
-        let keys = Arc::new(ScanKeys::new(&self.keys, range.start, range.end)?);
-        *cached = Some((range, Arc::clone(&keys)));
+        let mut keys = ScanKeys::new(&self.keys, range.start, range.end)?;
+        keys.set_birthdays(&birthdays);
+        let keys = Arc::new(keys);
+        *cached = Some((range, birthdays, Arc::clone(&keys)));
         Ok(keys)
+    }
+
+    /// Initializes a birthday scan from a node-provided commitment frontier.
+    /// The caller must first authenticate that `header` is canonical.
+    pub fn initialize_scan_checkpoint(
+        &self,
+        header: &BlockHeader,
+        frontier: Frontier<Node, 48>,
+    ) -> Result<()> {
+        let birthday = self.birthday_height()?;
+        let base = birthday
+            .checked_sub(1)
+            .ok_or(Error::Corrupt("genesis birthday has no scan base"))?;
+        if header.height != base
+            || Anchor::from_base(*frontier.root().inner()) != header.commitment_root
+        {
+            return Err(Error::Corrupt("wallet scan checkpoint mismatch"));
+        }
+
+        let tx = self.db.begin_write()?;
+        {
+            let mut meta = tx.open_table(META)?;
+            let stored_base = read_meta_height(&meta, SCAN_BASE_HEIGHT)?;
+            if stored_base.is_some() {
+                let stored_hash: [u8; 32] = meta
+                    .get(SCAN_BASE_HASH)?
+                    .ok_or(Error::Corrupt("scan base hash missing"))?
+                    .value()
+                    .try_into()
+                    .map_err(|_| Error::Corrupt("scan base hash"))?;
+                if stored_base == Some(header.height)
+                    && BlockHash::from_bytes(stored_hash) == header.hash()
+                {
+                    return Ok(());
+                }
+                return Err(Error::Corrupt("wallet scan checkpoint already initialized"));
+            }
+            if tx.open_table(HEIGHTS)?.last()?.is_some()
+                || tx.open_table(SHARDS)?.last()?.is_some()
+                || tx.open_table(CAP)?.get(())?.is_some()
+                || tx.open_table(CHECKPOINTS)?.last()?.is_some()
+            {
+                return Err(Error::Corrupt("wallet already has scan history"));
+            }
+            let size = frontier.tree_size();
+            let mut tree = write_tree(&tx)?;
+            tree.insert_frontier(
+                frontier,
+                Retention::Checkpoint {
+                    id: base,
+                    marking: Marking::Reference,
+                },
+            )?;
+            tx.open_table(HEIGHTS)?
+                .insert(base, encode_height(header.hash(), size).as_slice())?;
+            meta.insert(SCAN_BASE_HEIGHT, base.to_le_bytes().as_slice())?;
+            meta.insert(SCAN_BASE_HASH, header.hash().as_bytes().as_slice())?;
+            meta.insert(SCAN_START_HEIGHT, birthday.to_le_bytes().as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Discards chain-derived state and reverts to a genesis scan after a
+    /// reorganization invalidates the imported birthday checkpoint.
+    pub fn reset_scan_to_genesis(&self) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        tx.open_table(HEIGHTS)?.retain(|_, _| false)?;
+        tx.open_table(COINS)?.retain(|_, _| false)?;
+        tx.open_table(COINS_BY_NULLIFIER)?.retain(|_, _| false)?;
+        tx.open_table(SHARDS)?.retain(|_, _| false)?;
+        tx.open_table(CAP)?.retain(|_, _| false)?;
+        tx.open_table(CHECKPOINTS)?.retain(|_, _| false)?;
+        self.reopen_confirmations(&tx, None)?;
+        {
+            let mut meta = tx.open_table(META)?;
+            meta.remove(SCAN_BASE_HEIGHT)?;
+            meta.remove(SCAN_BASE_HASH)?;
+            meta.insert(BIRTHDAY_HEIGHT, 0u32.to_le_bytes().as_slice())?;
+            meta.insert(SCAN_START_HEIGHT, 0u32.to_le_bytes().as_slice())?;
+            meta.retain(|name, _| !name.starts_with(ADDRESS_BIRTHDAY_PREFIX))?;
+            meta.insert(
+                format!("{ADDRESS_BIRTHDAY_PREFIX}0").as_str(),
+                0u32.to_le_bytes().as_slice(),
+            )?;
+        }
+        tx.commit()?;
+        self.scan_keys
+            .lock()
+            .map_err(|_| Error::Corrupt("scan key cache poisoned"))?
+            .take();
+        Ok(())
     }
 
     /// The unlocked keys.
@@ -553,9 +748,10 @@ impl Wallet {
     pub fn next_height(&self) -> Result<u32> {
         let tx = self.db.begin_read()?;
         let heights = tx.open_table(HEIGHTS)?;
-        let next = heights
-            .last()?
-            .map_or(0, |(k, _)| k.value().saturating_add(1));
+        let next = match heights.last()? {
+            Some((height, _)) => height.value().saturating_add(1),
+            None => read_meta_height(&tx.open_table(META)?, SCAN_START_HEIGHT)?.unwrap_or(0),
+        };
         Ok(next)
     }
 
@@ -592,6 +788,22 @@ impl Wallet {
         tree.store().oldest_checkpoint_id()
     }
 
+    /// Rewinds from the last hash confirmed on the canonical chain. The
+    /// imported base, if still canonical, is the earliest usable frontier.
+    ///
+    /// # Errors
+    /// Fails if the wallet cannot roll back or clear its scan state.
+    pub fn rewind_after_reorg(&self, last_canonical: Option<u32>) -> Result<()> {
+        let base = self.scan_base()?.map_or(0, |(height, _)| height);
+        if let (Some(common), Some(oldest)) = (last_canonical, self.oldest_checkpoint()?) {
+            let rewind = common.saturating_sub(REORG_MARGIN).max(base);
+            if common >= base && rewind >= oldest {
+                return self.rollback_to(rewind);
+            }
+        }
+        self.reset_scan_to_genesis()
+    }
+
     /// Scans the next full block: appends its commitments to the witness
     /// tree, marking the ones it owns, takes a checkpoint at the block's
     /// height, records owned coins marks coins it
@@ -623,7 +835,8 @@ impl Wallet {
 
     /// Applies one scanned block in a single write transaction: appends
     /// leaves, checkpoints, records found coins and marks spends. Shared
-    /// by the full and compact scanners.
+    /// by the full and compact scanners. Replay also goes in height order:
+    /// no found note becomes visible until its witness checkpoint commits.
     fn apply(
         &self,
         height: u32,
@@ -631,6 +844,14 @@ impl Wallet {
         build: impl FnOnce(&ScanKeys, u64) -> Result<BlockScan>,
     ) -> Result<ScanReport> {
         let tx = self.db.begin_write()?;
+        // Read the allocation range only after acquiring the writer. A concurrent
+        // address allocation cannot commit between selecting keys and this scan.
+        let meta = tx.open_table(META)?;
+        if read_meta_height(&meta, BIRTHDAY_HEIGHT)?.unwrap_or(0) > 0
+            && read_meta_height(&meta, SCAN_BASE_HEIGHT)?.is_none()
+        {
+            return Err(Error::Corrupt("birthday scan checkpoint missing"));
+        }
         let expected = tx
             .open_table(HEIGHTS)?
             .last()?
@@ -641,10 +862,9 @@ impl Wallet {
                 got: height,
             });
         }
-        // Read the allocation range only after acquiring the writer. A concurrent
-        // address allocation cannot commit between selecting keys and this scan.
-        let range = read_address_range(&tx.open_table(META)?)?;
-        let keys = self.scanning_keys_for(range)?;
+        let range = read_address_range(&meta)?;
+        let keys = self.scanning_keys_for(range, read_address_birthdays(&meta, range)?)?;
+        drop(meta);
         let mut report = ScanReport::default();
         {
             let mut tree = write_tree(&tx)?;
@@ -738,19 +958,43 @@ impl Wallet {
                     coins.insert(coin.position, self.seal_coin(&coin)?.as_slice())?;
                 }
             }
-            let mut operations = tx.open_table(OPERATIONS)?;
-            for mut op in self.decrypt_operations(&operations)? {
-                if let OperationStatus::Confirmed { txid, height: at } = op.status {
-                    if at > height {
-                        // The build height was no later than the confirmation.
-                        // Using this upper bound delays expiry conservatively.
-                        op.status = OperationStatus::Submitted { txid, built_at: at };
-                        operations.insert(op.id, self.seal_operation(&op)?.as_slice())?;
+            {
+                // Addresses remain shared after their original chain history is
+                // removed. They can receive at an earlier replacement height,
+                // so their scan bounds must move back with the retained tip.
+                // A retained imported checkpoint already bounds this height by
+                // the wallet birthday; rolling below it fails above.
+                let next_height = height.saturating_add(1);
+                let mut meta = tx.open_table(META)?;
+                let range = read_address_range(&meta)?;
+                for index in range.start..range.end {
+                    let name = format!("{ADDRESS_BIRTHDAY_PREFIX}{index}");
+                    if read_meta_height(&meta, &name)?.is_some_and(|at| at > next_height) {
+                        meta.insert(name.as_str(), next_height.to_le_bytes().as_slice())?;
                     }
                 }
             }
+            self.reopen_confirmations(&tx, Some(height))?;
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    fn reopen_confirmations(&self, tx: &WriteTransaction, retained: Option<u32>) -> Result<()> {
+        let mut operations = tx.open_table(OPERATIONS)?;
+        for mut op in self.decrypt_operations(&operations)? {
+            if let OperationStatus::Confirmed { txid, height } = op.status {
+                if retained.is_none_or(|last| height > last) {
+                    // The build height was no later than the confirmation.
+                    // Using this upper bound delays expiry conservatively.
+                    op.status = OperationStatus::Submitted {
+                        txid,
+                        built_at: height,
+                    };
+                    operations.insert(op.id, self.seal_operation(&op)?.as_slice())?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -867,7 +1111,11 @@ impl Wallet {
     /// # Errors
     /// Fails on a database error.
     pub fn scanned_height(&self) -> Result<Option<u32>> {
-        Ok(self.next_height()?.checked_sub(1))
+        let tx = self.db.begin_read()?;
+        Ok(tx
+            .open_table(HEIGHTS)?
+            .last()?
+            .map(|(height, _)| height.value()))
     }
 
     /// Returns the persisted active receiving address. Receipt scanning rotates
@@ -950,6 +1198,19 @@ impl Wallet {
         tx: &WriteTransaction,
         label: &str,
     ) -> Result<(u64, KryptosAddress)> {
+        let next_scan_height = {
+            let heights = tx.open_table(HEIGHTS)?;
+            let last = heights.last()?;
+            match last {
+                Some((height, _)) => height.value().saturating_add(1),
+                None => tx
+                    .open_table(META)?
+                    .get(SCAN_START_HEIGHT)?
+                    .map(|height| decode_meta_height(height.value()))
+                    .transpose()?
+                    .unwrap_or(0),
+            }
+        };
         let mut meta = tx.open_table(META)?;
         let range = read_address_range(&meta)?;
         let index = range.end;
@@ -971,6 +1232,13 @@ impl Wallet {
         let sealed = self.file_key.seal(TAG_LABEL, index, label.as_bytes())?;
         tx.open_table(ADDRESSES)?.insert(index, sealed.as_slice())?;
         meta.insert(NEXT_ADDRESS, next.to_le_bytes().as_slice())?;
+        let birthday = read_meta_height(&meta, BIRTHDAY_HEIGHT)?
+            .unwrap_or(0)
+            .max(next_scan_height);
+        meta.insert(
+            format!("{ADDRESS_BIRTHDAY_PREFIX}{index}").as_str(),
+            birthday.to_le_bytes().as_slice(),
+        )?;
         Ok((index, address))
     }
 
@@ -1269,6 +1537,39 @@ fn decode_u64(bytes: &[u8]) -> Result<u64> {
         .try_into()
         .map(u64::from_le_bytes)
         .map_err(|_| Error::Corrupt("u64 meta value"))
+}
+
+fn decode_meta_height(bytes: &[u8]) -> Result<u32> {
+    bytes
+        .try_into()
+        .map(u32::from_le_bytes)
+        .map_err(|_| Error::Corrupt("wallet height metadata"))
+}
+
+fn read_meta_height(
+    meta: &impl ReadableTable<&'static str, &'static [u8]>,
+    key: &str,
+) -> Result<Option<u32>> {
+    meta.get(key)?
+        .map(|value| decode_meta_height(value.value()))
+        .transpose()
+}
+
+fn read_address_birthdays(
+    meta: &impl ReadableTable<&'static str, &'static [u8]>,
+    range: AddressScanRange,
+) -> Result<Vec<u32>> {
+    let default = read_meta_height(meta, BIRTHDAY_HEIGHT)?.unwrap_or(0);
+    (range.start..range.end)
+        .map(|index| {
+            let name = format!("{ADDRESS_BIRTHDAY_PREFIX}{index}");
+            Ok(meta
+                .get(name.as_str())?
+                .map(|value| decode_meta_height(value.value()))
+                .transpose()?
+                .unwrap_or(default))
+        })
+        .collect()
 }
 
 /// A height row: `hash || first position`.
@@ -1663,6 +1964,88 @@ mod tests {
     }
 
     #[test]
+    fn spending_the_last_coin_keeps_scan_progress_and_rollback_restores_the_coin() {
+        let mut rng = ChaCha20Rng::seed_from_u64(7401);
+        let key = sk(7401);
+        let owner = WalletKeys::from_spending_key(key.clone()).unwrap();
+        let recipient = WalletKeys::from_spending_key(sk(7402)).unwrap();
+        let funding = coinbase_block(&mut rng, &owner, BlockHash::ZERO, 0, 1_000_000_000);
+        let (_full_dir, full) = temp_wallet(&key, funding.hash(), &mut rng);
+        let (_compact_dir, compact) = temp_wallet(&key, funding.hash(), &mut rng);
+        full.scan(&funding).unwrap();
+        compact
+            .scan_compact(&CompactBlock::from_block(&funding).unwrap())
+            .unwrap();
+
+        let funded = full.unspent().unwrap().pop().unwrap();
+        let (path, anchor) = full.witness(funded.position).unwrap();
+        let mut builder = Builder::new(anchor);
+        builder
+            .add_spend(SpendInfo::new(key, funded.coin.clone(), path.clone()))
+            .unwrap();
+        let fee = Transaction::default_fee_for_actions(2).unwrap();
+        builder
+            .add_output(OutputInfo::new(
+                recipient.default_address().unwrap(),
+                RawCoin::from_raw(funded.coin.value().raw() - fee.raw()).unwrap(),
+            ))
+            .unwrap();
+        let spend = builder.build_with_fee(fee, pk(), BRANCH, &mut rng).unwrap();
+        let mut header = empty_header(1, funding.hash(), anchor);
+        header.tx_root = protocol::block::tx_root([spend.txid()]);
+        let spending = Block::new(header, vec![spend]);
+        let empty = Block::new(empty_header(2, spending.hash(), anchor), vec![]);
+        let orphaned = coinbase_block(&mut rng, &owner, empty.hash(), 3, 9);
+
+        for (wallet, light) in [(&full, false), (&compact, true)] {
+            let scan = |block: &Block| {
+                if light {
+                    wallet.scan_compact(&CompactBlock::from_block(block).unwrap())
+                } else {
+                    wallet.scan(block)
+                }
+                .unwrap()
+            };
+            assert_eq!(scan(&spending), ScanReport { found: 0, spent: 1 });
+            assert_eq!(wallet.balance().unwrap(), 0);
+            assert_eq!(wallet.next_height().unwrap(), 2);
+            assert_eq!(wallet.coins().unwrap()[0].spent_at, Some(1));
+            assert_eq!(wallet.scanned_hash(1).unwrap(), Some(spending.hash()));
+            assert_eq!(scan(&empty), ScanReport::default());
+            assert_eq!(wallet.next_height().unwrap(), 3);
+            assert_eq!(wallet.scanned_hash(2).unwrap(), Some(empty.hash()));
+
+            assert_eq!(scan(&orphaned), ScanReport { found: 1, spent: 0 });
+            let orphaned_coin = wallet.unspent().unwrap().pop().unwrap();
+            assert_eq!(
+                indexed_position(wallet, &orphaned_coin.nullifier),
+                Some(orphaned_coin.position)
+            );
+            wallet.rollback_to(0).unwrap();
+            assert_eq!(wallet.next_height().unwrap(), 1);
+            assert_eq!(wallet.scanned_hash(1).unwrap(), None);
+            assert_eq!(wallet.coins().unwrap().len(), 1);
+            assert_eq!(indexed_position(wallet, &orphaned_coin.nullifier), None);
+            let unspent = wallet.unspent().unwrap().pop().unwrap();
+            assert_eq!(unspent.nullifier, funded.nullifier);
+            assert_eq!(unspent.spent_by, None);
+            assert_eq!(
+                indexed_position(wallet, &funded.nullifier),
+                Some(funded.position)
+            );
+            assert_eq!(
+                wallet.witness(unspent.position).unwrap(),
+                (path.clone(), anchor)
+            );
+
+            let replacement = Block::new(empty_header(1, funding.hash(), anchor), vec![]);
+            assert_eq!(scan(&replacement), ScanReport::default());
+            assert_eq!(wallet.scanned_hash(1).unwrap(), Some(replacement.hash()));
+            assert_eq!(wallet.balance().unwrap(), funded.coin.value().raw());
+        }
+    }
+
+    #[test]
     fn compact_scanning_finds_the_same_coins_and_tree_as_full_scanning() {
         use protocol::compact::CompactBlock;
 
@@ -1700,6 +2083,134 @@ mod tests {
         light
             .scan_compact(&CompactBlock::from_block(&b1).unwrap())
             .unwrap_err();
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn birthday_frontier_bootstrap_preserves_later_coin_witnesses_and_backup() {
+        let mut rng = ChaCha20Rng::seed_from_u64(7201);
+        let owner_key = sk(7201);
+        let owner = WalletKeys::from_spending_key(owner_key.clone()).unwrap();
+        let mut imported = Frontier::<Node, 48>::empty();
+        let mut naive = crypto::merkle::MerkleTree::new();
+        for value in [11u64, 12, 13] {
+            let leaf = pallas::Base::from(value);
+            assert!(imported.append(Node::new(leaf)));
+            naive.append(leaf).unwrap();
+        }
+        let empty_root = Anchor::from_base(crypto::merkle::MerkleTree::new().root());
+        let genesis = Block::new(empty_header(0, BlockHash::ZERO, empty_root), vec![]);
+        let checkpoint_header = empty_header(
+            1,
+            genesis.hash(),
+            Anchor::from_base(*imported.root().inner()),
+        );
+        let block = coinbase_block(&mut rng, &owner, checkpoint_header.hash(), 2, 50);
+        let mut replay_tree = crypto::merkle::MerkleTree::new();
+        for action in &CompactBlock::from_block(&block).unwrap().actions {
+            naive.append(*action.cmx.inner()).unwrap();
+            replay_tree.append(*action.cmx.inner()).unwrap();
+        }
+        let alternate_base = Block::new(empty_header(1, genesis.hash(), empty_root), vec![]);
+        let mut header = empty_header(
+            2,
+            alternate_base.hash(),
+            Anchor::from_base(replay_tree.root()),
+        );
+        header.tx_root = block.tx_root();
+        let replacement = Block::new(header, block.transactions().to_vec());
+
+        for light in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let wallet = Wallet::create_with_birthday(
+                dir.path().join("wallet.redb"),
+                &owner_key,
+                genesis.hash(),
+                2,
+                &mut rng,
+            )
+            .unwrap();
+            let scan = |wallet: &Wallet, block: &Block| {
+                if light {
+                    wallet.scan_compact(&CompactBlock::from_block(block).unwrap())
+                } else {
+                    wallet.scan(block)
+                }
+            };
+            assert_eq!(wallet.birthday_height().unwrap(), 2);
+            assert_eq!(wallet.next_height().unwrap(), 2);
+            assert_eq!(wallet.scanned_height().unwrap(), None);
+            assert!(scan(&wallet, &block).is_err());
+            assert!(wallet.coins().unwrap().is_empty());
+
+            wallet
+                .initialize_scan_checkpoint(&checkpoint_header, imported.clone())
+                .unwrap();
+            let scan_base = Some((1, checkpoint_header.hash()));
+            assert_eq!(wallet.scan_base().unwrap(), scan_base);
+            assert_eq!(wallet.scanned_height().unwrap(), Some(1));
+            assert_eq!(wallet.tree_size().unwrap(), imported.tree_size());
+            scan(&wallet, &block).unwrap();
+            let coin = wallet.unspent().unwrap().pop().unwrap();
+            let (path, anchor) = wallet.witness(coin.position).unwrap();
+            assert_eq!(anchor, Anchor::from_base(naive.root()));
+            assert_eq!(path.root(coin.coin.cmx().unwrap().inner()), naive.root());
+
+            let backup = wallet.backup_json().unwrap();
+            let restored_path = dir.path().join("restored.redb");
+            Wallet::restore_backup_json(&restored_path, &backup, genesis.hash()).unwrap();
+            let restored = Wallet::open(&restored_path, genesis.hash()).unwrap();
+            assert_eq!(restored.next_height().unwrap(), 3);
+            assert_eq!(restored.scan_base().unwrap(), scan_base);
+            assert_eq!(restored.balance().unwrap(), wallet.balance().unwrap());
+            assert_eq!(
+                restored.witness(coin.position).unwrap(),
+                (path.clone(), anchor)
+            );
+
+            restored.rollback_to(1).unwrap();
+            assert_eq!(restored.next_height().unwrap(), 2);
+            assert_eq!(restored.scan_base().unwrap(), scan_base);
+            assert!(restored.coins().unwrap().is_empty());
+            assert!(restored.witness(coin.position).is_err());
+            scan(&restored, &block).unwrap();
+            assert_eq!(restored.witness(coin.position).unwrap(), (path, anchor));
+
+            let mut op = restored.add_operation(None, 2, 1_000).unwrap();
+            let txid = block.transactions()[0].txid();
+            op.status = OperationStatus::Confirmed { txid, height: 2 };
+            restored.put_operation(&op).unwrap();
+
+            let receiving = restored.current_receive_address().unwrap();
+            restored.reset_scan_to_genesis().unwrap();
+            assert_eq!(restored.next_height().unwrap(), 0);
+            assert_eq!(restored.scan_base().unwrap(), None);
+            assert_eq!(restored.scanned_height().unwrap(), None);
+            assert_eq!(restored.tree_size().unwrap(), 0);
+            assert_eq!(restored.balance().unwrap(), 0);
+            assert!(restored.witness(coin.position).is_err());
+            assert_eq!(indexed_position(&restored, &coin.nullifier), None);
+            assert_eq!(restored.current_receive_address().unwrap(), receiving);
+            assert_eq!(
+                restored.operation(op.id).unwrap().status,
+                OperationStatus::Submitted { txid, built_at: 2 }
+            );
+
+            for block in [&genesis, &alternate_base, &replacement] {
+                scan(&restored, block).unwrap();
+            }
+            let replayed = restored.unspent().unwrap().pop().unwrap();
+            assert_eq!(replayed.nullifier, coin.nullifier);
+            assert_ne!(replayed.position, coin.position);
+            assert!(restored.witness(coin.position).is_err());
+            let (path, replayed_anchor) = restored.witness(replayed.position).unwrap();
+            assert_ne!(replayed_anchor, anchor);
+            assert_eq!(replayed_anchor, replacement.header().commitment_root);
+            assert_eq!(
+                path.root(replayed.coin.cmx().unwrap().inner()),
+                replay_tree.root()
+            );
+        }
     }
 
     #[test]
@@ -1814,6 +2325,85 @@ mod tests {
         let reopened = Wallet::open(dir.path().join("wallet.redb"), BlockHash::ZERO).unwrap();
         assert_eq!(reopened.current_receive_address().unwrap(), current);
         assert_eq!(reopened.balance().unwrap(), 100);
+    }
+
+    #[test]
+    fn address_birthdays_follow_rollback_for_full_and_compact_scans() {
+        let mut rng = ChaCha20Rng::seed_from_u64(7301);
+        let key = sk(7301);
+        let frontier = Frontier::<Node, 48>::empty();
+        let anchor = Anchor::from_base(*frontier.root().inner());
+        let base = empty_header(0, BlockHash::ZERO, anchor);
+        let first = Block::new(empty_header(1, base.hash(), anchor), vec![]);
+        let second = Block::new(empty_header(2, first.hash(), anchor), vec![]);
+        let third = Block::new(empty_header(3, second.hash(), anchor), vec![]);
+        let birthdays = |wallet: &Wallet| {
+            let tx = wallet.db.begin_read().unwrap();
+            let meta = tx.open_table(META).unwrap();
+            read_address_birthdays(&meta, AddressScanRange { start: 0, end: 2 }).unwrap()
+        };
+        let recipient = WalletKeys::from_spending_key(key.clone())
+            .unwrap()
+            .address(DiversifierIndex::from(1))
+            .unwrap();
+        let receiving = (1, recipient.clone());
+        let credit = RawCoin::from_raw(50).unwrap();
+        let mut builder = Builder::new(anchor);
+        builder
+            .add_output(OutputInfo::new(recipient, credit))
+            .unwrap();
+        let payment = builder
+            .build_coinbase(pk(), credit, BRANCH, &mut rng)
+            .unwrap();
+        let mut header = empty_header(1, base.hash(), anchor);
+        header.tx_root = protocol::block::tx_root([payment.txid()]);
+        let replacement = Block::new(header, vec![payment]);
+
+        for light in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("wallet.redb");
+            let wallet =
+                Wallet::create_with_birthday(&path, &key, BlockHash::ZERO, 1, &mut rng).unwrap();
+            wallet
+                .initialize_scan_checkpoint(&base, frontier.clone())
+                .unwrap();
+            let scan = |block: &Block| {
+                if light {
+                    wallet.scan_compact(&CompactBlock::from_block(block).unwrap())
+                } else {
+                    wallet.scan(block)
+                }
+                .unwrap()
+            };
+            for block in [&first, &second, &third] {
+                scan(block);
+            }
+            assert_eq!(
+                wallet.new_address("shared before reorg").unwrap(),
+                receiving
+            );
+            assert_eq!(birthdays(&wallet), [1, 4]);
+            // Scan keys must reflect the lowered birthdays even when the
+            // allocated key range stays the same.
+            wallet.scanning_keys().unwrap();
+            wallet.rollback_to(2).unwrap();
+            assert_eq!(wallet.next_height().unwrap(), 3);
+            assert_eq!(birthdays(&wallet), [1, 3]);
+            wallet.rollback_to(0).unwrap();
+            assert_eq!(wallet.next_height().unwrap(), 1);
+            assert_eq!(birthdays(&wallet), [1, 1]);
+            assert_eq!(wallet.scan_base().unwrap(), Some((0, base.hash())));
+            assert_eq!(wallet.birthday_height().unwrap(), 1);
+            assert_eq!(
+                wallet.current_receive_address().unwrap(),
+                Some(receiving.clone())
+            );
+            assert_eq!(scan(&replacement).found, 1);
+            drop(wallet);
+            let wallet = Wallet::open(&path, BlockHash::ZERO).unwrap();
+            assert_eq!(wallet.balance().unwrap(), 50);
+            assert_eq!(birthdays(&wallet), [1, 1]);
+        }
     }
 
     #[test]

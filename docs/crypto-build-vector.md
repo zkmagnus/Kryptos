@@ -48,3 +48,26 @@ measurement ignored per command), with the identical current-domain digest
 above. The isolated old-domain comparison also passed its unchanged former
 expected digest. No production source was modified for either comparison in
 the working checkout.
+
+## Kryptos rename vector correction — November 21, 2026
+
+Commit `97e66eba` subsequently renamed the two curve domains from
+`rhombus:Generator` and `rhombus:DiversifiedBase` to their `kryptos:`
+equivalents. It also changed the synthetic signed message from
+`Rhombus build consistency` to `Kryptos build consistency`, but left the
+aggregate expected digest unchanged.
+
+A fresh isolated copy of the current crypto crate restored only those three
+strings. Its unchanged expected-vector assertion passed and reproduced
+`e1081cf184e5f362183188e288ffcf789ac426b22059076f062b58d3f4f37eaf`
+exactly. With the current Kryptos strings, the digest is
+`913080149e20a8cfee83882726b90abb661c4ebbd6a710f60d9790c548da3de1`.
+
+The expected vector and explanatory comment were updated after that comparison.
+No production cryptographic source was changed. The assertion and malformed
+encoding, signature, and wrong-message checks remain enabled. This establishes
+the cause of the stale fixture, not independent cryptographic correctness.
+
+The corrected vector passed with the repository's default
+`-C target-cpu=native` and with `RUSTFLAGS=''` (portable), both in the optimized
+test profile on the current host. Each produced the same `91308014...` digest.

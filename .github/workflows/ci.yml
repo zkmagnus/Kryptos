@@ -57,6 +57,8 @@ jobs:
         run: cargo check --workspace --all-targets --locked
       - name: Run workspace Clippy
         run: cargo clippy --workspace --all-targets --locked
+      - name: Deny arithmetic side effects in consensus and storage targets
+        run: cargo clippy -p chain -p protocol -p storage --all-targets --locked -- -D clippy::arithmetic_side_effects
       - name: Run unit, integration, and documentation tests
         # Limit concurrent provers/RandomX instances on the hosted runner.
         run: cargo test --workspace --locked -- --test-threads=2
@@ -117,7 +119,7 @@ jobs:
           cargo test --release --locked -p chain --lib pow::tests::native_bindings_match_the_published_randomx_vectors
 
   dependencies:
-    name: Dependency advisories
+    name: Dependency policy and advisories
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -128,5 +130,9 @@ jobs:
         run: rustup show active-toolchain
       - name: Install pinned cargo-audit
         run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Install pinned cargo-deny
+        run: cargo install cargo-deny --version 0.19.9 --locked
+      - name: Check dependency versions, licenses, and sources offline
+        run: cargo deny --locked --offline check bans licenses sources
       - name: Check the lockfile against current RustSec advisories
         run: cargo audit --deny warnings

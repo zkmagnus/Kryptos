@@ -110,7 +110,9 @@ pub fn body_root_from_bytes(body: &[u8]) -> Result<Digest> {
     let mut level = 0u32;
     while nodes.len() > 1 {
         nodes = parent_level(&nodes, level);
-        level += 1;
+        level = level
+            .checked_add(1)
+            .ok_or(Error::Malformed("body tree depth"))?;
     }
     let node = nodes.first().ok_or(Error::Malformed("empty body tree"))?;
     Ok(finalize(
@@ -165,8 +167,13 @@ impl BodyMerklePath {
         if self.siblings.len() != depth {
             return false;
         }
-        let offset = u64::from(self.index) * BODY_CHUNK_SIZE as u64;
-        let expected_len = (self.body_len - offset).min(BODY_CHUNK_SIZE as u64);
+        let Some(expected_len) = u64::from(self.index)
+            .checked_mul(BODY_CHUNK_SIZE as u64)
+            .and_then(|offset| self.body_len.checked_sub(offset))
+            .map(|remaining| remaining.min(BODY_CHUNK_SIZE as u64))
+        else {
+            return false;
+        };
         if u64::try_from(chunk.len()).ok() != Some(expected_len) {
             return false;
         }
@@ -247,7 +254,9 @@ pub fn body_merkle_path(body: &[u8], index: usize) -> Result<BodyMerklePath> {
         );
         nodes = parent_level(&nodes, level);
         position /= 2;
-        level += 1;
+        level = level
+            .checked_add(1)
+            .ok_or(Error::Malformed("body tree depth"))?;
     }
     Ok(BodyMerklePath {
         index,

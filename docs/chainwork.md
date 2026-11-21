@@ -28,11 +28,11 @@ transaction root, authorization and state effects. Only successful exact
 headers are cached; eviction causes a fresh proof check and does not affect
 validity.
 
-Fork choice compares the indexed totals. A strictly larger total wins. Equal
-work keeps the first successfully imported tip; a smaller block hash cannot
-replace it. "First seen" here means accepted block arrival, not an unverified
-header announcement or an inventory advertisement. Side branches retain their
-work index so importing another descendant does not rescan and sum both chains.
+Fork choice compares the indexed totals. A strictly larger total wins. At
+equal work, the lexicographically larger tip hash wins, so nodes that validate
+the same candidate tips converge regardless of block arrival order. Side
+branches retain their work index so importing another descendant does not
+rescan and sum both chains.
 
 The `chainwork` redb table maps a block hash to 32 big-endian bytes. `Store::apply`
 and `Store::put_block` write the bytes and work in the same database transaction.
@@ -43,8 +43,16 @@ work index entries when the chain opens.
 Storage layout version **1** under the new chain store marker requires this
 index. An older database is refused with the existing resync error; no
 unvalidated values are reconstructed from claimed targets. Consensus revision
-**1** includes exact compact difficulty and
-checked 256-bit accumulation in the rules digest. The configured mainnet block
+**2** includes deterministic equal-work fork choice, exact compact difficulty
+and checked 256-bit accumulation in the rules digest. The header format remains
+version **1**. Databases stamped with revision 1's first-accepted-tip rule are
+refused with `RulesMismatch`, including mainnet databases whose parameters and
+genesis are otherwise identical. This source change does not migrate their
+history or rewrite their recorded digest. Operators must coordinate the rules
+revision and validate history into a separate fresh chain directory, preserving
+the stopped original database and binary for rollback.
+
+The configured mainnet block
 interval is **120 seconds** from launch. Both network configurations permit
 reverting at most **50 canonical blocks**; deeper forks are rejected before
 fork choice.
@@ -54,6 +62,9 @@ See [the policy and compatibility procedure](release-hardening.md).
 block validation or the consensus rules digest. Sync only downloads bodies once
 validated peer header work reaches `max(local_tip_work, MIN_CHAIN_WORK)`. Raising
 this threshold for a release should accompany an appropriate checkpoint.
+Equal-height peers with a non-genesis tip also exchange headers on connection,
+so reconnecting nodes can discover competing tips. Equal-work header candidates
+remain eligible for body download; full block validation decides fork choice.
 Header candidates awaiting the work threshold or a checkpoint are spooled to an
 anonymous temporary file in the datadir, with only the difficulty lookback in
 memory. Candidates below a future checkpoint stay unauthenticated until the
@@ -69,14 +80,14 @@ Implementation choices:
   overflow before transaction verification, and passes the computed index value
   to storage. Exposes header rules for headers-first synchronization.
 - `crates/chain/src/chain.rs`: reads indexed cumulative work for fork choice and
-  crash recovery; defines genesis work and preserves arrival-order ties.
+  crash recovery; defines genesis work and resolves equal-work ties by tip hash.
 - `crates/chain/src/error.rs`: gives overflow a distinct error.
 - `crates/chain/src/params.rs` sets the two-minute mainnet interval and documents
   the resulting 100-block difficulty window of about 3 hours 20 minutes.
 - `crates/storage/src/store.rs`: stores cumulative work atomically beside each
   block and refuses the old layout rather than silently serving an absent index.
-- `crates/chain/tests/chain.rs`: covers monotonic persisted work, arrival-order
-  ties even when the later hash is smaller, overflow without a tip mutation,
-  and equivalent noncanonical `nBits` rejection.
+- `crates/chain/tests/chain.rs`: covers monotonic persisted work, equal-work
+  fork choice across both import orders, overflow without a tip mutation, and
+  equivalent noncanonical `nBits` rejection.
 - `crates/runtime/tests/sync_adversarial.rs`: uses the one-RTT version exchange
   and verifies invalid `nBits` cannot trigger a body request.

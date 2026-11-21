@@ -1,0 +1,49 @@
+# Run with cargo-deny 0.19.9. Cargo.lock and the patched vendor tree are reviewed
+# together; this policy does not replace validation of local vendor changes.
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+unmaintained = "all"
+ignore = []
+
+[licenses]
+include-dev = true
+allow = [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "GPL-3.0-or-later",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+[[licenses.exceptions]]
+crate = "option-ext@0.2.0"
+allow = ["MPL-2.0"]
+
+[bans]
+# Arti and other upstream crates require multiple dependency generations.
+# Curve/proof types, however, must have a single version across all targets.
+multiple-versions = "warn"
+multiple-versions-include-dev = true
+deny = [
+    { crate = "pasta_curves", deny-multiple-versions = true },
+    { crate = "halo2_proofs", deny-multiple-versions = true },
+    { crate = "halo2_gadgets", deny-multiple-versions = true },
+    { crate = "halo2_poseidon", deny-multiple-versions = true },
+]
+# Internal workspace path dependencies intentionally omit registry versions.
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

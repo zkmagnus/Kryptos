@@ -146,10 +146,7 @@ mod tests {
         let address = keys.default_address().unwrap();
         let encoded = address.encode(protocol::address::Network::Main);
         assert_eq!(
-            protocol::address::KryptosAddress::decode(
-                &encoded,
-                protocol::address::Network::Main
-            ),
+            protocol::address::KryptosAddress::decode(&encoded, protocol::address::Network::Main),
             Ok(address),
             "account 0 address of the all-zero phrase did not round-trip"
         );

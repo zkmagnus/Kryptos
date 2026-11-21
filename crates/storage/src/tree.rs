@@ -59,6 +59,12 @@ impl CommitmentTree {
     pub fn root(&self) -> Anchor {
         Anchor::from_base(*self.frontier.root().inner())
     }
+
+    /// The bounded append frontier, sufficient to initialize a wallet's
+    /// witness tree without replaying commitments before its birthday.
+    pub fn frontier(&self) -> Frontier<Node, DEPTH> {
+        self.frontier.clone()
+    }
 }
 
 impl Encodable for CommitmentTree {

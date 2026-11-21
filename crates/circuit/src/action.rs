@@ -200,6 +200,13 @@ impl PublicInputs {
     /// # Errors
     /// Propagates [`ActionWitness::cv_net`] errors.
     pub fn from_witness(anchor: Fp, witness: &ActionWitness) -> Result<Self, crypto::Error> {
+        // Field negation is defined modulo the prime and cannot overflow.
+        #[allow(clippy::arithmetic_side_effects)]
+        let net_sign = if witness.transaction_negative {
+            -Fp::one()
+        } else {
+            Fp::one()
+        };
         Ok(Self {
             anchor,
             nf_old: witness.spend.nullifier(),
@@ -207,11 +214,7 @@ impl PublicInputs {
             cmx_new: witness.output.commitment(),
             cv_net: witness.cv_net()?,
             cv_net_total: witness.transaction_cv_net(witness.transaction_negative)?,
-            net_sign: if witness.transaction_negative {
-                -Fp::one()
-            } else {
-                Fp::one()
-            },
+            net_sign,
         })
     }
 

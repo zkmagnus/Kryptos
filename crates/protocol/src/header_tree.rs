@@ -75,6 +75,8 @@ fn finalize_root(count: u64, peaks: &[(u32, HeaderDigest)]) -> HeaderDigest {
     let count_bytes = count.to_le_bytes();
     let depth_bytes = (HEADER_TREE_DEPTH as u32).to_le_bytes();
     let peak_count = u32::try_from(peaks.len()).unwrap_or(u32::MAX).to_le_bytes();
+    // Callers construct peaks from the 33-slot frontier or validate their levels.
+    #[allow(clippy::arithmetic_side_effects)]
     let mut state = Vec::with_capacity(1 + 8 + 4 + 4 + peaks.len() * 36);
     state.extend_from_slice(ROOT_TAG);
     state.extend_from_slice(&depth_bytes);
@@ -154,6 +156,8 @@ impl HeaderFrontier {
     /// # Errors
     /// Refuses a full tree, a skipped/repeated height, or a different parent.
     /// Header rules, proof of work, and body validation are the caller's job.
+    // The capacity check bounds count below 2^32 and carry levels below 33.
+    #[allow(clippy::arithmetic_side_effects)]
     pub fn append(&mut self, header: &BlockHeader) -> Result<Vec<HeaderNode>> {
         if self.count >= HEADER_TREE_CAPACITY {
             return Err(Error::HeightExhausted);
@@ -313,7 +317,9 @@ impl HeaderMerklePath {
             return false;
         }
         let mut peak = header_leaf(self.index, &header.hash());
-        let local_index = u64::from(self.index) - start;
+        let Some(local_index) = u64::from(self.index).checked_sub(start) else {
+            return false;
+        };
         for (level, sibling) in self.siblings.iter().enumerate() {
             peak = if (local_index >> level) & 1 == 0 {
                 header_node(level as u32, &peak, sibling)
@@ -321,7 +327,7 @@ impl HeaderMerklePath {
                 header_node(level as u32, sibling, &peak)
             };
         }
-        let mut peaks = Vec::with_capacity(self.other_peaks.len() + 1);
+        let mut peaks = Vec::with_capacity(HEADER_TREE_DEPTH + 1);
         let mut other = self.other_peaks.iter();
         let mut selected = false;
         for peak_level in peak_levels(self.count) {

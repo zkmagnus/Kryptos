@@ -80,6 +80,31 @@ The cached run also could not lock the crates.io index, so it provides neither
 current advisory coverage nor yanked-release coverage. A fresh online audit is
 still required after remediation.
 
+### Cached recheck on 2026-11-21
+
+`cargo audit --deny warnings --no-fetch --no-yanked` reproduced the same three
+vulnerabilities and two warnings against the November 15 advisory snapshot.
+Fetching a fresh snapshot failed because this environment could not resolve
+GitHub. The cached result neither checks yanked releases nor reflects advisories
+added after the snapshot. No dependencies or audit exclusions were changed.
+
+### Fresh online audit on 2026-11-21
+
+A subsequent online `cargo audit --deny warnings --db
+/tmp/kryptos-release-advisory-db` successfully fetched 1,555 advisories at commit
+`f291af9b1cc0d21dfcea1709d6b037963cef262b`, updated the crates.io index, and
+scanned all 589 locked packages. It exited with status 1: the same three
+vulnerabilities and **four** denied unmaintained warnings. In addition to
+`bincode` and `paste`, these include `chrono 0.4.45`
+(`RUSTSEC-2026-0543`) and `humantime 2.4.0` (`RUSTSEC-2026-0542`).
+`cargo tree --locked --offline -i humantime` confirms active Arti paths;
+`chrono` is absent from the default host dependency tree, which does not
+establish its absence on other targets or feature selections.
+
+This fresh online result supersedes the cached recheck for release status.
+The configured audit remains a release blocker. No dependencies, vendor sources,
+lockfile entries, or advisory exclusions were changed by this audit.
+
 ## RandomX binding generation
 
 Keep bindgen 0.58.1 and enable only its `runtime` feature. The build script uses

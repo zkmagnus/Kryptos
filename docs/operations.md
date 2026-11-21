@@ -56,7 +56,7 @@ symbol stripping remain at Cargo's defaults.
 
 Run commands from the repository root. The binaries are
 `target/release/kryptos` (node and wallet CLI), `target/release/wallet` (wallet
-RPC daemon), and `target/release/rhomscan` (local database scanner). The `wallet` binary
+RPC daemon), and `target/release/kryptoscan` (local database scanner). The `wallet` binary
 currently prints `Kryptos-wallet-rpc` in its help text.
 
 ## Test network over embedded Tor
@@ -142,6 +142,39 @@ Stop nodes with Ctrl-C or SIGTERM and wait for exit before copying databases or
 Arti state. Keep test/main wallet files separate; wallets are bound to their
 network's genesis. A service-ready log confirms Arti's reported readiness, not
 successful synchronization with an independent peer.
+
+## Wallet in the node process
+
+Add `--wallet <path>` to the usual `kryptos run` command to open an existing
+wallet and scan automatically. Only one process can open the wallet file; stop
+any desktop app or standalone wallet daemon using it before running:
+
+```sh
+target/release/kryptos run --network main --datadir local-main/node \
+  --wallet local-main/wallet.redb
+```
+
+Use the node's local HTTP JSON-RPC address (default `127.0.0.1:18443`) and node
+token. Wallet methods are available on this loopback listener only. The token
+can authorize spending locally, so keep it private. No standalone wallet daemon
+or wallet-specific token is needed in this mode.
+
+```sh
+wallet_rpc() {
+  curl -sS http://127.0.0.1:18443/ \
+    -H "Authorization: Bearer $(cat local-main/node/rpc.token)" \
+    -H 'Content-Type: application/json' --data "$1"
+}
+
+wallet_rpc '{"jsonrpc":"2.0","id":1,"method":"getwalletinfo","params":[]}'
+wallet_rpc '{"jsonrpc":"2.0","id":2,"method":"getbalance","params":[]}'
+wallet_rpc '{"jsonrpc":"2.0","id":3,"method":"send","params":[{"address":"RECIPIENT_ADDRESS","amount":"100000000"}]}'
+```
+
+Replace the recipient before sending. Amounts use the smallest unit (100,000,000
+per coin). `send` queues an operation; check it with `getoperationstatus`, passing
+the returned operation ID as the first parameter. Use `rescan` with a starting
+height only if you need to repeat a scan; normal synchronization is automatic.
 
 ## Wallet daemon
 
@@ -312,7 +345,27 @@ inspection or shell history; prefer phrase recovery in a private terminal
 when a phrase is available. Fresh seed creation rejects `--restore-through`.
 
 The restore command prints `scan_address_indices` and `next_address_index`.
-Record the highest reserved index in the backup procedure. A normal wallet keeps
+It also prints `birthday_height`, the earliest block that could contain a
+payment. Record it with the phrase and highest reserved index. On restore,
+pass `--birthday-height <height>` only if the recorded height is reliable;
+omit it to scan from genesis. A height after the first payment can cause the
+wallet to miss that payment.
+
+For a fresh wallet, you can start after the current tip of a local chain.
+Stop the node first, then pass its existing chain database:
+
+```sh
+target/release/kryptos create --network main --wallet local-main/wallet.redb \
+  --chain local-main/node/chain.redb
+```
+
+The wallet uses the previous block's commitment tree to start without replaying
+earlier blocks. If the node no longer retains that checkpoint or a reorganization
+replaces it, the wallet falls back to scanning from genesis. This requires a
+node that can serve the older blocks. In the wallet RPC, `rescan` with
+`from_height` set to zero also starts over from genesis.
+
+A normal wallet keeps
 its durable range and extends it as new addresses are issued, up to 4096
 separate ML-KEM keys. To recover a larger historical range later, create a new
 wallet file with a higher bound and rescan from genesis; increasing the bound
@@ -400,6 +453,11 @@ host, not a production wallet recovery or a multi-location competing-miner
 benchmark. See [RPC recovery](rpc-and-reorg-recovery.md) and
 [measured relay results](block-propagation.md) for the tested paths and limits.
 
+On 2026-11-21 a repeat attempt in a restricted sandbox could not reach Tor
+bootstrap. Arti rejected the sandbox root directory owner in three tests, and
+the RPC test could not open its loopback listener. Rerun all four tests in an
+environment with working loopback TCP and public Tor access.
+
 ## Checks and public-release requirements
 
 [CI](../.github/workflows/ci.yml) runs formatting, all-target compilation,
@@ -429,13 +487,10 @@ fixtures use in-memory streams; real Tor tests must be requested explicitly. Mea
 regeneration tests marked `#[ignore]` are separate explicit tasks, not run by
 the default suite. The fuzz target in `fuzz/` is not a continuous fuzzing service.
 
-The embedded migration's final Rust 1.100.0 workspace run on 2026-11-16 passed:
-**545 tests passed, 0 failed, 9 ignored** across 40 result groups. The ignored tests
-are two public-Tor exercises, six measurement tests and one fixed-base table
-generation test. Formatting, the network
-source guard, whitespace checks and Clippy passed; Clippy still reports existing
-legacy warnings, with no new networking diagnostics. See the
-[verification report](tor-only-networking.md#dependencies-and-verification).
+The November 21 testnet checkpoint validation recorded **700 tests passed,
+0 failed, 12 ignored**. See the [checkpoint validation report](checkpoint-validation.md)
+for the exact command and what the run covered. The earlier embedded Tor migration
+checks are recorded in the [Tor verification report](tor-only-networking.md#dependencies-and-verification).
 
 Historical advisory findings and the daemon-era test results must not be confused
 with current validation. A refreshed RustSec audit of the embedded dependency

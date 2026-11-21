@@ -8,6 +8,7 @@
 //! block <height>         -> ok <hex> | err not found
 //! compact <height>       -> ok <hex> | err not found
 //! hash <height>          -> ok <hex> | err not found
+//! scancheckpoint <height> -> ok <header and frontier hex> | err not found
 //! submit <hex tx> -> ok <txid hex> | err <reason>
 //! txstatus <hex txid>    -> ok unknown | ok pooled | ok confirmed <height> <index>
 //! spent <hex nullifier>  -> ok true | ok false
@@ -319,6 +320,10 @@ pub fn parse(line: &str) -> Result<Request> {
             .parse()
             .map(Request::Hash)
             .map_err(|_| Error::Argument("height".into())),
+        "scancheckpoint" => argument
+            .parse()
+            .map(Request::ScanCheckpoint)
+            .map_err(|_| Error::Argument("height".into())),
         "coinbase" => argument
             .parse()
             .map(Request::Coinbase)
@@ -364,10 +369,16 @@ pub fn format(response: &Response) -> String {
         Response::Block(Some(block)) => format!("ok {}", to_hex(&block.to_vec())),
         Response::Compact(Some(block)) => format!("ok {}", to_hex(&block.to_vec())),
         Response::Hash(Some(hash)) => format!("ok {}", to_hex(hash.as_bytes())),
+        Response::ScanCheckpoint(Some((header, tree))) => {
+            let mut bytes = header.to_vec();
+            bytes.extend(tree.to_vec());
+            format!("ok {}", to_hex(&bytes))
+        }
         Response::Coinbase(Some(tx)) => format!("ok {}", to_hex(&tx.to_vec())),
         Response::Block(None)
         | Response::Compact(None)
         | Response::Hash(None)
+        | Response::ScanCheckpoint(None)
         | Response::Coinbase(None) => "err not found".into(),
         Response::Submitted(txid) => format!("ok {txid}"),
         Response::TransactionStatus(TxStatus::Unknown) => "ok unknown".into(),
@@ -650,7 +661,16 @@ impl Client {
 fn read_only_request(line: &str) -> bool {
     matches!(
         line.split_whitespace().next(),
-        Some("status" | "block" | "compact" | "hash" | "coinbase" | "txstatus" | "spent")
+        Some(
+            "status"
+                | "block"
+                | "compact"
+                | "hash"
+                | "scancheckpoint"
+                | "coinbase"
+                | "txstatus"
+                | "spent"
+        )
     )
 }
 
@@ -1096,33 +1116,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_request_recovers_after_partial_reply_on_a_fresh_authenticated_stream() {
-        let identity = p2p::address::NetAddr::TorV3([151; 32]);
-        let (server, mut incoming) = p2p::transport::test_support::network(identity, &[18444]);
-        let (network, _) =
-            p2p::transport::test_support::network(p2p::address::NetAddr::TorV3([152; 32]), &[]);
-        let task = tokio::spawn(async move {
-            let _server = server;
-            for bytes in [b"ok incomplete".as_slice(), b"ok height=42\n".as_slice()] {
-                let mut stream =
-                    authenticate_test_stream(incoming.recv().await.unwrap().stream).await;
-                let mut line = String::new();
-                stream.read_line(&mut line).await.unwrap();
-                assert_eq!(line, "status\n");
-                stream.get_mut().write_all(bytes).await.unwrap();
-                stream.get_mut().flush().await.unwrap();
-                // The first stream closes in the middle of its reply.
-            }
-        });
-        let mut client = Client::connect(
-            &network,
-            &identity.endpoint(18444),
-            &Token::new("test-token").unwrap(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(client.call("status").await.unwrap(), "height=42");
-        task.await.unwrap();
+    async fn read_requests_recover_after_partial_reply_on_a_fresh_authenticated_stream() {
+        let tree = storage::tree::CommitmentTree::empty();
+        let header =
+            protocol::block::empty_header(7, protocol::block::BlockHash::ZERO, tree.root());
+        let checkpoint = format(&Response::ScanCheckpoint(Some((header, tree))));
+        for (server_id, client_id, request, reply) in [
+            (151, 152, "status", "ok height=42".to_owned()),
+            (173, 174, "scancheckpoint 7", checkpoint),
+        ] {
+            let identity = p2p::address::NetAddr::TorV3([server_id; 32]);
+            let (server, mut incoming) = p2p::transport::test_support::network(identity, &[18444]);
+            let (network, _) = p2p::transport::test_support::network(
+                p2p::address::NetAddr::TorV3([client_id; 32]),
+                &[],
+            );
+            let complete_reply = format!("{reply}\n");
+            let task = tokio::spawn(async move {
+                let _server = server;
+                for bytes in [b"ok incomplete".as_slice(), complete_reply.as_bytes()] {
+                    let mut stream =
+                        authenticate_test_stream(incoming.recv().await.unwrap().stream).await;
+                    let mut line = String::new();
+                    stream.read_line(&mut line).await.unwrap();
+                    assert_eq!(line, format!("{request}\n"));
+                    stream.get_mut().write_all(bytes).await.unwrap();
+                    stream.get_mut().flush().await.unwrap();
+                    // The first stream closes in the middle of its reply.
+                }
+            });
+            let mut client = Client::connect(
+                &network,
+                &identity.endpoint(18444),
+                &Token::new("test-token").unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                client.call(request).await.unwrap(),
+                decode_reply(&reply).unwrap()
+            );
+            task.await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -1327,6 +1362,11 @@ mod tests {
         assert!(matches!(parse("coinbase 7"), Ok(Request::Coinbase(7))));
         assert!(parse("coinbase x").is_err());
         assert!(matches!(parse("hash 7"), Ok(Request::Hash(7))));
+        assert!(matches!(
+            parse("scancheckpoint 7"),
+            Ok(Request::ScanCheckpoint(7))
+        ));
+        assert!(parse("scancheckpoint x").is_err());
         assert!(parse("block x").is_err());
         assert!(parse("submit zz").is_err());
         assert!(parse("spent 00").is_err());

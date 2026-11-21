@@ -8,13 +8,15 @@
 //! - [`validate`]: stateful block validation against the store.
 //! - [`chain`]: importing blocks, including reorganizations.
 //! - [`mempool`]: the arrival-order transaction pool.
+#![deny(clippy::arithmetic_side_effects)]
 #![cfg_attr(
     test,
     allow(
         clippy::unwrap_used,
         clippy::expect_used,
         clippy::panic,
-        clippy::indexing_slicing
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
     )
 )]
 

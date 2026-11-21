@@ -217,6 +217,8 @@ impl Builder {
         let fee_blinding =
             crypto::commitment::ValueCommitTrapdoor::sum(prepared.iter().map(|p| &p.rcv));
         let aggregate_commitment = ValueCommitment::sum(bodies.iter().map(|body| body.cv_net()));
+        // Field negation is defined modulo the prime and cannot overflow.
+        #[allow(clippy::arithmetic_side_effects)]
         let net_sign = if balance < 0 {
             -crypto::pallas::Base::one()
         } else {

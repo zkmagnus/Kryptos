@@ -27,7 +27,7 @@ from node policy and from transport behavior.
 | `crates/runtime/src/node.rs` | Integrate work gates, parallel downloads, safe duplicate collapse, background pool refill, and measured relay priority. |
 | `crates/runtime/src/discovery.rs` | Remove extra verification probes beyond a full maintained pool. |
 | `crates/runtime/src/jsonrpc.rs` | Expose connection duration, RTT, sent/received bytes, and throughput in peer results. |
-| `crates/chain/tests/chain.rs` | Test persisted monotonic work, checked overflow, exact `nBits`, and first-imported fork ties. |
+| `crates/chain/tests/chain.rs` | Test persisted monotonic work, checked overflow, exact `nBits`, and equal-work fork choice across import orders. |
 | `crates/runtime/tests/connections.rs` | Test stable deterministic duplicate collapse and resistance to forged inbound onion claims. |
 | `crates/runtime/tests/sync_parallel.rs` | Test two concurrent body windows and reassignment after a helper reports a missing body. |
 | `crates/runtime/tests/sync_adversarial.rs` | Test rejection before body download and use the one-RTT handshake fixture. |
@@ -39,13 +39,14 @@ fixed network anchor. A zero target would represent `2^256` work, which cannot
 be represented by `U256`, so it is rejected as an invalid target. The maximum
 target contributes one. Work is computed only after exact compact-target
 validation, and cumulative overflow returns an error before a child block is
-stored. Equal-work forks keep the first successfully imported block; an
-unverified header or inventory announcement does not establish “first seen”.
+stored. Greater work wins; equal-work tips are ordered by block hash so the
+same validated tips produce the same fork choice at every node.
 
 Storage layout version 1 under the new chain store marker requires the
 cumulative-work index. Opening an older database fails and asks for
 resynchronization rather than reconstructing work from untrusted header
-claims. Consensus revision 1 records the current rules.
+claims. Consensus revision 2 records the deterministic equal-work fork choice;
+revision 1 stores are refused so an earlier arrival-order choice cannot persist.
 
 The maintained pool is fixed by configuration and contains authenticated
 reusable peers. A strict directed rule in which every pair always chooses the

@@ -33,7 +33,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot, Semaphore};
+use tokio::sync::{mpsc, oneshot};
 use transaction_proof::ProvingKey;
 
 use crate::config::{Network, MEMPOOL_CAPACITY};
@@ -271,6 +271,7 @@ impl TemplateCache {
 pub struct Context {
     events: mpsc::Sender<Event>,
     network: Network,
+    local_wallet: Option<crate::walletd::WalletDaemon>,
     params: ChainParams,
     /// Built on the first template request; proving a coinbase needs it.
     proving_key: Arc<tokio::sync::OnceCell<Arc<ProvingKey>>>,
@@ -285,11 +286,17 @@ impl Context {
         Self {
             events,
             network,
+            local_wallet: None,
             params: network.params(),
             proving_key: Arc::new(tokio::sync::OnceCell::new()),
             templates: Arc::new(Mutex::new(TemplateCache::default())),
             preparation: Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    pub(crate) fn with_local_wallet(mut self, wallet: crate::walletd::WalletDaemon) -> Self {
+        self.local_wallet = Some(wallet);
+        self
     }
 
     async fn proving_key(&self) -> core::result::Result<Arc<ProvingKey>, RpcError> {
@@ -476,6 +483,21 @@ pub trait Dispatch: Clone + Send + Sync + 'static {
 
 impl Dispatch for Context {
     async fn call(&self, method: &str, params: &Params) -> core::result::Result<Value, RpcError> {
+        if let Some(wallet) = &self.local_wallet {
+            if method == "help" {
+                let mut methods = METHODS.to_vec();
+                methods.extend(
+                    crate::walletd::METHODS
+                        .iter()
+                        .copied()
+                        .filter(|m| *m != "help"),
+                );
+                return Ok(json!(methods));
+            }
+            if crate::walletd::METHODS.contains(&method) {
+                return wallet.call(method, params).await;
+            }
+        }
         dispatch(self, method, params).await
     }
 }
@@ -493,19 +515,36 @@ pub async fn serve(
 /// Serves `dispatcher`'s methods forever behind `token`, one request per
 /// connection.
 pub async fn serve_with<D: Dispatch>(listener: TcpListener, token: Token, dispatcher: D) {
-    let slots = Arc::new(Semaphore::new(16));
-    while let Ok((stream, _)) = listener.accept().await {
-        let Ok(permit) = slots.clone().try_acquire_owned() else {
-            continue;
-        };
-        let dispatcher = dispatcher.clone();
-        let token = token.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            let mut stream = stream;
-            let _ = serve_stream(&mut stream, &dispatcher, &token).await;
-        });
+    serve_until(listener, token, dispatcher, std::future::pending()).await;
+}
+
+pub(crate) async fn serve_until<D: Dispatch>(
+    listener: TcpListener,
+    token: Token,
+    dispatcher: D,
+    stop: impl std::future::Future<Output = ()>,
+) {
+    tokio::pin!(stop);
+    let mut connections = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut stop => break,
+            _ = connections.join_next(), if !connections.is_empty() => {}
+            accepted = listener.accept() => {
+                let Ok((mut stream, _)) = accepted else { break };
+                if connections.len() >= 16 {
+                    continue;
+                }
+                let dispatcher = dispatcher.clone();
+                let token = token.clone();
+                connections.spawn(async move {
+                    let _ = serve_stream(&mut stream, &dispatcher, &token).await;
+                });
+            }
+        }
     }
+    connections.shutdown().await;
 }
 
 /// Serves one HTTP RPC request on an already accepted stream.
@@ -1109,6 +1148,7 @@ fn variant_name(response: &Response) -> &'static str {
         Response::Compact(_) => "compact",
         Response::Coinbase(_) => "coinbase",
         Response::Hash(_) => "hash",
+        Response::ScanCheckpoint(_) => "scan checkpoint",
         Response::Submitted(_) => "submitted",
         Response::Spent(_) => "spent",
         Response::Metrics(_) => "metrics",

@@ -562,7 +562,11 @@ impl SnapshotPayload {
             .checked_add(protocol::block::HEADER_LEN_V1)
             .and_then(|n| n.checked_add(48))
             .ok_or(SnapshotError::PayloadLength)?;
-        if header_count > r.remaining() / min_header_record {
+        let max_header_count = r
+            .remaining()
+            .checked_div(min_header_record)
+            .ok_or(SnapshotError::PayloadLength)?;
+        if header_count > max_header_count {
             return Err(SnapshotError::HeaderHistory);
         }
         let mut recent_headers = Vec::with_capacity(header_count);

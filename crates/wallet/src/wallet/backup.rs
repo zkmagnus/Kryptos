@@ -8,12 +8,13 @@ use redb::ReadableTableMetadata;
 use serde::Deserialize;
 
 use super::{
-    decode_height, decode_u64, read_address_range, read_auto_rotate_receive, read_receive_index,
-    Anchor, BlockHash, Database, Encodable, Error, Operation, OwnedCoin, Path, ReadableDatabase,
-    ReadableTable, Result, Wallet, ADDRESSES, ADDRESS_KEY_SCHEME, ADDRESS_KEY_START, BACKUP_FORMAT,
-    BACKUP_VERSION, CAP, CHECKPOINTS, COINS, COIN_INDEX_VERSION, CURRENT_RECEIVE_ADDRESS,
-    FINGERPRINT, GENESIS, HEIGHTS, META, NEXT_ADDRESS, NEXT_OPERATION, OPERATIONS, SHARDS,
-    SPENDING_KEY,
+    decode_height, decode_meta_height, decode_u64, read_address_range, read_auto_rotate_receive,
+    read_meta_height, read_receive_index, Anchor, BlockHash, Database, Encodable, Error, Operation,
+    OwnedCoin, Path, ReadableDatabase, ReadableTable, Result, Wallet, ADDRESSES,
+    ADDRESS_BIRTHDAY_PREFIX, ADDRESS_KEY_SCHEME, ADDRESS_KEY_START, BACKUP_FORMAT, BACKUP_VERSION,
+    BIRTHDAY_HEIGHT, CAP, CHECKPOINTS, COINS, COIN_INDEX_VERSION, CURRENT_RECEIVE_ADDRESS,
+    FINGERPRINT, GENESIS, HEIGHTS, META, NEXT_ADDRESS, NEXT_OPERATION, OPERATIONS, SCAN_BASE_HASH,
+    SCAN_BASE_HEIGHT, SCAN_START_HEIGHT, SHARDS, SPENDING_KEY,
 };
 
 #[derive(Deserialize)]
@@ -169,24 +170,79 @@ impl Wallet {
         read_auto_rotate_receive(&meta)?;
         let range = read_address_range(&meta)?;
         read_receive_index(&meta, range)?;
+        let birthday = read_meta_height(&meta, BIRTHDAY_HEIGHT)?.unwrap_or(0);
+        let scan_start = read_meta_height(&meta, SCAN_START_HEIGHT)?.unwrap_or(0);
+        let scan_base = read_meta_height(&meta, SCAN_BASE_HEIGHT)?;
+        let scan_base_hash = meta
+            .get(SCAN_BASE_HASH)?
+            .map(|value| value.value().to_vec());
+        if scan_start != birthday
+            || scan_base.is_some_and(|base| scan_start.checked_sub(1) != Some(base))
+            || scan_base.is_some() != scan_base_hash.is_some()
+            || scan_base_hash.as_ref().is_some_and(|hash| hash.len() != 32)
+        {
+            return Err(Error::Corrupt("wallet backup scan birthday"));
+        }
+        for row in meta.iter()? {
+            let (name, value) = row?;
+            if let Some(index) = name.value().strip_prefix(ADDRESS_BIRTHDAY_PREFIX) {
+                let parsed = index
+                    .parse::<u64>()
+                    .map_err(|_| Error::Corrupt("wallet backup address birthday index"))?;
+                if parsed >= range.end || parsed.to_string() != index {
+                    return Err(Error::Corrupt("wallet backup address birthday index"));
+                }
+                decode_meta_height(value.value())?;
+            }
+        }
         self.addresses()?;
         let tree_size = self.tree_size()?;
         let heights = tx.open_table(HEIGHTS)?;
-        let mut count = 0u64;
-        let mut first = 0;
+        let history_start = u64::from(scan_base.unwrap_or(0));
+        let mut expected_height = history_start;
+        let mut history_end = None;
+        let mut previous_position = 0;
+        let mut prefix_position = None;
         for row in heights.iter()? {
             let (height, value) = row?;
-            if u64::from(height.value()) != count || value.value().len() != 40 {
+            if u64::from(height.value()) != expected_height || value.value().len() != 40 {
                 return Err(Error::Corrupt("wallet backup scan history"));
             }
-            let (_, position) = decode_height(value.value())?;
-            if (count == 0 && position != 0) || position < first || position > tree_size {
+            let (hash, position) = decode_height(value.value())?;
+            if scan_base.is_some() && history_end.is_none() {
+                if scan_base_hash.as_deref() != Some(hash.as_bytes().as_slice()) {
+                    return Err(Error::Corrupt("wallet backup scan base hash"));
+                }
+            }
+            if (history_end.is_none() && scan_base.is_none() && position != 0)
+                || position < previous_position
+                || position > tree_size
+            {
                 return Err(Error::Corrupt("wallet backup tree positions"));
             }
-            first = position;
-            count = count
+            if scan_base.is_some() && history_end.is_none() {
+                prefix_position = Some(position);
+            } else if height.value() == scan_start
+                && prefix_position.is_some_and(|prefix| prefix != position)
+            {
+                return Err(Error::Corrupt("wallet backup scan base position"));
+            }
+            previous_position = position;
+            expected_height = expected_height
                 .checked_add(1)
                 .ok_or(Error::Corrupt("wallet backup height overflow"))?;
+            history_end = Some(expected_height);
+        }
+        if scan_base.is_some() && history_end.is_none()
+            || scan_start != 0 && scan_base.is_none() && history_end.is_some()
+        {
+            return Err(Error::Corrupt("wallet backup scan base"));
+        }
+        if scan_base.is_some()
+            && history_end == Some(u64::from(scan_start))
+            && prefix_position != Some(tree_size)
+        {
+            return Err(Error::Corrupt("wallet backup scan base position"));
         }
         for row in tx.open_table(SHARDS)?.iter()? {
             let (index, value) = row?;
@@ -210,7 +266,8 @@ impl Wallet {
             let checkpoint = crate::tree::decode_checkpoint(value.value())?;
             // Retained checkpoints form a contiguous suffix ending at the
             // scanned tip. Its length can be shorter after a rollback.
-            if u64::from(height) >= count
+            if u64::from(height) < history_start
+                || history_end.is_none_or(|end| u64::from(height) >= end)
                 || next_checkpoint.is_some_and(|expected| expected != u64::from(height))
             {
                 return Err(Error::Corrupt("wallet backup checkpoint"));
@@ -236,10 +293,10 @@ impl Wallet {
                 }
             }
         }
-        if next_checkpoint != (count != 0).then_some(count) {
+        if next_checkpoint != history_end {
             return Err(Error::Corrupt("wallet backup checkpoint tip"));
         }
-        let anchor = if count == 0 {
+        let anchor = if history_end.is_none() {
             if tree_size != 0 {
                 return Err(Error::Corrupt("wallet backup tree without scan history"));
             }
@@ -252,10 +309,11 @@ impl Wallet {
             let coin = OwnedCoin::from_slice(value.value())?;
             if coin.position != position.value()
                 || coin.position >= tree_size
-                || u64::from(coin.height) >= count
-                || coin
-                    .spent_at
-                    .is_some_and(|height| height < coin.height || u64::from(height) >= count)
+                || coin.height < scan_start
+                || history_end.is_none_or(|end| u64::from(coin.height) >= end)
+                || coin.spent_at.is_some_and(|height| {
+                    height < coin.height || history_end.is_none_or(|end| u64::from(height) >= end)
+                })
                 || coin.nullifier != coin.coin.nullifier(self.keys.nullifier_key())?
             {
                 return Err(Error::Corrupt("wallet backup coin state"));
@@ -316,7 +374,8 @@ impl Wallet {
                 }
             }
             if matches!(operation.status, OperationStatus::Confirmed { height, .. }
-                if u64::from(height) >= count)
+                if height < scan_start
+                    || history_end.is_none_or(|end| u64::from(height) >= end))
             {
                 return Err(Error::Corrupt("wallet backup operation confirmation"));
             }
@@ -540,6 +599,30 @@ mod tests {
             .file_name()
             .to_string_lossy()
             .starts_with(".kryptos-wallet-restore-")));
+    }
+
+    #[test]
+    fn backup_rejects_a_scan_start_inconsistent_with_birthday() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut rng = ChaCha20Rng::seed_from_u64(8801);
+        let source = Wallet::create_with_birthday(
+            directory.path().join("source.redb"),
+            &SpendingKey::random(&mut rng),
+            BlockHash::ZERO,
+            2,
+            &mut rng,
+        )
+        .unwrap();
+        let bytes = source.backup_json().unwrap();
+        let mut backup: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        change_meta(&mut backup, SCAN_START_HEIGHT, &0u32.to_le_bytes());
+        assert_rejected_without_destination(directory.path(), &backup);
+
+        let destination = directory.path().join("restored.redb");
+        Wallet::restore_backup_json(&destination, &bytes, BlockHash::ZERO).unwrap();
+        let restored = Wallet::open(destination, BlockHash::ZERO).unwrap();
+        assert_eq!(restored.next_height().unwrap(), 2);
+        assert_eq!(restored.scan_base().unwrap(), None);
     }
 
     #[test]

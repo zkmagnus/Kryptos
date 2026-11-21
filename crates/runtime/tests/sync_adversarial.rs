@@ -79,6 +79,25 @@ fn blocks() -> &'static [Block; 3] {
     })
 }
 
+/// Two valid solutions for the same body and parent, ordered by fork choice.
+fn sibling_tips() -> &'static [Block; 2] {
+    static SIBLINGS: OnceLock<[Block; 2]> = OnceLock::new();
+    SIBLINGS.get_or_init(|| {
+        let original = &blocks()[1];
+        let mut header = original.header().clone();
+        let mut rng = ChaCha20Rng::seed_from_u64(113);
+        let pow = chain::pow::RandomXPow::new(ChainParams::test().randomx_key).unwrap();
+        assert!(pow.mine(&mut header, 256, &mut rng).unwrap());
+        let sibling = Block::new(header, original.transactions().to_vec());
+        assert_ne!(original.hash(), sibling.hash());
+        if original.hash() > sibling.hash() {
+            [original.clone(), sibling]
+        } else {
+            [sibling, original.clone()]
+        }
+    })
+}
+
 struct Peer {
     writer: ConnectionWriter,
     reader: ConnectionReader,
@@ -154,6 +173,20 @@ async fn status(node: &Handle) -> (u32, BlockHash, bool) {
     }
 }
 
+/// Peer pongs acknowledge actor receipt, not completion of background validation.
+async fn wait_for_tip(node: &Handle, height: u32, hash: BlockHash) {
+    tokio::time::timeout(DEADLINE, async {
+        loop {
+            if status(node).await == (height, hash, false) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background block validation did not reach the expected tip");
+}
+
 async fn listener(network: &TorFixture) -> Handle {
     network
         .spawn(Config {
@@ -161,6 +194,111 @@ async fn listener(network: &TorFixture) -> Handle {
             ..Config::test()
         })
         .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn equal_height_peer_headers_download_the_winning_equal_work_body() {
+    let [winner, loser] = sibling_tips();
+    let genesis = chain::genesis::genesis(&ChainParams::test());
+    let network = TorFixture::new();
+    let node = listener(&network).await;
+    assert!(matches!(
+        node.request(Request::SubmitBlock(Box::new(loser.clone())))
+            .await
+            .unwrap(),
+        Response::BlockSubmitted(Submission::Accepted)
+    ));
+    assert!(matches!(
+        node.request(Request::BlockByHash(winner.hash()))
+            .await
+            .unwrap(),
+        Response::Block(None)
+    ));
+
+    let mut peer = Peer::connect(&network, &node, 1, genesis.hash()).await;
+    // A reconnect advertises only height, so equal height must still initiate
+    // a header exchange before either branch's body is considered.
+    let Message::GetHeaders { locator, .. } = peer
+        .until(|message| match message {
+            Message::GetData(_) => panic!("a body was requested before its header was verified"),
+            Message::GetHeaders { .. } => true,
+            _ => false,
+        })
+        .await
+    else {
+        unreachable!()
+    };
+    assert_eq!(locator, vec![loser.hash(), genesis.hash()]);
+    peer.send(Message::Headers(vec![winner.header().clone()]))
+        .await;
+    let Message::GetData(requests) = peer
+        .until(|message| matches!(message, Message::GetData(_)))
+        .await
+    else {
+        unreachable!()
+    };
+    assert_eq!(requests, vec![Inventory::Block(winner.hash())]);
+    peer.send(Message::Block(Box::new(winner.clone()))).await;
+    wait_for_tip(&node, 1, winner.hash()).await;
+    let Response::Peers(peers) = node.request(Request::Peers).await.unwrap() else {
+        panic!("peers response")
+    };
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0].score, 0);
+    node.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn equal_work_nodes_converge_after_reconnect_in_both_dial_directions() {
+    let [winner, loser] = sibling_tips();
+    for (inbound_tip, outbound_tip) in [(winner, loser), (loser, winner)] {
+        let directory = tempfile::tempdir().unwrap();
+        let network = TorFixture::new();
+        let inbound = network
+            .spawn(Config {
+                datadir: directory.path().join("inbound"),
+                p2p: true,
+                max_outbound: 0,
+                ..Config::test()
+            })
+            .await;
+        let mut outbound_config = Config {
+            datadir: directory.path().join("outbound"),
+            cleanup_datadir: false,
+            p2p: true,
+            max_outbound: 1,
+            ..Config::test()
+        };
+        let outbound = network.spawn(outbound_config.clone()).await;
+        for (node, block) in [(&inbound, inbound_tip), (&outbound, outbound_tip)] {
+            assert!(matches!(
+                node.request(Request::SubmitBlock(Box::new(block.clone())))
+                    .await
+                    .unwrap(),
+                Response::BlockSubmitted(Submission::Accepted)
+            ));
+            assert_eq!(status(node).await, (1, block.hash(), false));
+        }
+        outbound.shutdown().await;
+        outbound_config.cleanup_datadir = true;
+        outbound_config.connect = vec![network.endpoint(&inbound)];
+        let outbound = network.spawn(outbound_config).await;
+
+        tokio::join!(
+            wait_for_tip(&inbound, 1, winner.hash()),
+            wait_for_tip(&outbound, 1, winner.hash()),
+        );
+        for node in [&inbound, &outbound] {
+            let Response::Peers(peers) = node.request(Request::Peers).await.unwrap() else {
+                panic!("peers response")
+            };
+            assert_eq!(peers.len(), 1);
+            assert!(peers[0].ready);
+            assert_eq!(peers[0].score, 0);
+        }
+        outbound.shutdown().await;
+        inbound.shutdown().await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -258,7 +396,7 @@ async fn a_header_with_wrong_nbits_is_rejected_before_body_download() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn child_before_parent_is_requested_again_and_applied_before_sync_finishes() {
+async fn child_before_parent_is_buffered_and_applied_before_sync_finishes() {
     let [genesis, parent, child] = blocks();
     let network = TorFixture::new();
     let node = listener(&network).await;
@@ -289,18 +427,23 @@ async fn child_before_parent_is_requested_again_and_applied_before_sync_finishes
     assert_eq!(status(&node).await, (0, genesis.hash(), true));
 
     peer.send(Message::Block(Box::new(parent.clone()))).await;
-    let Message::GetData(retry) = peer
-        .until(|message| matches!(message, Message::GetData(_)))
-        .await
-    else {
-        unreachable!()
-    };
-    assert_eq!(retry, vec![Inventory::Block(child.hash())]);
-    assert_eq!(status(&node).await, (1, parent.hash(), true));
-
-    peer.send(Message::Block(Box::new(child.clone()))).await;
-    peer.barrier(2).await;
-    assert_eq!(status(&node).await, (2, child.hash(), false));
+    // The verified child body is quarantined until its parent is applied.
+    // It must be consumed without a redundant network download.
+    wait_for_tip(&node, 2, child.hash()).await;
+    peer.send(Message::Ping(2)).await;
+    loop {
+        match peer.next().await {
+            Message::Pong(2) => break,
+            Message::GetData(items) => {
+                assert!(
+                    !items.contains(&Inventory::Block(child.hash())),
+                    "quarantined child must not be downloaded again"
+                );
+            }
+            Message::Ping(nonce) => peer.send(Message::Pong(nonce)).await,
+            _ => {}
+        }
+    }
     let Response::Peers(peers) = node.request(Request::Peers).await.unwrap() else {
         panic!("peers response")
     };
@@ -443,6 +586,9 @@ async fn valid_large_data_request_is_served_incrementally_without_disconnect() {
         Response::BlockSubmitted(Submission::Accepted)
     ));
     let mut peer = Peer::connect(&network, &node, 1, genesis.hash()).await;
+    peer.until(|message| matches!(message, Message::GetHeaders { .. }))
+        .await;
+    peer.send(Message::Headers(vec![])).await;
     peer.barrier(7).await;
     let missing: Vec<Inventory> = (0..128u32)
         .map(|index| {

@@ -79,8 +79,13 @@ impl From<RawCoin> for u64 {
     }
 }
 
-/// A signed sum of amounts. `i128` cannot overflow with fewer than
-/// `2^64` terms, so arithmetic here is unchecked by design.
+/// A signed sum of amounts stored in `i128`.
+///
+/// Up to `2^63` contributions of magnitude at most `u64::MAX` fit in `i128`.
+/// The transaction builder bounds each side to [`crate::consensus::MAX_ACTIONS`]
+/// amounts, so its sums and their difference are safely within that range.
+/// These unchecked helpers and operators require callers to keep every result
+/// representable; arbitrarily composing existing sums can exceed this bound.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ValueSum(i128);
 
@@ -98,7 +103,7 @@ impl ValueSum {
         self.0
     }
 
-    /// Sums amounts into a signed total. Cannot overflow, see the type doc.
+    /// Sums amounts into a signed total under the bound in the type doc.
     #[allow(clippy::arithmetic_side_effects)] // see type-level doc on overflow
     pub fn sum(amounts: impl IntoIterator<Item = RawCoin>) -> Self {
         amounts
@@ -172,6 +177,14 @@ mod tests {
     }
 
     #[test]
+    fn signed_conversion_rejects_values_above_i64_max() {
+        assert_eq!(amt(i64::MAX as u64).to_i64(), Ok(i64::MAX));
+        for raw in [i64::MAX as u64 + 1, u64::MAX] {
+            assert_eq!(amt(raw).to_i64(), Err(Error::RawCoinOutOfRange));
+        }
+    }
+
+    #[test]
     fn checked_add_detects_u64_overflow() {
         assert_eq!(amt(1).checked_add(amt(2)), Ok(amt(3)));
         assert_eq!(
@@ -200,6 +213,17 @@ mod tests {
         assert_eq!(total.plus(amt(4)), total + amt(4));
         assert_eq!(total.minus_sum(ValueSum::sum([amt(6)])), ValueSum::ZERO);
         assert_eq!(total.minus(amt(6)), ValueSum::ZERO);
+    }
+
+    #[test]
+    fn maximum_action_amounts_sum_exactly_without_narrowing() {
+        let amounts = [RawCoin::MAX; crate::consensus::MAX_ACTIONS];
+        let total = ValueSum::sum(amounts);
+        let expected = i128::from(u64::MAX) * crate::consensus::MAX_ACTIONS as i128;
+        assert_eq!(total.raw(), expected);
+        assert_eq!(total.minus_sum(total), ValueSum::ZERO);
+        assert_eq!(ValueSum::ZERO.minus_sum(total).raw(), -expected);
+        assert_eq!(total.to_i64(), Err(Error::RawCoinOutOfRange));
     }
 
     #[test]

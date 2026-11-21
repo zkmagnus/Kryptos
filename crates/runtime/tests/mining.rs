@@ -190,6 +190,12 @@ async fn a_pool_mines_through_templates_and_submissions() {
     assert_eq!(template_2["height"], 2);
     let mut header_2 = header_from(&template_2);
     solve(&mut header_2, &mut rng);
+    let mut rival = header_from(&template_2);
+    rival.timestamp += 1;
+    solve(&mut rival, &mut rng);
+    if rival.hash() > header_2.hash() {
+        std::mem::swap(&mut header_2, &mut rival);
+    }
     let id_2 = template_2["template_id"].as_str().unwrap();
     let accepted_2 = call(addr, t, "submitblock", submission(&header_2, id_2)).await;
     assert_eq!(accepted_2["status"], "accepted");
@@ -202,10 +208,7 @@ async fn a_pool_mines_through_templates_and_submissions() {
         "duplicate"
     );
 
-    // A competing block at height 2 on the old template is stale.
-    let mut rival = header_from(&template_2);
-    rival.timestamp += 1;
-    solve(&mut rival, &mut rng);
+    // A competing block with equal work and a losing tip hash is stale.
     let stale = call(addr, t, "submitblock", submission(&rival, id_2)).await;
     assert_eq!(stale["status"], "stale");
     assert_eq!(call(addr, t, "getblockcount", json!([])).await, 2);

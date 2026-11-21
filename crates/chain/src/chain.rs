@@ -1,5 +1,5 @@
 //! The chain: imports blocks onto the best chain, keeping side chains and
-//! reorganizing to whichever has the most work.
+//! reorganizing to whichever has the most work, with a stable hash tie-break.
 
 use crypto::hash::{blake2b_short, RULES};
 use protocol::block::{Block, BlockHash};
@@ -23,9 +23,9 @@ pub enum Import {
     AlreadyKnown,
     /// The block extended the tip.
     Extended,
-    /// The block was stored on a side chain with no more work than ours.
+    /// The block was stored on a side chain that did not win fork choice.
     SideChain,
-    /// The block's chain had more work; the tip moved to it.
+    /// The block's chain won fork choice; the tip moved to it.
     Reorganized {
         /// Blocks removed from the old best chain, tip first, so their
         /// transactions can be readmitted to the mempool.
@@ -330,7 +330,7 @@ impl Chain {
     }
 
     /// Imports a block: extends the tip, stores a side-chain block, or
-    /// reorganizes when the side chain has more work.
+    /// reorganizes when its branch wins fork choice.
     ///
     /// # Errors
     /// Returns [`Error::Orphan`] if the parent is unknown, or the first
@@ -380,9 +380,13 @@ impl Chain {
         } else {
             validator.check_side_chain_block(&self.store, block, rng)?;
         }
-        // Keep the first accepted tip on equal work; block hashes never
-        // influence the tie. Every indexed value came from a validated target.
-        if self.chainwork(&block.hash())? <= self.chainwork(&tip.hash)? {
+        // Fork choice is independent of block arrival order: greater
+        // cumulative work wins, then the lexicographically larger tip hash.
+        // Every indexed value came from a validated target.
+        let candidate_hash = block.hash();
+        let candidate_work = self.chainwork(&candidate_hash)?;
+        let tip_work = self.chainwork(&tip.hash)?;
+        if candidate_work < tip_work || (candidate_work == tip_work && candidate_hash <= tip.hash) {
             self.store.prune_branch_state(
                 self.params.max_reorg_depth,
                 tip.height.saturating_sub(frontier_retention(&self.params)),
@@ -564,15 +568,19 @@ impl Chain {
     }
 }
 
-/// Consensus rules revision for the unified v1 header format.
-pub const CONSENSUS_REVISION: u32 = 1;
+/// Consensus rules revision; revision 2 adds deterministic equal-work fork choice.
+pub const CONSENSUS_REVISION: u32 = 2;
 
-/// Digest of everything that decides whether an applied block was valid:
+/// Digest of block validity and fork-choice rules:
 /// [`CONSENSUS_REVISION`], every consensus parameter, the genesis branch,
 /// the upgrade schedule, the checkpoints and the verifying key.
 pub fn rules_digest(params: &ChainParams, vk: &VerifyingKey) -> [u8; 32] {
+    rules_digest_for_revision(params, vk, CONSENSUS_REVISION)
+}
+
+fn rules_digest_for_revision(params: &ChainParams, vk: &VerifyingKey, revision: u32) -> [u8; 32] {
     let mut w = Writer::default();
-    w.put(&CONSENSUS_REVISION.to_le_bytes());
+    w.put(&revision.to_le_bytes());
     w.put(b"kryptos-header-v1-state-roots-tx-merkle-body-merkle-parent-header-mmr");
     w.put(&[protocol::body_tree::BODY_TREE_VERSION]);
     w.put(&[protocol::header_tree::HEADER_TREE_COMMITMENT_VERSION]);
@@ -658,6 +666,12 @@ mod tests {
             .preview_nullifier_transition(parent, &[])
             .unwrap();
         let mut header = protocol::block::empty_header(height, parent, tree.root());
+        header.history_root = chain
+            .store
+            .header_frontier(&parent)
+            .unwrap()
+            .unwrap()
+            .root();
         header.nullifier_root = transition.root();
         header.state_root = crate::state::state_root(
             chain.chain_id(),
@@ -767,10 +781,7 @@ mod tests {
         let tree = chain.store.tree().unwrap();
         let mut prev = chain.tip().unwrap().hash;
         for height in 1..=52 {
-            let block = Block::new(
-                protocol::block::empty_header(height, prev, tree.root()),
-                vec![],
-            );
+            let block = empty_state_block(&chain, prev, height);
             chain.store.apply(&block, &tree, &[0; 32]).unwrap();
             prev = block.hash();
         }
@@ -810,10 +821,7 @@ mod tests {
         .unwrap();
         let tree = chain.store.tree().unwrap();
         let genesis = chain.tip().unwrap().hash;
-        let first = Block::new(
-            protocol::block::empty_header(1, genesis, tree.root()),
-            vec![],
-        );
+        let first = empty_state_block(&chain, genesis, 1);
         chain.store.apply(&first, &tree, &[0; 32]).unwrap();
         chain.params.checkpoints = Box::leak(Box::new([crate::params::Checkpoint {
             height: 1,
@@ -892,5 +900,40 @@ mod tests {
             rules_digest(&ChainParams::mainnet(), &vk),
             "networks differ"
         );
+    }
+
+    #[test]
+    fn reopening_refuses_the_previous_first_seen_fork_choice_profile_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chain.redb");
+        // Mainnet parameters did not otherwise change with fork choice. The
+        // explicit revision must distinguish even these profiles.
+        let params = ChainParams::mainnet();
+        let chain = Chain::new(
+            Store::open(&path).unwrap(),
+            params,
+            VerifyingKey::build().unwrap(),
+        )
+        .unwrap();
+        let previous_digest = rules_digest_for_revision(&params, chain.verifying_key(), 1);
+        assert_ne!(previous_digest, chain.rules_digest);
+
+        // Model persisted history without generating proofs: admission must
+        // reject the old profile before reading or rewriting its block state.
+        let first = empty_state_block(&chain, chain.tip().unwrap().hash, 1);
+        let tree = chain.store.tree().unwrap();
+        chain.store.apply(&first, &tree, &[0; 32]).unwrap();
+        let original_tip = chain.tip().unwrap();
+        chain.store.set_rules_digest(&previous_digest).unwrap();
+        drop(chain);
+
+        let store = Store::open(&path).unwrap();
+        assert!(matches!(
+            Chain::new(store.clone(), params, VerifyingKey::build().unwrap()),
+            Err(Error::RulesMismatch)
+        ));
+        assert_eq!(store.rules_digest().unwrap(), Some(previous_digest));
+        assert_eq!(store.tip().unwrap(), Some(original_tip));
+        assert_eq!(store.block(&first.hash()).unwrap(), Some(first));
     }
 }

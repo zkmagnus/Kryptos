@@ -88,6 +88,7 @@ rand = "0.8"
 rand_chacha = "0.3"
 tempfile = "3"
 proptest = "1"
+tracing = "=0.1.44"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -111,6 +112,7 @@ must_use_candidate = "allow"
 lto = "fat"
 codegen-units = 1
 opt-level = 3
+overflow-checks = true
 
 [profile.dev]
 # Keep routine builds small. Enable debug info explicitly when using a debugger.
@@ -121,3 +123,13 @@ incremental = false
 opt-level = 1
 debug = 0
 incremental = false
+
+# Optimize proof/curve dependencies without slowing routine workspace rebuilds.
+[profile.test.package.halo2_proofs]
+opt-level = 3
+
+[profile.test.package.pasta_curves]
+opt-level = 3
+
+[profile.test.package.halo2_gadgets]
+opt-level = 3

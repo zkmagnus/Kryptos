@@ -106,6 +106,72 @@ fn encrypt_coin_with_kem(
         enc_ciphertext,
     })
 }
+
+/// A transmission key derived once for the diversifier of a scan candidate.
+pub struct PreparedIvk {
+    diversifier: Diversifier,
+    pk_d: DiversifiedTransmissionKey,
+}
+
+impl PreparedIvk {
+    /// Prepares the recipient derivation shared by all trials for this address.
+    ///
+    /// # Errors
+    /// Returns an error if the diversifier is invalid.
+    pub fn new(ivk: &IncomingViewingKey, diversifier: Diversifier) -> Result<Self> {
+        Ok(Self {
+            diversifier,
+            pk_d: ivk.transmission_key(&diversifier)?,
+        })
+    }
+
+    /// Trials a full ciphertext and checks its commitment and recipient.
+    ///
+    /// # Errors
+    /// Fails if the ciphertext or recipient does not match the prepared address.
+    pub fn decrypt_coin(
+        &self,
+        receiver_key: &ReceiverKey,
+        encrypted: &EncryptedCoin,
+        rho: Rho,
+        cmx: &ExtractedCoinCommitment,
+    ) -> Result<Coin> {
+        self.finish_trial(decrypt_plaintext(receiver_key, encrypted, cmx), rho, cmx)
+    }
+
+    /// Trials a compact ciphertext and checks its commitment and recipient.
+    ///
+    /// # Errors
+    /// Fails if the compact lead or recipient does not match the prepared address.
+    pub fn detect_coin(
+        &self,
+        receiver_key: &ReceiverKey,
+        kem_ciphertext: &KemCiphertext,
+        enc_lead: &[u8; COMPACT_COIN_LEAD],
+        rho: Rho,
+        cmx: &ExtractedCoinCommitment,
+    ) -> Result<Coin> {
+        self.finish_trial(
+            detect_plaintext(receiver_key, kem_ciphertext, enc_lead, cmx),
+            rho,
+            cmx,
+        )
+    }
+
+    fn finish_trial(
+        &self,
+        plaintext: Result<CoinPlaintext>,
+        rho: Rho,
+        cmx: &ExtractedCoinCommitment,
+    ) -> Result<Coin> {
+        let coin = finish_trial_decryption(plaintext, |_| Ok(self.pk_d), rho, cmx)?;
+        if coin.diversifier() != &self.diversifier {
+            return Err(Error::CoinDecryption("diversifier mismatch"));
+        }
+        Ok(coin)
+    }
+}
+
 /// Trial-decrypts as the receiver.
 ///
 /// `rho` and `cmx` come from the action carrying the ciphertext.
@@ -121,13 +187,24 @@ pub fn decrypt_coin_with_ivk(
     rho: Rho,
     cmx: &ExtractedCoinCommitment,
 ) -> Result<Coin> {
+    finish_trial_decryption(
+        decrypt_plaintext(receiver_key, encrypted, cmx),
+        |diversifier| ivk.transmission_key(diversifier),
+        rho,
+        cmx,
+    )
+}
+
+fn decrypt_plaintext(
+    receiver_key: &ReceiverKey,
+    encrypted: &EncryptedCoin,
+    cmx: &ExtractedCoinCommitment,
+) -> Result<CoinPlaintext> {
     let shared_secret = receiver_key.decapsulate(&encrypted.kem_ciphertext)?;
     let key = shared_secret.coin_key(&encrypted.kem_ciphertext, &cmx.to_bytes());
-    let plaintext = key
-        .decrypt(&encrypted.enc_ciphertext)
+    key.decrypt(&encrypted.enc_ciphertext)
         .map_err(Error::from)
-        .and_then(|bytes| CoinPlaintext::decode(&bytes));
-    finish_trial_decryption(plaintext, ivk, rho, cmx)
+        .and_then(|bytes| CoinPlaintext::decode(&bytes))
 }
 
 /// Detects and rebuilds a coin from the leading bytes of its ciphertext,
@@ -148,19 +225,31 @@ pub fn detect_coin_with_ivk(
     rho: Rho,
     cmx: &ExtractedCoinCommitment,
 ) -> Result<Coin> {
-    let shared_secret = receiver_key.decapsulate(kem_ciphertext)?;
-    let key = shared_secret.coin_key(kem_ciphertext, &cmx.to_bytes());
-    let lead = key.decrypt_lead(enc_lead);
-    finish_trial_decryption(CoinPlaintext::decode(&lead), ivk, rho, cmx)
+    finish_trial_decryption(
+        detect_plaintext(receiver_key, kem_ciphertext, enc_lead, cmx),
+        |diversifier| ivk.transmission_key(diversifier),
+        rho,
+        cmx,
+    )
 }
 
-/// Every trial performs one recipient derivation and one commitment, even
-/// when authentication or parsing failed. Delaying that error also avoids
-/// doing a second stand-in reconstruction after a commitment mismatch.
+fn detect_plaintext(
+    receiver_key: &ReceiverKey,
+    kem_ciphertext: &KemCiphertext,
+    enc_lead: &[u8; COMPACT_COIN_LEAD],
+    cmx: &ExtractedCoinCommitment,
+) -> Result<CoinPlaintext> {
+    let shared_secret = receiver_key.decapsulate(kem_ciphertext)?;
+    let key = shared_secret.coin_key(kem_ciphertext, &cmx.to_bytes());
+    CoinPlaintext::decode(&key.decrypt_lead(enc_lead))
+}
+
+/// Every trial reconstructs one commitment, even when authentication or
+/// parsing failed. Unprepared callers also derive the recipient key here.
 /// This balances expensive cryptographic work; it is not a constant-time API.
 fn finish_trial_decryption(
     plaintext: Result<CoinPlaintext>,
-    ivk: &IncomingViewingKey,
+    transmission_key: impl FnOnce(&Diversifier) -> crypto::Result<DiversifiedTransmissionKey>,
     rho: Rho,
     cmx: &ExtractedCoinCommitment,
 ) -> Result<Coin> {
@@ -175,7 +264,7 @@ fn finish_trial_decryption(
             Some(error),
         ),
     };
-    let pk_d = ivk.transmission_key(&candidate.diversifier)?;
+    let pk_d = transmission_key(&candidate.diversifier)?;
     // Keep the reconstruction observable to the optimizer even when an earlier
     // error means its result will be discarded. This is workload balancing,
     // not a guarantee of constant-time execution.

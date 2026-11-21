@@ -32,13 +32,15 @@ environment variables, restoring the native configuration. Unset
 `CARGO_ENCODED_RUSTFLAGS` first. See [the operations guide](operations.md) for
 platform prerequisites and shell details.
 
-The existing release profile is retained:
+The release profile retains its optimization settings and enables integer
+overflow checks:
 
 | Setting | Current value | Trade-off and decision |
 | --- | --- | --- |
 | `opt-level` | `3` | Aggressive optimization can increase compile time and code size; retain the existing setting while measuring actual workloads. |
 | `lto` | `"fat"` | Enables optimization across crate boundaries, with longer linking and potentially higher peak memory. No measured evidence yet justifies changing the existing value. |
 | `codegen-units` | `1` | Allows optimization across a larger compilation unit, at the cost of less parallel code generation. Retain pending a controlled comparison. |
+| `overflow-checks` | `true` | Detects integer overflow in release code; consensus code must still reject invalid arithmetic explicitly. |
 | `panic` | Cargo default, unwind | Preserves current panic behavior; abort is not adopted without checking cleanup and error behavior as well as measurements. |
 | `strip` | Cargo default, none | Preserves symbols for diagnosis. Stripping is not treated as a measured runtime optimization. |
 

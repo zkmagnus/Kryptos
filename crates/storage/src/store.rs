@@ -1882,8 +1882,7 @@ fn schema_bytes() -> [u8; 32] {
     // that also used numeric schema version 1.
     const SCHEMA_DOMAIN: &[u8] = b"KRYPTOS:STORE:V1-MERKLE:";
     out[..SCHEMA_DOMAIN.len()].copy_from_slice(SCHEMA_DOMAIN);
-    out[SCHEMA_DOMAIN.len()..SCHEMA_DOMAIN.len() + 4]
-        .copy_from_slice(&SCHEMA_VERSION.to_le_bytes());
+    out[SCHEMA_DOMAIN.len()..][..4].copy_from_slice(&SCHEMA_VERSION.to_le_bytes());
     out
 }
 

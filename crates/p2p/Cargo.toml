@@ -23,14 +23,14 @@ fs-mistrust.workspace = true
 safelog.workspace = true
 tokio = { workspace = true, features = ["macros"] }
 thiserror.workspace = true
-rand_core.workspace = true
+rand_core = { workspace = true, features = ["getrandom"] }
 
 [features]
 # Explicit memory and local RPC fixtures; excluded from production builds.
 test-support = []
 
 [dev-dependencies]
-tracing = "=0.1.44"
+tracing.workspace = true
 tempfile.workspace = true
 sha3.workspace = true
 data-encoding.workspace = true

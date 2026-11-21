@@ -2,6 +2,7 @@
 //! events from connections, the clock, the miner and the RPC.
 
 use p2p::transport::{Incoming, TorNetwork, TorSettings, TorStatus};
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -249,6 +250,8 @@ pub enum Request {
     Coinbase(u32),
     /// The hash of the block at a height, for cheap reorg checks.
     Hash(u32),
+    /// Canonical header and commitment frontier for a wallet birthday.
+    ScanCheckpoint(u32),
     /// Submit a transaction.
     Submit(Box<Transaction>),
     /// Whether a nullifier is spent.
@@ -393,6 +396,8 @@ pub enum Response {
     Coinbase(Option<Box<Transaction>>),
     /// A block hash, if present.
     Hash(Option<BlockHash>),
+    /// A canonical header and its retained commitment-tree frontier.
+    ScanCheckpoint(Option<(BlockHeader, storage::tree::CommitmentTree)>),
     /// The submitted transaction's id.
     Submitted(TxId),
     /// Whether a nullifier is spent.
@@ -611,8 +616,10 @@ pub struct Handle {
     pub rpc_http_addr: Option<SocketAddr>,
     /// The control socket's token, if enabled.
     pub rpc_token: Option<Token>,
-    task: JoinHandle<()>,
+    task: Option<JoinHandle<()>>,
     tasks: JoinSet<()>,
+    wallet: Option<crate::walletd::Service>,
+    wallet_rpc: Option<(oneshot::Sender<()>, JoinHandle<()>)>,
     /// Embedded Tor status, including the current ready service identity.
     pub tor_status: Option<watch::Receiver<TorStatus>>,
     _tor: Option<Arc<TorNetwork>>,
@@ -653,10 +660,26 @@ impl Handle {
         self.events.clone()
     }
 
+    /// Waits for the node loop to exit, including an RPC-requested stop.
+    /// Cancelling this wait leaves the handle available for orderly shutdown.
+    pub(crate) async fn stopped(&mut self) {
+        if let Some(task) = self.task.as_mut() {
+            let _ = task.await;
+        }
+        self.task = None;
+    }
+
     /// Stops the node and waits for the loop to exit.
     pub async fn shutdown(mut self) {
+        if let Some((stop, task)) = self.wallet_rpc.take() {
+            let _ = stop.send(());
+            let _ = task.await;
+        }
+        if let Some(wallet) = self.wallet.take() {
+            wallet.shutdown().await;
+        }
         let _ = self.events.send(Event::Shutdown).await;
-        let _ = self.task.await;
+        self.stopped().await;
         self.tasks.shutdown().await;
     }
 }
@@ -667,7 +690,23 @@ impl Handle {
 /// # Errors
 /// Fails if the store or a socket cannot be opened or key generation fails.
 pub async fn spawn(config: Config) -> Result<Handle> {
-    spawn_inner(config, None).await
+    spawn_inner(config, None, None).await
+}
+
+/// Starts a node with an open wallet and exposes its methods on local HTTP RPC only.
+///
+/// # Errors
+/// Returns a startup error, or an argument error if local HTTP RPC is disabled.
+pub(crate) async fn spawn_with_wallet(
+    config: Config,
+    wallet: wallet::wallet::Wallet,
+) -> Result<Handle> {
+    if config.rpc_http.is_none() {
+        return Err(Error::Argument(
+            "embedded wallet requires local HTTP RPC".into(),
+        ));
+    }
+    spawn_inner(config, None, Some(wallet)).await
 }
 
 /// Starts a node using an already-created embedded Tor service.
@@ -679,12 +718,13 @@ pub async fn spawn_with_network(
     network: Arc<TorNetwork>,
     incoming: mpsc::Receiver<Incoming>,
 ) -> Result<Handle> {
-    spawn_inner(config, Some((network, incoming))).await
+    spawn_inner(config, Some((network, incoming)), None).await
 }
 
 async fn spawn_inner(
     config: Config,
     supplied: Option<(Arc<TorNetwork>, mpsc::Receiver<Incoming>)>,
+    wallet: Option<wallet::wallet::Wallet>,
 ) -> Result<Handle> {
     config.validate()?;
     let cleanup_datadir = config
@@ -741,7 +781,8 @@ async fn spawn_inner(
     let (peers_path, mut book) = saved_book(&config);
     let configured = starting_peers(&config, &mut book);
 
-    let (rpc_addr, rpc_http_addr, rpc_token) = serve_rpc(&config, &events, &mut tasks).await?;
+    let (rpc_addr, http, rpc_token) = bind_rpc(&config, &events, &mut tasks).await?;
+    let rpc_http_addr = http.as_ref().map(|(_, addr)| *addr);
     let (tor, onion) = start_network(
         &config,
         !configured.is_empty(),
@@ -841,6 +882,39 @@ async fn spawn_inner(
         started_at: now(),
         block_notify: config.block_notify.clone(),
     };
+    let wallet = wallet.map(|wallet| {
+        crate::walletd::start(crate::walletd::ServiceConfig {
+            wallet,
+            network: config.network,
+            node: crate::rpc::Source::Embedded(events.clone()),
+            sync_interval: std::time::Duration::from_secs(crate::walletd::DEFAULT_SYNC_SECONDS),
+            light: false,
+        })
+    });
+    let mut wallet_rpc = None;
+    if let (Some((listener, _)), Some(token)) = (http, rpc_token.clone()) {
+        if let Some(service) = &wallet {
+            let (stop, stopped) = oneshot::channel();
+            let context = crate::jsonrpc::Context::new(events.clone(), config.network)
+                .with_local_wallet(service.daemon.clone());
+            let task = tokio::spawn(crate::jsonrpc::serve_until(
+                listener,
+                token,
+                context,
+                async {
+                    let _ = stopped.await;
+                },
+            ));
+            wallet_rpc = Some((stop, task));
+        } else {
+            tasks.spawn(crate::jsonrpc::serve(
+                listener,
+                events.clone(),
+                token,
+                config.network,
+            ));
+        }
+    }
     Ok(Handle {
         events,
         tip,
@@ -848,8 +922,10 @@ async fn spawn_inner(
         rpc_addr,
         rpc_http_addr,
         rpc_token,
-        task: tokio::spawn(node.run(receiver)),
+        task: Some(tokio::spawn(node.run(receiver))),
         tasks,
+        wallet,
+        wallet_rpc,
         tor_status: tor.as_ref().map(|tor| tor.status()),
         _tor: tor,
         _cleanup_datadir: cleanup_datadir,
@@ -1015,13 +1091,17 @@ async fn serve_onion(
     connections.shutdown().await;
 }
 
-/// Starts the control socket and the JSON-RPC endpoint, whichever are
-/// configured, behind one token persisted in the data directory.
-async fn serve_rpc(
+/// Starts the local control server and binds the local HTTP listener, sharing
+/// one token persisted in the data directory.
+async fn bind_rpc(
     config: &Config,
     events: &mpsc::Sender<Event>,
     tasks: &mut JoinSet<()>,
-) -> Result<(Option<SocketAddr>, Option<SocketAddr>, Option<Token>)> {
+) -> Result<(
+    Option<SocketAddr>,
+    Option<(tokio::net::TcpListener, SocketAddr)>,
+    Option<Token>,
+)> {
     if config.rpc.is_none() && config.rpc_http.is_none() {
         return Ok((None, None, None));
     }
@@ -1044,19 +1124,7 @@ async fn serve_rpc(
         }
         None => None,
     };
-    let rpc_http_addr = match bind(config.rpc_http).await? {
-        Some((listener, local)) => {
-            tasks.spawn(crate::jsonrpc::serve(
-                listener,
-                events.clone(),
-                token.clone(),
-                config.network,
-            ));
-            Some(local)
-        }
-        None => None,
-    };
-    Ok((rpc_addr, rpc_http_addr, Some(token)))
+    Ok((rpc_addr, bind(config.rpc_http).await?, Some(token)))
 }
 
 /// Opens the chain store and builds the verifying key.
@@ -1625,7 +1693,11 @@ impl Node {
         }
         self.exchange_addresses(id);
         let ours = self.chain.tip().map_or(0, |t| t.height);
-        if info.best_height > ours || (self.mining_needs_peers && direction == Direction::Outbound)
+        // Height alone cannot distinguish competing tips. Check equal-height
+        // peers too, so reconnecting nodes can learn the winning fork.
+        if info.best_height > ours
+            || (info.best_height == ours && ours > 0)
+            || (self.mining_needs_peers && direction == Direction::Outbound)
         {
             self.start_sync(id);
         }
@@ -3563,7 +3635,10 @@ impl Node {
             let ours = self.chain.tip().map_or(0, |t| t.height);
             let behind = self
                 .claims()
-                .find(|(_, height)| *height > ours)
+                .filter(|(_, height)| *height > ours)
+                // Prefer the highest advertised height, then the lowest peer
+                // id; HashMap iteration must not choose the sync source.
+                .min_by_key(|(id, height)| (Reverse(*height), *id))
                 .map(|(id, _)| id);
             let needs_witnesses = self.authenticated_identities(true) < self.mining_min_peers;
             let initial = self.mining_needs_peers.then(|| self.peers.iter()
@@ -3889,6 +3964,28 @@ impl Node {
                     .map(Box::new),
             )),
             Request::Hash(height) => Ok(Response::Hash(self.chain.store().hash_at(height)?)),
+            Request::ScanCheckpoint(height) => {
+                let store = self.chain.store();
+                let Some(hash) = store.hash_at(height)? else {
+                    return Ok(Response::ScanCheckpoint(None));
+                };
+                let Some(header) = store.header(&hash)? else {
+                    return Ok(Response::ScanCheckpoint(None));
+                };
+                let Some(tree) = store.commitment_tree_at(&hash)? else {
+                    return Ok(Response::ScanCheckpoint(None));
+                };
+                if header.height != height
+                    || header.hash() != hash
+                    || tree.root() != header.commitment_root
+                {
+                    return Err(chain::Error::InvalidBlock(
+                        "wallet checkpoint does not match canonical header",
+                    )
+                    .into());
+                }
+                Ok(Response::ScanCheckpoint(Some((header, tree))))
+            }
             Request::Submit(tx) => {
                 let txid = tx.txid();
                 self.on_tx(None, *tx, false);
@@ -4008,6 +4105,123 @@ mod tests {
         assert_eq!(dialed_key("8.8.8.8:19000"), None);
         assert_eq!(dialed_key("[2606:4700::1111]:19000"), None);
         assert_eq!(dialed_key("abcdef.onion:19000"), None);
+    }
+
+    #[tokio::test]
+    async fn sync_sources_follow_unsettled_heights_then_peer_ids_in_both_insertion_orders() {
+        use p2p::transport::{ConnectionReader, ConnectionWriter};
+
+        async fn receive(reader: &mut ConnectionReader, expected: impl Fn(&Message) -> bool) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if expected(&reader.recv().await.unwrap()) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("expected peer message did not arrive");
+        }
+
+        async fn connect(
+            node: &Handle,
+            tasks: &mut JoinSet<()>,
+            id: PeerId,
+            height: u32,
+        ) -> (ConnectionWriter, ConnectionReader) {
+            let (local, remote) = tokio::io::duplex(64 * 1024);
+            tasks.spawn(crate::net::accept(
+                local.into(),
+                node.events(),
+                id,
+                TorSettings::default(),
+            ));
+            let (mut writer, mut reader) = p2p::transport::split(remote);
+            let genesis = chain::genesis::genesis(&ChainParams::test()).hash();
+            writer
+                .send(&Message::Version(p2p::peer::version_info(
+                    1_000 + id,
+                    height,
+                    genesis,
+                    now(),
+                )))
+                .await
+                .unwrap();
+            receive(&mut reader, |message| {
+                matches!(message, Message::Version(_))
+            })
+            .await;
+            (writer, reader)
+        }
+
+        async fn settle(writer: &mut ConnectionWriter, reader: &mut ConnectionReader) {
+            writer.send(&Message::Headers(vec![])).await.unwrap();
+            writer.send(&Message::Ping(42)).await.unwrap();
+            receive(reader, |message| matches!(message, Message::Pong(42))).await;
+        }
+
+        let candidates = [(1, 5), (3, 10), (7, 10), (5, 20), (9, 20), (0, 0)];
+        for reverse in [false, true] {
+            let own = NetAddr::TorV3([241; 32]);
+            let (network, incoming) = test_support::network(own, &[19000]);
+            let node = spawn_with_network(Config::test(), network, incoming)
+                .await
+                .unwrap();
+            let mut tasks = JoinSet::new();
+            // Hold synchronization open while all candidates finish handshaking.
+            // Its higher claim must stop counting once it returns no headers.
+            let (mut writer, mut reader) = connect(&node, &mut tasks, 99, 100).await;
+            receive(&mut reader, |message| {
+                matches!(message, Message::GetHeaders { .. })
+            })
+            .await;
+            let mut peers = HashMap::new();
+            let order: Vec<_> = if reverse {
+                candidates.into_iter().rev().collect()
+            } else {
+                candidates.into_iter().collect()
+            };
+            for (id, height) in order {
+                peers.insert(id, connect(&node, &mut tasks, id, height).await);
+            }
+            settle(&mut writer, &mut reader).await;
+            // Each empty reply settles another claim. Selection must keep
+            // ignoring those peers even though their handshake heights remain.
+            for id in [5, 9, 3, 7, 1] {
+                node.events.send(Event::Tick).await.unwrap();
+                let (writer, reader) = peers.get_mut(&id).unwrap();
+                receive(reader, |message| {
+                    matches!(message, Message::GetHeaders { .. })
+                })
+                .await;
+                settle(writer, reader).await;
+            }
+            node.events.send(Event::Tick).await.unwrap();
+            assert!(matches!(
+                node.request(Request::Status).await.unwrap(),
+                Response::Status { syncing: false, .. }
+            ));
+            node.shutdown().await;
+            tasks.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_stop_completes_a_cancelled_node_exit_wait() {
+        let mut node = spawn(Config::test()).await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1), node.stopped())
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            node.request(Request::Stop).await.unwrap(),
+            Response::Stopping
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(10), node.stopped())
+            .await
+            .expect("RPC stop did not end the node loop");
+        node.shutdown().await;
     }
 
     #[tokio::test]

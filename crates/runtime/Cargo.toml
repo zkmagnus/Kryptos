@@ -15,8 +15,8 @@ name = "wallet"
 path = "src/bin/wallet_rpc.rs"
 
 [[bin]]
-name = "rhomscan"
-path = "src/bin/rhomscan.rs"
+name = "kryptoscan"
+path = "src/bin/kryptoscan.rs"
 
 [dependencies]
 crypto.workspace = true
@@ -31,14 +31,14 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 rand.workspace = true
-rand_core.workspace = true
+rand_core = { workspace = true, features = ["getrandom"] }
 subtle.workspace = true
 zeroize.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
 tempfile.workspace = true
 
 [dev-dependencies]
-tracing = "=0.1.44"
+tracing.workspace = true
 rand_chacha.workspace = true
 p2p = { workspace = true, features = ["test-support"] }
 

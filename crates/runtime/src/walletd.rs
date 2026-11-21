@@ -875,7 +875,12 @@ impl Dispatch for WalletDaemon {
             "rescan" => {
                 let from: u32 = params.opt(0, "from_height")?.unwrap_or(0);
                 let _guard = self.0.sync_lock.lock().await;
-                self.0.wallet.rollback_to(from.saturating_sub(1))?;
+                let wallet = &self.0.wallet;
+                if from == 0 || from < wallet.scan_start_height()? {
+                    wallet.reset_scan_to_genesis()?;
+                } else {
+                    wallet.rollback_to(from - 1)?;
+                }
                 self.0.wake.notify_one();
                 Ok(json!({ "scanned_height": self.scanned_height()? }))
             }
@@ -909,6 +914,8 @@ impl WalletDaemon {
                     "scanned_height": scanned,
                     "node_height": node,
                     "synced": scanned.is_some() && scanned == node,
+                    "birthday_height": wallet.birthday_height()?,
+                    "scan_start_height": wallet.scan_start_height()?,
                     "coins": coins.len(),
                     "unspent": coins.iter().filter(|n| n.spent_at.is_none()).count(),
                     "balance": wallet.balance()?.to_string(),
@@ -1192,17 +1199,106 @@ mod tests {
     }
 
     fn wallet_file() -> (tempfile::TempDir, Wallet) {
+        wallet_file_for(Network::Test)
+    }
+
+    fn wallet_file_for(network: Network) -> (tempfile::TempDir, Wallet) {
         let dir = tempfile::tempdir().unwrap();
         let mut rng = ChaCha20Rng::seed_from_u64(73);
         let key = SpendingKey::from_bytes([73; 32]);
         let wallet = Wallet::create(
             dir.path().join("wallet.redb"),
             &key,
-            genesis(&Network::Test.params()).hash(),
+            genesis(&network.params()).hash(),
             &mut rng,
         )
         .unwrap();
         (dir, wallet)
+    }
+
+    #[tokio::test]
+    async fn embedded_wallet_scans_and_queues_sends_on_local_node_rpc() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let network = Network::Test;
+        let dir = tempfile::tempdir().unwrap();
+        let wallet = Wallet::create_with_birthday(
+            dir.path().join("wallet.redb"),
+            &SpendingKey::from_bytes([73; 32]),
+            genesis(&network.params()).hash(),
+            1,
+            &mut ChaCha20Rng::seed_from_u64(73),
+        )
+        .unwrap();
+        let recipient = wallet
+            .keys()
+            .default_address()
+            .unwrap()
+            .encode(network.address_network());
+        let config = crate::config::Config {
+            network,
+            rpc_http: Some("127.0.0.1:0".parse().unwrap()),
+            rpc_token: Some(Token::new("test-token").unwrap()),
+            ..crate::config::Config::test()
+        };
+        let mut node = crate::node::spawn_with_wallet(config, wallet)
+            .await
+            .unwrap();
+        let addr = node.rpc_http_addr.unwrap();
+        let rpc = |method: &'static str, params: Value| async move {
+            let body = json!({"jsonrpc":"2.0", "method":method, "params":params, "id":1});
+            let mut stream = p2p::transport::connect_loopback_for_tests(addr)
+                .await
+                .unwrap();
+            let request = format!(
+                "POST / HTTP/1.1\r\nAuthorization: Bearer test-token\r\nContent-Length: {}\r\n\r\n{body}",
+                body.to_string().len(),
+            );
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+            let (_, body) = response.split_once("\r\n\r\n").unwrap();
+            let response: Value = serde_json::from_str(body).unwrap();
+            assert!(response["error"].is_null(), "{response}");
+            response["result"].clone()
+        };
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while rpc("getwalletinfo", json!([])).await["synced"] != true {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("wallet did not scan the embedded node");
+        let info = rpc("getwalletinfo", json!([])).await;
+        assert_eq!(info["birthday_height"], 1);
+        assert_eq!(info["scan_start_height"], 1);
+        assert_eq!(info["scanned_height"], 0);
+        assert!(rpc("getblockchaininfo", json!([])).await.is_object());
+        let (balance, send) = tokio::join!(
+            rpc("getbalance", json!([])),
+            rpc("send", json!([{"address":recipient, "amount":"1"}])),
+        );
+        assert_eq!(balance["total"], "0");
+        let id = send["operation_id"].as_u64().unwrap();
+        assert!(rpc("getoperationstatus", json!([id])).await.is_object());
+
+        let idle = p2p::transport::connect_loopback_for_tests(addr)
+            .await
+            .unwrap();
+        assert_eq!(rpc("stop", json!([])).await, json!("stopping"));
+        tokio::time::timeout(Duration::from_secs(10), node.stopped())
+            .await
+            .expect("RPC stop did not end the embedded node loop");
+        node.shutdown().await;
+        drop(idle);
+        let wallet = Wallet::open(
+            dir.path().join("wallet.redb"),
+            genesis(&network.params()).hash(),
+        )
+        .unwrap();
+        assert!(wallet.operation(id).is_ok());
     }
 
     fn funded_block(wallet: &Wallet) -> Block {

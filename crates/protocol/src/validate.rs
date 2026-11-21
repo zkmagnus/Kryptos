@@ -365,6 +365,41 @@ mod tests {
     }
 
     #[test]
+    fn decoded_extreme_fees_are_rejected_before_authorization() {
+        let tx = unsigned_tx(42, 2);
+        for fee in [i64::MAX as u64 + 1, u64::MAX] {
+            let mut bytes = tx.to_vec();
+            let fee_offset = 1 + 1 + 32;
+            bytes[fee_offset..fee_offset + 8].copy_from_slice(&fee.to_le_bytes());
+            let decoded = Transaction::from_slice(&bytes).unwrap();
+            assert_eq!(decoded.fee().raw(), fee);
+            assert!(matches!(
+                check_structure(&decoded),
+                Err(Error::InvalidTransaction(
+                    "fee does not match transaction size"
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn coinbase_balance_rejects_unsigned_values_outside_signed_range() {
+        use crate::amount::RawCoin;
+
+        assert_eq!(coinbase_balance(RawCoin::ZERO), Ok(0));
+        assert_eq!(
+            coinbase_balance(RawCoin::from_raw(i64::MAX as u64).unwrap()),
+            Ok(-i64::MAX)
+        );
+        for raw in [i64::MAX as u64 + 1, u64::MAX] {
+            assert_eq!(
+                coinbase_balance(RawCoin::from_raw(raw).unwrap()),
+                Err(Error::RawCoinOutOfRange)
+            );
+        }
+    }
+
+    #[test]
     fn signatures_over_the_wrong_message_fail() {
         // sample_action signs "x", not the real sighash.
         let tx = unsigned_tx(5, 2);

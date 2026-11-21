@@ -3,9 +3,10 @@
 use crypto::diversifier::DiversifierIndex;
 use crypto::encryption::ReceiverKey;
 use crypto::hash::{blake2b_short, PIN};
-use crypto::keys::{Diversifier, FullViewingKey, IncomingViewingKey, NullifierKey, SpendingKey};
+use crypto::keys::{FullViewingKey, IncomingViewingKey, NullifierKey, SpendingKey};
 use protocol::address::KryptosAddress;
 use protocol::coin::Coin;
+use protocol::encryption::PreparedIvk;
 
 use crate::{Error, Result};
 
@@ -14,12 +15,14 @@ use crate::{Error, Result};
 pub const MAX_SCAN_ADDRESSES: u64 = 4096;
 
 struct ScanCandidate {
+    birthday_height: u32,
     receiver_key: ReceiverKey,
-    diversifier: Diversifier,
+    ivk: PreparedIvk,
 }
 
 /// Receiver keys for an explicit half-open range of address indices.
-/// Construct once and reuse across blocks; every action tries every key.
+/// Construct once and reuse across blocks; each action tries the keys whose
+/// birthdays have been reached.
 pub struct ScanKeys {
     candidates: Vec<ScanCandidate>,
     fingerprint: [u8; 32],
@@ -45,8 +48,9 @@ impl ScanKeys {
         for index in start..end {
             let diversifier = dk.diversifier(DiversifierIndex::from(index))?;
             candidates.push(ScanCandidate {
+                birthday_height: 0,
                 receiver_key: keys.fvk.receiver_key_for_diversifier(&diversifier).0,
-                diversifier,
+                ivk: PreparedIvk::new(keys.incoming_viewing_key(), diversifier)?,
             });
         }
         Ok(Self {
@@ -67,9 +71,15 @@ impl ScanKeys {
         self.end
     }
 
-    /// Number of attempted keys per output, within the configured range.
+    /// Number of keys in the configured range.
     pub fn candidate_count(&self) -> usize {
         self.candidates.len()
+    }
+
+    pub(crate) fn set_birthdays(&mut self, birthdays: &[u32]) {
+        for (candidate, height) in self.candidates.iter_mut().zip(birthdays) {
+            candidate.birthday_height = *height;
+        }
     }
 
     pub(crate) fn check_wallet(&self, keys: &WalletKeys) -> Result<()> {
@@ -84,15 +94,16 @@ impl ScanKeys {
     /// authenticate/reconstruct the commitment before returning a coin.
     pub(crate) fn trial_decrypt(
         &self,
-        mut decrypt: impl FnMut(&ReceiverKey) -> protocol::Result<Coin>,
+        height: u32,
+        mut decrypt: impl FnMut(&PreparedIvk, &ReceiverKey) -> protocol::Result<Coin>,
     ) -> Option<(Coin, bool)> {
         let mut found = None;
         for candidate in &self.candidates {
-            let decrypted = decrypt(&candidate.receiver_key);
-            if let Ok(coin) = decrypted {
-                if &candidate.diversifier == coin.diversifier() {
-                    found = Some((coin, false));
-                }
+            if height < candidate.birthday_height {
+                continue;
+            }
+            if let Ok(coin) = decrypt(&candidate.ivk, &candidate.receiver_key) {
+                found = Some((coin, false));
             }
         }
         found
